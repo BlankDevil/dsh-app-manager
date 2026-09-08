@@ -1,6 +1,6 @@
 /**
  * DSH App Manager Plugin
- * Registers AI-callable tools for discovering and managing CLI applications.
+ * Registers AI-callable tools and a web management page for CLI applications.
  */
 import type { CordisContext } from "./types.js";
 /**

@@ -1,9 +1,9 @@
 /**
  * DSH App Manager Plugin
- * Registers AI-callable tools for discovering and managing CLI applications.
+ * Registers AI-callable tools and a web management page for CLI applications.
  */
 
-import type { CliApp, CordisContext, ToolDefinition } from "./types.js";
+import type { CliApp, CordisContext, HttpRequest, HttpResponse, ToolDefinition, WebServerService } from "./types.js";
 import { discoverAll, findApp } from "./discovery.js";
 import { commandExists, compareVersions, execSafe } from "./utils.js";
 import { defineTool as dshDefineTool } from "@deepseek-ai/dsh-tools";
@@ -194,6 +194,287 @@ function registerTools(toolsService: { register: (tool: ToolDefinition) => (() =
 }
 
 /**
+ * Escape HTML special characters
+ */
+function escapeHtml(text: string): string {
+  return text
+    .replace(/\u0026/g, "&amp;")
+    .replace(/\u003c/g, "&lt;")
+    .replace(/\u003e/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
+}
+
+/**
+ * Get category emoji
+ */
+function getCategoryIcon(category: string): string {
+  const icons: Record<string, string> = {
+    ai: "🤖",
+    "package-manager": "📦",
+    dev: "🛠️",
+    deploy: "🚀",
+    cloud: "☁️",
+    database: "🗄️",
+    framework: "🏗️",
+    css: "🎨",
+    build: "🔨",
+    test: "🧪",
+    ui: "🖼️",
+    design: "✏️",
+    other: "📎",
+  };
+  return icons[category] || "📎";
+}
+
+/**
+ * Generate HTML page showing all discovered CLI applications
+ */
+function generateAppManagerPage(): string {
+  const apps = discoverAll();
+
+  const byCategory: Record<string, CliApp[]> = {};
+  for (const app of apps) {
+    if (!byCategory[app.category]) byCategory[app.category] = [];
+    byCategory[app.category].push(app);
+  }
+
+  const categoryOrder = [
+    "ai",
+    "package-manager",
+    "framework",
+    "dev",
+    "build",
+    "test",
+    "deploy",
+    "cloud",
+    "database",
+    "css",
+    "ui",
+    "design",
+    "other",
+  ];
+  const sortedCategories = Object.keys(byCategory).sort(
+    (a, b) => categoryOrder.indexOf(a) - categoryOrder.indexOf(b)
+  );
+
+  let categoryHtml = "";
+  for (const category of sortedCategories) {
+    const appsInCategory = byCategory[category];
+    const rows = appsInCategory
+      .map((app) => {
+        const status = app.commands.some((cmd) => commandExists(cmd))
+          ? "<span class='status ok'>✅ PATH</span>"
+          : "<span class='status missing'>❌ PATH</span>";
+        return `
+          <tr>
+            <td class="name">${escapeHtml(app.name)}</td>
+            <td class="version">${escapeHtml(app.version)}</td>
+            <td class="commands">${escapeHtml(app.commands.join(", "))}</td>
+            <td class="source">${escapeHtml(app.source)}</td>
+            <td class="path" title="${escapeHtml(app.path)}">${escapeHtml(app.path || "N/A")}</td>
+            <td class="status-cell">${status}</td>
+          </tr>
+        `;
+      })
+      .join("");
+
+    categoryHtml += `
+      <section class="category">
+        <h2>${getCategoryIcon(category)} ${escapeHtml(category.toUpperCase())} <span class="count">(${appsInCategory.length})</span></h2>
+        <table>
+          <thead>
+            <tr>
+              <th>Name</th>
+              <th>Version</th>
+              <th>Commands</th>
+              <th>Source</th>
+              <th>Path</th>
+              <th>Status</th>
+            </tr>
+          </thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </section>
+    `;
+  }
+
+  const bySource: Record<string, number> = {};
+  for (const app of apps) {
+    bySource[app.source] = (bySource[app.source] || 0) + 1;
+  }
+  const sourceSummary = Object.entries(bySource)
+    .map(([source, count]) => `<span class="badge">${escapeHtml(source)}: ${count}</span>`)
+    .join(" ");
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DSH App Manager</title>
+  <style>
+    :root {
+      --bg: #0d1117;
+      --surface: #161b22;
+      --border: #30363d;
+      --text: #c9d1d9;
+      --muted: #8b949e;
+      --accent: #58a6ff;
+      --ok: #238636;
+      --missing: #da3633;
+    }
+    * { box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      margin: 0;
+      padding: 2rem;
+      line-height: 1.6;
+    }
+    header {
+      border-bottom: 1px solid var(--border);
+      margin-bottom: 2rem;
+      padding-bottom: 1rem;
+    }
+    h1 { margin: 0 0 0.5rem; font-size: 1.75rem; }
+    .subtitle { color: var(--muted); margin: 0; }
+    .summary { margin: 1rem 0; }
+    .badge {
+      display: inline-block;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      padding: 0.25rem 0.75rem;
+      margin-right: 0.5rem;
+      font-size: 0.85rem;
+    }
+    .category {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      margin-bottom: 1.5rem;
+      overflow: hidden;
+    }
+    .category h2 {
+      margin: 0;
+      padding: 1rem;
+      background: rgba(88, 166, 255, 0.1);
+      border-bottom: 1px solid var(--border);
+      font-size: 1.1rem;
+    }
+    .count { color: var(--muted); font-weight: normal; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.9rem;
+    }
+    th, td {
+      padding: 0.75rem 1rem;
+      text-align: left;
+      border-bottom: 1px solid var(--border);
+    }
+    th {
+      color: var(--muted);
+      font-weight: 600;
+      text-transform: uppercase;
+      font-size: 0.75rem;
+      letter-spacing: 0.05em;
+    }
+    tr:last-child td { border-bottom: none; }
+    .name { font-weight: 600; color: var(--accent); }
+    .version { font-family: monospace; }
+    .commands { font-family: monospace; font-size: 0.85rem; }
+    .source { text-transform: capitalize; }
+    .path {
+      max-width: 300px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-size: 0.8rem;
+      color: var(--muted);
+    }
+    .status { font-size: 0.8rem; font-weight: 600; }
+    .status.ok { color: var(--ok); }
+    .status.missing { color: var(--missing); }
+    .empty {
+      text-align: center;
+      padding: 3rem;
+      color: var(--muted);
+    }
+    footer {
+      margin-top: 2rem;
+      padding-top: 1rem;
+      border-top: 1px solid var(--border);
+      color: var(--muted);
+      font-size: 0.85rem;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>🚀 DSH App Manager</h1>
+    <p class="subtitle">Discover, monitor, and manage installed CLI applications</p>
+    <div class="summary">
+      <span class="badge">Total: ${apps.length}</span>
+      ${sourceSummary}
+    </div>
+  </header>
+  <main>
+    ${apps.length === 0 ? "<div class='empty'>No CLI applications discovered.</div>" : categoryHtml}
+  </main>
+  <footer>
+    Generated by dsh-app-manager plugin · <a href="/app-manager/api/apps" style="color:var(--accent)">JSON API</a>
+  </footer>
+</body>
+</html>`;
+}
+
+/**
+ * Register web routes for the app manager page
+ */
+function registerWebRoutes(webServer: WebServerService): Array<(() => void) | undefined> {
+  const disposers: Array<(() => void) | undefined> = [];
+
+  // Main HTML page
+  disposers.push(
+    webServer.register({
+      kind: "exact",
+      path: "/app-manager",
+      handler: (_req: HttpRequest, res: HttpResponse) => {
+        res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+        res.end(generateAppManagerPage());
+      },
+    })
+  );
+
+  // JSON API endpoint
+  disposers.push(
+    webServer.register({
+      kind: "exact",
+      path: "/app-manager/api/apps",
+      handler: (_req: HttpRequest, res: HttpResponse) => {
+        const apps = discoverAll().map((app) => ({
+          name: app.name,
+          version: app.version,
+          commands: app.commands,
+          category: app.category,
+          source: app.source,
+          description: app.description,
+          path: app.path,
+          inPath: app.commands.some((cmd) => commandExists(cmd)),
+        }));
+        res.writeHead(200, { "content-type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify({ total: apps.length, apps }, null, 2));
+      },
+    })
+  );
+
+  return disposers;
+}
+
+/**
  * Cordis plugin apply function
  */
 export function apply(ctx: CordisContext): () => void {
@@ -209,8 +490,18 @@ export function apply(ctx: CordisContext): () => void {
     disposers.push(injectDisposer);
   }
 
+  if (ctx.inject) {
+    // Dynamically inject webServer service for the management page
+    const injectDisposer = ctx.inject(["webServer"], (serverCtx) => {
+      if (serverCtx.webServer?.register) {
+        disposers.push(...registerWebRoutes(serverCtx.webServer));
+      }
+    });
+    disposers.push(injectDisposer);
+  }
+
   if (ctx.logger?.info) {
-    ctx.logger.info("dsh-app-manager: discovered tools registered");
+    ctx.logger.info("dsh-app-manager: plugin loaded");
   }
 
   return () => {
@@ -221,7 +512,7 @@ export function apply(ctx: CordisContext): () => void {
 /**
  * Declare service dependencies for DSH loader (kept as fallback)
  */
-export const inject = ["tools"];
+export const inject = ["tools", "webServer"];
 
 /**
  * Plugin name (used by Cordis)

@@ -57,6 +57,22 @@ export interface ToolDefinition {
         signal: AbortSignal;
     }) => Promise<unknown>;
 }
+export interface HttpRequest {
+    url?: string;
+    method?: string;
+    headers: Record<string, string | string[] | undefined>;
+}
+export interface HttpResponse {
+    writeHead: (statusCode: number, headers?: Record<string, string>) => void;
+    end: (data?: string | Buffer) => void;
+}
+export interface WebServerService {
+    register: (route: {
+        kind: "prefix" | "exact";
+        path: string;
+        handler: (req: HttpRequest, res: HttpResponse) => void | Promise<void>;
+    }) => (() => void);
+}
 export interface CordisContext {
     logger?: {
         info: (msg: string) => void;
@@ -64,6 +80,7 @@ export interface CordisContext {
     tools?: {
         register: (tool: ToolDefinition) => (() => void);
     };
+    webServer?: WebServerService;
     service?: (name: string, instance: unknown) => void;
     inject?: (services: string[], callback: (ctx: CordisContext) => void) => (() => void);
 }

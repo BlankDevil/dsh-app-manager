@@ -6,15 +6,9 @@
 import type { CliApp, CordisContext, ToolDefinition } from "./types.js";
 import { discoverAll, findApp } from "./discovery.js";
 import { commandExists, compareVersions, execSafe } from "./utils.js";
+import { defineTool as dshDefineTool } from "@deepseek-ai/dsh-tools";
 
-let defineTool: ((tool: ToolDefinition) => ToolDefinition) | null = null;
-try {
-  const dshTools = await import("@deepseek-ai/dsh-tools");
-  defineTool = dshTools.defineTool as unknown as (tool: ToolDefinition) => ToolDefinition;
-} catch {
-  // Fallback when running outside DSH (e.g. standalone tests)
-  defineTool = null;
-}
+const defineTool = dshDefineTool as unknown as (tool: ToolDefinition) => ToolDefinition;
 
 /**
  * Format app list as a concise markdown table for LLM consumption

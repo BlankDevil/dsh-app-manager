@@ -33,13 +33,11 @@ async function checkLatestVersion(app: CliApp): Promise<string | null> {
 }
 
 /**
- * Register tools with DSH
+ * Register tools with DSH using the provided tools service
  */
-function registerTools(ctx: CordisContext): Array<(() => void) | undefined> {
-  if (!defineTool || !ctx.tools?.register) return [];
-
+function registerTools(toolsService: { register: (tool: ToolDefinition) => (() => void) }): Array<(() => void) | undefined> {
   const disposers: Array<(() => void) | undefined> = [];
-  const register = (tool: ToolDefinition) => disposers.push(ctx.tools!.register(tool));
+  const register = (tool: ToolDefinition) => disposers.push(toolsService.register(tool));
 
   register({
     name: "app_manager_list",
@@ -199,7 +197,17 @@ function registerTools(ctx: CordisContext): Array<(() => void) | undefined> {
  * Cordis plugin apply function
  */
 export function apply(ctx: CordisContext): () => void {
-  const disposers = registerTools(ctx);
+  const disposers: Array<(() => void) | undefined> = [];
+
+  if (ctx.inject) {
+    // Dynamically inject tools service to avoid Cordis inject export issues
+    const injectDisposer = ctx.inject(["tools"], (toolsCtx) => {
+      if (toolsCtx.tools?.register) {
+        disposers.push(...registerTools(toolsCtx.tools));
+      }
+    });
+    disposers.push(injectDisposer);
+  }
 
   if (ctx.logger?.info) {
     ctx.logger.info("dsh-app-manager: discovered tools registered");
@@ -211,7 +219,7 @@ export function apply(ctx: CordisContext): () => void {
 }
 
 /**
- * Declare service dependencies for DSH loader
+ * Declare service dependencies for DSH loader (kept as fallback)
  */
 export const inject = ["tools"];
 

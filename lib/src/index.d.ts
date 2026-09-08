@@ -8,7 +8,7 @@ import type { CordisContext } from "./types.js";
  */
 export declare function apply(ctx: CordisContext): () => void;
 /**
- * Declare service dependencies for DSH loader
+ * Declare service dependencies for DSH loader (kept as fallback)
  */
 export declare const inject: string[];
 /**

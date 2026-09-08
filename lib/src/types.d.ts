@@ -65,5 +65,6 @@ export interface CordisContext {
         register: (tool: ToolDefinition) => (() => void);
     };
     service?: (name: string, instance: unknown) => void;
+    inject?: (services: string[], callback: (ctx: CordisContext) => void) => (() => void);
 }
 //# sourceMappingURL=types.d.ts.map

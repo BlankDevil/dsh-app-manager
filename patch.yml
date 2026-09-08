@@ -1,0 +1,39 @@
+# DSH App Manager Bundle Patch
+# This patch registers the app manager as a DSH service
+
+- id: appManager
+  target: dsh
+  insert:
+    - key: services
+      value:
+        appManager:
+          path: ./src/index.js
+          config:
+            enabled: true
+            autoDiscover: true
+            sources:
+              - npm
+              - pnpm
+              - npx-cache
+              - scoop
+              - choco
+              - cargo
+              - pipx
+
+- id: appManagerCommands
+  target: dsh.commands
+  insert:
+    - key: apps
+      value:
+        description: Manage installed CLI applications
+        handler: appManager.handleCommand
+        subcommands:
+          list: List all discovered CLI applications
+          check: Check for available updates
+          info: Show detailed app information
+          update: Update a specific application
+          update-all: Update all applications
+          doctor: Run health check
+          monitor: Monitor running processes
+          search: Search installed applications
+          export: Export registry to JSON

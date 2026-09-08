@@ -1,0 +1,33 @@
+{
+  "name": "dsh-app-manager",
+  "version": "0.1.0",
+  "description": "A CLI application manager for discovering, monitoring, and managing installed command-line tools across package managers",
+  "main": "src/index.js",
+  "bin": {
+    "app-manager": "./bin/cli-app-manager.js",
+    "am": "./bin/cli-app-manager.js"
+  },
+  "scripts": {
+    "start": "node bin/cli-app-manager.js",
+    "test": "node --test src/**/*.test.js"
+  },
+  "keywords": [
+    "dsh",
+    "cli",
+    "manager",
+    "npm",
+    "pnpm",
+    "tools"
+  ],
+  "author": "DSH User",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./patch.yml"
+    }
+  }
+}

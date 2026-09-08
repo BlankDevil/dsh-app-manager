@@ -4,35 +4,38 @@
  * A unified tool for discovering, monitoring, and managing CLI applications
  */
 
-import { dirname, join } from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import {
+  listApps,
+  checkUpdates,
+  showInfo,
+  updateApp,
+  updateAll,
+  runDoctor,
+  monitorProcesses,
+  exportRegistry,
+  searchApps,
+  showHelp,
+} from "../src/commands.js";
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-
-// Import commands
-const { 
-  listApps, 
-  checkUpdates, 
-  showInfo, 
-  updateApp, 
-  updateAll, 
-  runDoctor, 
-  monitorProcesses, 
-  exportRegistry, 
-  searchApps, 
-  showHelp 
-} = await import(pathToFileURL(join(__dirname, "..", "src", "commands.js")).href);
+interface ParsedArgs {
+  command: string;
+  subCommand: string | undefined;
+  options: {
+    output?: string;
+    json?: boolean;
+    category?: string;
+  };
+}
 
 /**
  * Parse command line arguments
  */
-function parseArgs(argv) {
+function parseArgs(argv: string[]): ParsedArgs {
   const args = argv.slice(2);
   const command = args[0] || "help";
   const subCommand = args[1];
-  const options = {};
+  const options: ParsedArgs["options"] = {};
 
-  // Parse flags
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--output" || args[i] === "-o") {
       options.output = args[i + 1];
@@ -47,14 +50,14 @@ function parseArgs(argv) {
     }
   }
 
-  return { command, subCommand, args, options };
+  return { command, subCommand, options };
 }
 
 /**
  * Main entry point
  */
-async function main() {
-  const { command, subCommand, args, options } = parseArgs(process.argv);
+async function main(): Promise<void> {
+  const { command, subCommand, options } = parseArgs(process.argv);
 
   try {
     switch (command) {
@@ -124,10 +127,11 @@ async function main() {
         showHelp();
         break;
     }
-  } catch (error) {
-    console.error("❌ Error:", error.message);
+  } catch (error: unknown) {
+    const err = error as Error;
+    console.error("❌ Error:", err.message);
     if (process.env.DEBUG) {
-      console.error(error.stack);
+      console.error(err.stack);
     }
     process.exit(1);
   }

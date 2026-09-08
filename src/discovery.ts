@@ -2,15 +2,15 @@
  * Discovery module - finds installed CLI tools across package managers
  */
 
-import { execSync } from "node:child_process";
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
-import { join, basename, dirname } from "node:path";
-import { execSafe, commandExists, parseNpmList, readPackageJson } from "./utils.js";
+import { existsSync, readdirSync } from "node:fs";
+import { basename, join } from "node:path";
+import type { AppCategory, AppSource, CliApp, KnownPackageInfo } from "./types.js";
+import { commandExists, execSafe, readPackageJson } from "./utils.js";
 
 /**
  * Known CLI tool mappings (package name -> command names)
  */
-const KNOWN_CLI_PACKAGES = {
+const KNOWN_CLI_PACKAGES: Record<string, KnownPackageInfo> = {
   "@anthropic-ai/claude-code": { commands: ["claude"], category: "ai", desc: "Claude Code - AI coding assistant" },
   "@openai/codex": { commands: ["codex"], category: "ai", desc: "OpenAI Codex CLI" },
   "@deepseek-ai/dsh": { commands: ["dsh"], category: "ai", desc: "DeepSeek Harness CLI" },
@@ -76,19 +76,19 @@ const KNOWN_CLI_PACKAGES = {
 };
 
 /**
- * Detect if a package has CLI commands from its package.json
+ * Detect CLI metadata from a package directory
  */
-function detectCliFromPackageJson(pkgPath, pkgName) {
+function detectCliFromPackageJson(pkgPath: string, pkgName: string): CliApp | null {
   const pkg = readPackageJson(pkgPath);
   if (!pkg) return null;
 
-  const commands = [];
+  const commands: string[] = [];
 
   // Check bin field
   if (pkg.bin) {
     if (typeof pkg.bin === "string") {
       commands.push(basename(pkgName));
-    } else if (typeof pkg.bin === "object") {
+    } else if (typeof pkg.bin === "object" && pkg.bin !== null) {
       commands.push(...Object.keys(pkg.bin));
     }
   }
@@ -99,9 +99,8 @@ function detectCliFromPackageJson(pkgPath, pkgName) {
     try {
       const bins = readdirSync(binDir).filter((f) => !f.endsWith(".md") && !f.endsWith(".txt"));
       for (const bin of bins) {
-        if (!commands.includes(bin.replace(/\.cmd$/, "").replace(/\.ps1$/, ""))) {
-          commands.push(bin.replace(/\.cmd$/, "").replace(/\.ps1$/, ""));
-        }
+        const cleanBin = bin.replace(/\.cmd$/, "").replace(/\.ps1$/, "");
+        if (!commands.includes(cleanBin)) commands.push(cleanBin);
       }
     } catch {
       // ignore
@@ -113,10 +112,10 @@ function detectCliFromPackageJson(pkgPath, pkgName) {
   const known = KNOWN_CLI_PACKAGES[pkgName];
   return {
     name: pkgName,
-    version: pkg.version || "unknown",
+    version: typeof pkg.version === "string" ? pkg.version : "unknown",
     commands: [...new Set(commands)],
     category: known?.category || "other",
-    description: known?.desc || pkg.description || "",
+    description: known?.desc || (typeof pkg.description === "string" ? pkg.description : ""),
     source: "npm",
     path: pkgPath,
     hasUpdate: false,
@@ -126,10 +125,9 @@ function detectCliFromPackageJson(pkgPath, pkgName) {
 
 /**
  * Discover npm globally installed CLI packages by reading filesystem
- * (avoids child_process EPERM issues in sandboxed environments)
  */
-export function discoverNpmGlobal() {
-  const apps = [];
+export function discoverNpmGlobal(): CliApp[] {
+  const apps: CliApp[] = [];
   const globalDir = join(process.env.APPDATA || "", "npm", "node_modules");
 
   if (!existsSync(globalDir)) return apps;
@@ -141,7 +139,6 @@ export function discoverNpmGlobal() {
       if (!entry.isDirectory()) continue;
 
       if (entry.name.startsWith("@")) {
-        // Scoped package: @scope/name
         const scopeDir = join(globalDir, entry.name);
         try {
           const scopedEntries = readdirSync(scopeDir, { withFileTypes: true });
@@ -159,7 +156,6 @@ export function discoverNpmGlobal() {
           // ignore scope read errors
         }
       } else {
-        // Regular package
         const pkgPath = join(globalDir, entry.name);
         const app = detectCliFromPackageJson(pkgPath, entry.name);
         if (app) {
@@ -178,20 +174,21 @@ export function discoverNpmGlobal() {
 /**
  * Discover pnpm globally installed CLI packages
  */
-export function discoverPnpmGlobal() {
-  const apps = [];
+export function discoverPnpmGlobal(): CliApp[] {
+  const apps: CliApp[] = [];
   if (!commandExists("pnpm")) return apps;
 
   const result = execSafe("pnpm list -g --json 2>nul", { shell: true });
   if (!result.success) return apps;
 
   try {
-    const data = JSON.parse(result.output);
+    const data = JSON.parse(result.output) as Record<string, unknown> | Record<string, unknown>[];
     const packages = Array.isArray(data) ? data : [data];
 
     for (const pkg of packages) {
-      if (!pkg.dependencies) continue;
-      for (const [name, info] of Object.entries(pkg.dependencies)) {
+      const deps = pkg.dependencies as Record<string, { version?: string; path?: string } > | undefined;
+      if (!deps) continue;
+      for (const [name, info] of Object.entries(deps)) {
         const pkgPath = info.path || join(process.env.PNPM_HOME || "", "global", "node_modules", name);
         const app = detectCliFromPackageJson(pkgPath, name);
         if (app) {
@@ -211,8 +208,8 @@ export function discoverPnpmGlobal() {
 /**
  * Discover npx cached packages
  */
-export function discoverNpxCache() {
-  const apps = [];
+export function discoverNpxCache(): CliApp[] {
+  const apps: CliApp[] = [];
   const npxCache = join(process.env.LOCALAPPDATA || "", "npm-cache", "_npx");
 
   if (!existsSync(npxCache)) return apps;
@@ -249,8 +246,8 @@ export function discoverNpxCache() {
 /**
  * Discover scoop installed apps
  */
-export function discoverScoop() {
-  const apps = [];
+export function discoverScoop(): CliApp[] {
+  const apps: CliApp[] = [];
   const scoopDir = join(process.env.USERPROFILE || "", "scoop", "apps");
   if (!existsSync(scoopDir)) return apps;
 
@@ -261,27 +258,29 @@ export function discoverScoop() {
       const appDir = join(scoopDir, entry.name, "current");
       if (!existsSync(appDir)) continue;
 
-      // Check for executable
+      const commands: string[] = [];
       const binDir = join(appDir, "bin");
-      const commands = [];
       if (existsSync(binDir)) {
         try {
           const bins = readdirSync(binDir).filter((f) => f.endsWith(".exe") || !f.includes("."));
-          commands.push(...bins.map((b) => b.replace(".exe", "")));
+          for (const b of bins) {
+            const clean = b.replace(".exe", "");
+            if (!commands.includes(clean)) commands.push(clean);
+          }
         } catch {
           // ignore
         }
       }
 
-      // Also check shim directory
       const shimDir = join(process.env.USERPROFILE || "", "scoop", "shims");
       if (existsSync(shimDir)) {
         try {
-          const shims = readdirSync(shimDir)
-            .filter((f) => f.startsWith(entry.name) && (f.endsWith(".exe") || f.endsWith(".cmd") || f.endsWith(".ps1")))
-            .map((f) => f.replace(/\.(exe|cmd|ps1)$/, ""));
+          const shims = readdirSync(shimDir).filter((f) =>
+            f.startsWith(entry.name) && (f.endsWith(".exe") || f.endsWith(".cmd") || f.endsWith(".ps1"))
+          );
           for (const shim of shims) {
-            if (!commands.includes(shim)) commands.push(shim);
+            const clean = shim.replace(/\.(exe|cmd|ps1)$/, "");
+            if (!commands.includes(clean)) commands.push(clean);
           }
         } catch {
           // ignore
@@ -312,8 +311,8 @@ export function discoverScoop() {
 /**
  * Discover chocolatey installed apps
  */
-export function discoverChoco() {
-  const apps = [];
+export function discoverChoco(): CliApp[] {
+  const apps: CliApp[] = [];
   if (!commandExists("choco")) return apps;
 
   const result = execSafe("choco list --local-only 2>nul", { shell: true });
@@ -343,8 +342,8 @@ export function discoverChoco() {
 /**
  * Discover cargo installed apps
  */
-export function discoverCargo() {
-  const apps = [];
+export function discoverCargo(): CliApp[] {
+  const apps: CliApp[] = [];
   if (!commandExists("cargo")) return apps;
 
   const result = execSafe("cargo install --list 2>nul", { shell: true });
@@ -357,8 +356,7 @@ export function discoverCargo() {
 
     const match = line.match(/^(\S+)\s+v(\S+):/);
     if (match) {
-      const bins = [];
-      // Next lines may contain binary paths
+      const bins: string[] = [];
       while (i + 1 < lines.length && lines[i + 1].trim().startsWith("-")) {
         i++;
         const binMatch = lines[i].match(/-\s+(.+)$/);
@@ -387,20 +385,32 @@ export function discoverCargo() {
 /**
  * Discover pipx installed apps
  */
-export function discoverPipx() {
-  const apps = [];
+export function discoverPipx(): CliApp[] {
+  const apps: CliApp[] = [];
   if (!commandExists("pipx")) return apps;
 
   const result = execSafe("pipx list --json 2>nul", { shell: true });
   if (!result.success) return apps;
 
   try {
-    const data = JSON.parse(result.output);
+    const data = JSON.parse(result.output) as {
+      venvs?: Record<
+        string,
+        {
+          metadata?: {
+            package_version?: string;
+            injected_packages?: Array<{ package: string }>;
+            venv_metadata?: { venv_dir?: string };
+          };
+        }
+      >;
+    };
     for (const [name, info] of Object.entries(data.venvs || {})) {
+      const injected = info.metadata?.injected_packages?.map((p) => p.package) || [name];
       apps.push({
         name,
         version: info.metadata?.package_version || "unknown",
-        commands: info.metadata?.injected_packages?.map((p) => p.package) || [name],
+        commands: injected,
         category: "other",
         description: "",
         source: "pipx",
@@ -417,25 +427,10 @@ export function discoverPipx() {
 }
 
 /**
- * Discover winget installed apps (Windows Package Manager)
- */
-export function discoverWinget() {
-  const apps = [];
-  if (!commandExists("winget")) return apps;
-
-  const result = execSafe("winget list --accept-source-agreements 2>nul", { shell: true, timeout: 60000 });
-  if (!result.success) return apps;
-
-  // winget list output is complex, skip for now
-  // This would need more sophisticated parsing
-  return apps;
-}
-
-/**
  * Discover all installed CLI applications
  */
-export function discoverAll() {
-  const sources = [
+export function discoverAll(): CliApp[] {
+  const sources: Array<{ name: string; fn: () => CliApp[] }> = [
     { name: "npm", fn: discoverNpmGlobal },
     { name: "pnpm", fn: discoverPnpmGlobal },
     { name: "npx-cache", fn: discoverNpxCache },
@@ -445,8 +440,8 @@ export function discoverAll() {
     { name: "pipx", fn: discoverPipx },
   ];
 
-  const allApps = [];
-  const seen = new Set();
+  const allApps: CliApp[] = [];
+  const seen = new Set<string>();
 
   for (const source of sources) {
     try {
@@ -458,7 +453,7 @@ export function discoverAll() {
           allApps.push(app);
         }
       }
-    } catch (err) {
+    } catch {
       // Silently skip failing sources
     }
   }
@@ -467,9 +462,9 @@ export function discoverAll() {
 }
 
 /**
- * Get app by name (searches across all sources)
+ * Find apps by name or command
  */
-export function findApp(name, apps) {
+export function findApp(name: string, apps: CliApp[]): CliApp[] {
   return apps.filter(
     (app) =>
       app.name.toLowerCase() === name.toLowerCase() ||

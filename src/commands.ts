@@ -2,31 +2,32 @@
  * Command handlers for dsh-app-manager
  */
 
-import { execSync, spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
+import type { CliApp } from "./types.js";
+import { discoverAll, findApp } from "./discovery.js";
 import {
-  discoverAll,
-  findApp,
-  discoverNpmGlobal,
-  discoverPnpmGlobal,
-} from "./discovery.js";
-import {
-  execSafe,
-  execAsync,
-  compareVersions,
   colorize,
   colors,
+  commandExists,
+  compareVersions,
+  execAsync,
+  execSafe,
   formatBytes,
   formatDuration,
-  commandExists,
 } from "./utils.js";
+
+interface CommandOptions {
+  output?: string;
+  json?: boolean;
+  category?: string;
+  silent?: boolean;
+}
 
 /**
  * Print a formatted table
  */
-function printTable(headers, rows, columnWidths) {
-  // Print headers
+function printTable(headers: string[], rows: string[][], columnWidths: number[]): void {
   let headerLine = "";
   for (let i = 0; i < headers.length; i++) {
     const width = columnWidths[i] || 15;
@@ -35,7 +36,6 @@ function printTable(headers, rows, columnWidths) {
   console.log(colorize(headerLine, "bright"));
   console.log(colorize("-".repeat(headerLine.length - 10), "gray"));
 
-  // Print rows
   for (const row of rows) {
     let line = "";
     for (let i = 0; i < row.length; i++) {
@@ -49,8 +49,8 @@ function printTable(headers, rows, columnWidths) {
 /**
  * Get category icon
  */
-function getCategoryIcon(category) {
-  const icons = {
+function getCategoryIcon(category: string): string {
+  const icons: Record<string, string> = {
     ai: "🤖",
     "package-manager": "📦",
     dev: "🛠️",
@@ -71,7 +71,7 @@ function getCategoryIcon(category) {
 /**
  * List all discovered CLI applications
  */
-export async function listApps(options = {}) {
+export async function listApps(options: CommandOptions = {}): Promise<void> {
   console.log(colorize("🔍 Scanning for installed CLI applications...\n", "cyan"));
 
   const startTime = Date.now();
@@ -80,23 +80,16 @@ export async function listApps(options = {}) {
 
   if (apps.length === 0) {
     console.log(colorize("No CLI applications found.", "yellow"));
-    console.log(
-      colorize(
-        "Try installing some global npm packages: npm install -g <package>",
-        "gray"
-      )
-    );
+    console.log(colorize("Try installing some global npm packages: npm install -g <package>", "gray"));
     return;
   }
 
-  // Group by category
-  const byCategory = {};
+  const byCategory: Record<string, CliApp[]> = {};
   for (const app of apps) {
     if (!byCategory[app.category]) byCategory[app.category] = [];
     byCategory[app.category].push(app);
   }
 
-  // Sort categories
   const categoryOrder = [
     "ai",
     "package-manager",
@@ -122,17 +115,10 @@ export async function listApps(options = {}) {
     const appsInCategory = byCategory[category];
     totalApps += appsInCategory.length;
 
-    console.log(
-      colorize(
-        `${getCategoryIcon(category)} ${category.toUpperCase()} (${appsInCategory.length})`,
-        "bright"
-      )
-    );
+    console.log(colorize(`${getCategoryIcon(category)} ${category.toUpperCase()} (${appsInCategory.length})`, "bright"));
 
     const rows = appsInCategory.map((app) => {
-      const updateMarker = app.hasUpdate
-        ? colorize(`↑${app.latestVersion}`, "yellow")
-        : "";
+      const updateMarker = app.hasUpdate ? colorize(`↑${app.latestVersion}`, "yellow") : "";
       return [
         colorize(app.name, "white"),
         colorize(app.version, "green"),
@@ -142,23 +128,13 @@ export async function listApps(options = {}) {
       ];
     });
 
-    printTable(
-      ["Name", "Version", "Commands", "Source", "Update"],
-      rows,
-      [25, 12, 20, 12, 15]
-    );
+    printTable(["Name", "Version", "Commands", "Source", "Update"], rows, [25, 12, 20, 12, 15]);
     console.log();
   }
 
-  console.log(
-    colorize(
-      `✅ Found ${totalApps} CLI applications in ${formatDuration(duration)}`,
-      "green"
-    )
-  );
+  console.log(colorize(`✅ Found ${totalApps} CLI applications in ${formatDuration(duration)}`, "green"));
 
-  // Summary by source
-  const bySource = {};
+  const bySource: Record<string, number> = {};
   for (const app of apps) {
     bySource[app.source] = (bySource[app.source] || 0) + 1;
   }
@@ -171,31 +147,26 @@ export async function listApps(options = {}) {
 /**
  * Check for available updates
  */
-export async function checkUpdates(options = {}) {
-  console.log(colorize("⬆️  Checking for updates...\n", "cyan"));
+export async function checkUpdates(options: CommandOptions = {}): Promise<CliApp[]> {
+  if (!options.silent) console.log(colorize("⬆️  Checking for updates...\n", "cyan"));
 
-  const apps = discoverAll().filter(
-    (app) => app.source === "npm" || app.source === "pnpm"
-  );
+  const apps = discoverAll().filter((app) => app.source === "npm" || app.source === "pnpm");
 
   if (apps.length === 0) {
-    console.log(colorize("No npm/pnpm packages found to check.", "yellow"));
-    return;
+    if (!options.silent) console.log(colorize("No npm/pnpm packages found to check.", "yellow"));
+    return [];
   }
 
-  const updates = [];
-  const checked = new Set();
+  const updates: CliApp[] = [];
+  const checked = new Set<string>();
 
   for (const app of apps) {
     if (checked.has(app.name)) continue;
     checked.add(app.name);
 
-    process.stdout.write(`Checking ${app.name}... `);
+    if (!options.silent) process.stdout.write(`Checking ${app.name}... `);
 
-    const result = execSafe(`npm.cmd view ${app.name} version 2>nul`, {
-      shell: true,
-      timeout: 10000,
-    });
+    const result = execSafe(`npm.cmd view ${app.name} version 2>nul`, { shell: true, timeout: 10000 });
 
     if (result.success && result.output) {
       const latestVersion = result.output.trim();
@@ -205,44 +176,36 @@ export async function checkUpdates(options = {}) {
         app.hasUpdate = true;
         app.latestVersion = latestVersion;
         updates.push(app);
-        console.log(
-          colorize(`${app.version} → ${latestVersion}`, "yellow")
-        );
+        if (!options.silent) console.log(colorize(`${app.version} → ${latestVersion}`, "yellow"));
       } else if (cmp < 0) {
-        console.log(colorize(`${app.version} (newer than ${latestVersion})`, "green"));
+        if (!options.silent) console.log(colorize(`${app.version} (newer than ${latestVersion})`, "green"));
       } else {
-        console.log(colorize("up to date", "green"));
+        if (!options.silent) console.log(colorize("up to date", "green"));
       }
     } else {
-      console.log(colorize("unable to check", "gray"));
+      if (!options.silent) console.log(colorize("unable to check", "gray"));
     }
   }
 
-  console.log();
+  if (!options.silent) console.log();
 
   if (updates.length === 0) {
-    console.log(colorize("✅ All packages are up to date!", "green"));
+    if (!options.silent) console.log(colorize("✅ All packages are up to date!", "green"));
   } else {
-    console.log(
-      colorize(`⚠️  ${updates.length} update(s) available:\n`, "yellow")
-    );
-    const rows = updates.map((app) => [
-      app.name,
-      colorize(app.version, "red"),
-      "→",
-      colorize(app.latestVersion, "green"),
-      colorize(app.source, "blue"),
-    ]);
-    printTable(["Package", "Current", "", "Latest", "Source"], rows, [
-      25, 12, 3, 12, 10,
-    ]);
-
-    console.log(
-      colorize(
-        "\nRun 'app-manager update <package>' or 'app-manager update-all' to update.",
-        "gray"
-      )
-    );
+    if (!options.silent) {
+      console.log(colorize(`⚠️  ${updates.length} update(s) available:\n`, "yellow"));
+      const rows = updates.map((app) => [
+        app.name,
+        colorize(app.version, "red"),
+        "→",
+        colorize(app.latestVersion || "", "green"),
+        colorize(app.source, "blue"),
+      ]);
+      printTable(["Package", "Current", "", "Latest", "Source"], rows, [25, 12, 3, 12, 10]);
+      console.log(
+        colorize("\nRun 'app-manager update <package>' or 'app-manager update-all' to update.", "gray")
+      );
+    }
   }
 
   return updates;
@@ -251,7 +214,7 @@ export async function checkUpdates(options = {}) {
 /**
  * Show detailed info about an app
  */
-export async function showInfo(appName, options = {}) {
+export async function showInfo(appName: string, options: CommandOptions = {}): Promise<void> {
   const apps = discoverAll();
   const matches = findApp(appName, apps);
 
@@ -275,7 +238,6 @@ export async function showInfo(appName, options = {}) {
       console.log(`  ${colorize("Description:", "gray")} ${app.description}`);
     }
 
-    // Check if command works
     if (app.commands.length > 0) {
       const cmd = app.commands[0];
       const works = commandExists(cmd);
@@ -284,44 +246,31 @@ export async function showInfo(appName, options = {}) {
       );
     }
 
-    // Check for update
     if (app.source === "npm" || app.source === "pnpm") {
-      const result = execSafe(`npm.cmd view ${app.name} version 2>nul`, {
-        shell: true,
-        timeout: 10000,
-      });
+      const result = execSafe(`npm.cmd view ${app.name} version 2>nul`, { shell: true, timeout: 10000 });
       if (result.success && result.output) {
         const latest = result.output.trim();
         const cmp = compareVersions(latest, app.version);
         if (cmp > 0) {
-          console.log(
-            `  ${colorize("Update:", "gray")}      ${colorize(`${app.version} → ${latest}`, "yellow")}`
-          );
+          console.log(`  ${colorize("Update:", "gray")}      ${colorize(`${app.version} → ${latest}`, "yellow")}`);
         } else {
-          console.log(
-            `  ${colorize("Update:", "gray")}      ${colorize("up to date", "green")}`
-          );
+          console.log(`  ${colorize("Update:", "gray")}      ${colorize("up to date", "green")}`);
         }
       }
     }
 
-    // Show package.json details
     if (app.path && existsSync(join(app.path, "package.json"))) {
       const { readFileSync } = await import("node:fs");
-      const pkg = JSON.parse(
-        readFileSync(join(app.path, "package.json"), "utf8")
-      );
-      if (pkg.homepage) {
-        console.log(`  ${colorize("Homepage:", "gray")}   ${pkg.homepage}`);
-      }
+      const pkg = JSON.parse(readFileSync(join(app.path, "package.json"), "utf8")) as {
+        homepage?: string;
+        repository?: { url?: string };
+        license?: string;
+      };
+      if (pkg.homepage) console.log(`  ${colorize("Homepage:", "gray")}   ${pkg.homepage}`);
       if (pkg.repository?.url) {
-        console.log(
-          `  ${colorize("Repository:", "gray")} ${pkg.repository.url.replace(/^git\+/, "").replace(/\.git$/, "")}`
-        );
+        console.log(`  ${colorize("Repository:", "gray")} ${pkg.repository.url.replace(/^git\+/, "").replace(/\.git$/, "")}`);
       }
-      if (pkg.license) {
-        console.log(`  ${colorize("License:", "gray")}    ${pkg.license}`);
-      }
+      if (pkg.license) console.log(`  ${colorize("License:", "gray")}    ${pkg.license}`);
     }
   }
 }
@@ -329,7 +278,7 @@ export async function showInfo(appName, options = {}) {
 /**
  * Update a specific app
  */
-export async function updateApp(appName, options = {}) {
+export async function updateApp(appName: string, options: CommandOptions = {}): Promise<void> {
   const apps = discoverAll();
   const matches = findApp(appName, apps);
 
@@ -342,11 +291,7 @@ export async function updateApp(appName, options = {}) {
     console.log(colorize(`\n⬆️  Updating ${app.name}...`, "cyan"));
 
     if (app.source === "npm") {
-      const result = await execAsync("npm.cmd", [
-        "install",
-        "-g",
-        `${app.name}@latest`,
-      ]);
+      const result = await execAsync("npm.cmd", ["install", "-g", `${app.name}@latest`]);
       if (result.success) {
         console.log(colorize(`✅ ${app.name} updated successfully!`, "green"));
       } else {
@@ -389,19 +334,17 @@ export async function updateApp(appName, options = {}) {
 /**
  * Update all apps with available updates
  */
-export async function updateAll(options = {}) {
+export async function updateAll(options: CommandOptions = {}): Promise<void> {
   console.log(colorize("⬆️  Checking for updates first...\n", "cyan"));
 
   const updates = await checkUpdates({ silent: true });
 
-  if (!updates || updates.length === 0) {
+  if (updates.length === 0) {
     console.log(colorize("✅ Everything is up to date!", "green"));
     return;
   }
 
-  console.log(
-    colorize(`\n🔄 Updating ${updates.length} package(s)...\n`, "cyan")
-  );
+  console.log(colorize(`\n🔄 Updating ${updates.length} package(s)...\n`, "cyan"));
 
   for (const app of updates) {
     await updateApp(app.name, options);
@@ -413,46 +356,32 @@ export async function updateAll(options = {}) {
 /**
  * Run health check on all apps
  */
-export async function runDoctor(options = {}) {
+export async function runDoctor(options: CommandOptions = {}): Promise<void> {
   console.log(colorize("🏥 Running health check...\n", "cyan"));
 
   const apps = discoverAll();
-  const issues = [];
+  const issues: Array<{ app: string; severity: "error" | "warning"; message: string }> = [];
 
   for (const app of apps) {
     process.stdout.write(`Checking ${app.name}... `);
 
-    // Check 1: Commands exist in PATH
     let commandsOk = true;
     for (const cmd of app.commands) {
       if (!commandExists(cmd)) {
         commandsOk = false;
-        issues.push({
-          app: app.name,
-          severity: "error",
-          message: `Command '${cmd}' not found in PATH`,
-        });
+        issues.push({ app: app.name, severity: "error", message: `Command '${cmd}' not found in PATH` });
       }
     }
 
-    // Check 2: Package directory exists
     let pathOk = true;
     if (app.path && !existsSync(app.path)) {
       pathOk = false;
-      issues.push({
-        app: app.name,
-        severity: "warning",
-        message: `Package directory missing: ${app.path}`,
-      });
+      issues.push({ app: app.name, severity: "warning", message: `Package directory missing: ${app.path}` });
     }
 
-    // Check 3: Try to get version from command
     let versionOk = true;
     if (app.commands.length > 0 && commandExists(app.commands[0])) {
-      const versionResult = execSafe(`${app.commands[0]} --version 2>nul`, {
-        shell: true,
-        timeout: 5000,
-      });
+      const versionResult = execSafe(`${app.commands[0]} --version 2>nul`, { shell: true, timeout: 5000 });
       if (!versionResult.success) {
         versionOk = false;
         issues.push({
@@ -475,9 +404,7 @@ export async function runDoctor(options = {}) {
   if (issues.length === 0) {
     console.log(colorize("✅ All applications are healthy!", "green"));
   } else {
-    console.log(
-      colorize(`⚠️  Found ${issues.length} issue(s):\n`, "yellow")
-    );
+    console.log(colorize(`⚠️  Found ${issues.length} issue(s):\n`, "yellow"));
 
     const errors = issues.filter((i) => i.severity === "error");
     const warnings = issues.filter((i) => i.severity === "warning");
@@ -485,18 +412,14 @@ export async function runDoctor(options = {}) {
     if (errors.length > 0) {
       console.log(colorize("Errors:", "red"));
       for (const issue of errors) {
-        console.log(
-          colorize(`  ❌ [${issue.app}] ${issue.message}`, "red")
-        );
+        console.log(colorize(`  ❌ [${issue.app}] ${issue.message}`, "red"));
       }
     }
 
     if (warnings.length > 0) {
       console.log(colorize("\nWarnings:", "yellow"));
       for (const issue of warnings) {
-        console.log(
-          colorize(`  ⚠️  [${issue.app}] ${issue.message}`, "yellow")
-        );
+        console.log(colorize(`  ⚠️  [${issue.app}] ${issue.message}`, "yellow"));
       }
     }
   }
@@ -505,7 +428,7 @@ export async function runDoctor(options = {}) {
 /**
  * Monitor running processes
  */
-export async function monitorProcesses(options = {}) {
+export async function monitorProcesses(options: CommandOptions = {}): Promise<void> {
   console.log(colorize("📊 Monitoring running processes...\n", "cyan"));
 
   if (process.platform !== "win32") {
@@ -513,43 +436,39 @@ export async function monitorProcesses(options = {}) {
   }
 
   const apps = discoverAll();
-  const runningApps = [];
+  const runningApps: Array<{ app: string; command: string; pid: number; memory: number; path: string }> = [];
 
-  // Get running processes
-  let processes = [];
+  interface ProcInfo {
+    Name?: string;
+    Id?: number;
+    Path?: string;
+    WorkingSet?: number;
+  }
+
+  let processes: ProcInfo[] = [];
   try {
     const result = execSafe(
       'powershell -Command "Get-Process | Select-Object Name, Id, Path, WorkingSet | ConvertTo-Json -Compress"',
       { shell: true, timeout: 10000 }
     );
     if (result.success) {
-      const data = JSON.parse(result.output);
+      const data = JSON.parse(result.output) as ProcInfo | ProcInfo[];
       processes = Array.isArray(data) ? data : [data];
     }
   } catch {
-    // Fallback to tasklist
-    const result = execSafe("tasklist /FO CSV /NH", {
-      shell: true,
-      timeout: 10000,
-    });
+    const result = execSafe("tasklist /FO CSV /NH", { shell: true, timeout: 10000 });
     if (result.success) {
       const lines = result.output.split("\n").filter((l) => l.trim());
       for (const line of lines) {
         const parts = line.split('","').map((p) => p.replace(/^"|"$/g, ""));
         if (parts.length >= 2) {
-          processes.push({
-            Name: parts[0],
-            Id: parseInt(parts[1]) || 0,
-            Path: parts[0],
-            WorkingSet: 0,
-          });
+          processes.push({ Name: parts[0], Id: parseInt(parts[1]) || 0, Path: parts[0], WorkingSet: 0 });
         }
       }
     }
   }
 
-  // Match processes to known CLI apps
-  const processMap = new Map();
+  const processMap = new Map<string, ProcInfo>();
   for (const proc of processes) {
     const procName = proc.Name?.toLowerCase() || "";
     processMap.set(procName, proc);
@@ -558,20 +477,15 @@ export async function monitorProcesses(options = {}) {
   for (const app of apps) {
     for (const cmd of app.commands) {
       const procName = cmd.toLowerCase();
-      // Check exact match
       if (processMap.has(procName)) {
-        const proc = processMap.get(procName);
+        const proc = processMap.get(procName)!;
         runningApps.push({
           app: app.name,
           command: cmd,
-          pid: proc.Id,
+          pid: proc.Id || 0,
           memory: proc.WorkingSet || 0,
-          path: proc.Path,
+          path: proc.Path || "",
         });
-      }
-      // Check node.exe running the command
-      if (processMap.has("node")) {
-        // Could be a node script, check path
       }
     }
   }
@@ -579,9 +493,7 @@ export async function monitorProcesses(options = {}) {
   if (runningApps.length === 0) {
     console.log(colorize("No monitored CLI applications are currently running.", "gray"));
   } else {
-    console.log(
-      colorize(`Found ${runningApps.length} running instance(s):\n`, "green")
-    );
+    console.log(colorize(`Found ${runningApps.length} running instance(s):\n`, "green"));
 
     const rows = runningApps.map((ra) => [
       colorize(ra.app, "white"),
@@ -591,37 +503,22 @@ export async function monitorProcesses(options = {}) {
       ra.path || "N/A",
     ]);
 
-    printTable(
-      ["Application", "Command", "PID", "Memory", "Path"],
-      rows,
-      [20, 15, 10, 12, 30]
-    );
+    printTable(["Application", "Command", "PID", "Memory", "Path"], rows, [20, 15, 10, 12, 30]);
   }
 
-  // Show summary of installed apps not running
   const runningNames = new Set(runningApps.map((ra) => ra.app));
   const notRunning = apps.filter((app) => !runningNames.has(app.name));
 
   if (notRunning.length > 0) {
-    console.log(
-      colorize(
-        `\n💤 ${notRunning.length} installed but not running:`,
-        "gray"
-      )
-    );
-    console.log(
-      colorize(
-        notRunning.map((a) => a.name).join(", "),
-        "gray"
-      )
-    );
+    console.log(colorize(`\n💤 ${notRunning.length} installed but not running:`, "gray"));
+    console.log(colorize(notRunning.map((a) => a.name).join(", "), "gray"));
   }
 }
 
 /**
  * Export app registry to JSON
  */
-export async function exportRegistry(options = {}) {
+export async function exportRegistry(options: CommandOptions = {}): Promise<void> {
   const apps = discoverAll();
   const registry = {
     generatedAt: new Date().toISOString(),
@@ -653,15 +550,13 @@ export async function exportRegistry(options = {}) {
 /**
  * Search for apps
  */
-export async function searchApps(query, options = {}) {
+export async function searchApps(query: string, options: CommandOptions = {}): Promise<void> {
   const apps = discoverAll();
   const matches = apps.filter(
     (app) =>
       app.name.toLowerCase().includes(query.toLowerCase()) ||
       app.description.toLowerCase().includes(query.toLowerCase()) ||
-      app.commands.some((cmd) =>
-        cmd.toLowerCase().includes(query.toLowerCase())
-      ) ||
+      app.commands.some((cmd) => cmd.toLowerCase().includes(query.toLowerCase())) ||
       app.category.toLowerCase().includes(query.toLowerCase())
   );
 
@@ -670,9 +565,7 @@ export async function searchApps(query, options = {}) {
     return;
   }
 
-  console.log(
-    colorize(`Found ${matches.length} app(s) matching "${query}":\n`, "green")
-  );
+  console.log(colorize(`Found ${matches.length} app(s) matching "${query}":\n`, "green"));
 
   const rows = matches.map((app) => [
     colorize(app.name, "white"),
@@ -682,21 +575,17 @@ export async function searchApps(query, options = {}) {
     app.description ? truncate(app.description, 40) : "",
   ]);
 
-  printTable(
-    ["Name", "Version", "Commands", "Source", "Description"],
-    rows,
-    [25, 12, 20, 12, 40]
-  );
+  printTable(["Name", "Version", "Commands", "Source", "Description"], rows, [25, 12, 20, 12, 40]);
 }
 
 /**
  * Show usage help
  */
-export function showHelp() {
+export function showHelp(): void {
   console.log(colorize("DSH App Manager - CLI Application Manager\n", "bright"));
   console.log("Usage: app-manager <command> [options]\n");
 
-  const commands = [
+  const commands: Array<[string, string]> = [
     ["list", "List all discovered CLI applications"],
     ["check", "Check for available updates"],
     ["info <app>", "Show detailed information about an app"],
@@ -727,8 +616,10 @@ export function showHelp() {
   console.log("  npm, pnpm, npx-cache, scoop, choco, cargo, pipx");
 }
 
-// Helper
-function truncate(str, max) {
+/**
+ * Truncate string helper
+ */
+function truncate(str: string, max: number): string {
   if (str.length <= max) return str;
   return str.slice(0, max - 3) + "...";
 }

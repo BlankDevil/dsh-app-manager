@@ -1,15 +1,23 @@
 {
   "name": "dsh-app-manager",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A CLI application manager for discovering, monitoring, and managing installed command-line tools across package managers",
-  "main": "src/index.js",
+  "main": "lib/src/index.js",
+  "types": "lib/src/index.d.ts",
   "bin": {
-    "app-manager": "./bin/cli-app-manager.js",
-    "am": "./bin/cli-app-manager.js"
+    "app-manager": "./lib/bin/cli-app-manager.js",
+    "am": "./lib/bin/cli-app-manager.js"
   },
+  "files": [
+    "lib",
+    "patch.yml",
+    "README.md"
+  ],
   "scripts": {
-    "start": "node bin/cli-app-manager.js",
-    "test": "node --test src/**/*.test.js"
+    "build": "tsc",
+    "start": "node lib/bin/cli-app-manager.js",
+    "test": "node --test lib/**/*.test.js",
+    "prepublishOnly": "npm run build"
   },
   "keywords": [
     "dsh",
@@ -28,6 +36,18 @@
   "dsh": {
     "bundle": {
       "patch": "./patch.yml"
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.7.0"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-tools": "^0.1.2-rc.1"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/dsh-tools": {
+      "optional": true
     }
   }
 }

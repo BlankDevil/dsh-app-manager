@@ -4,25 +4,31 @@
 
 import { execSync, spawn } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
-import { join, dirname } from "node:path";
+import { join } from "node:path";
+import type { ExecResult } from "./types.js";
 
 /**
- * Execute a command and return stdout/stderr
+ * Execute a command synchronously and return stdout/stderr
  */
-export function execSafe(command, options = {}) {
+export function execSafe(command: string, options: { shell?: boolean | string; timeout?: number; cwd?: string } = {}): ExecResult {
   try {
     const result = execSync(command, {
       encoding: "utf8",
       stdio: ["pipe", "pipe", "pipe"],
       timeout: 30000,
       ...options,
-    });
-    return { success: true, output: result.trim(), error: null };
-  } catch (error) {
+    } as import("node:child_process").ExecSyncOptions) as string;
+    return { success: true, output: result.trim(), error: "" };
+  } catch (error: unknown) {
+    const err = error as {
+      stdout?: Buffer;
+      stderr?: Buffer;
+      message?: string;
+    };
     return {
       success: false,
-      output: error.stdout?.toString().trim() || "",
-      error: error.stderr?.toString().trim() || error.message,
+      output: err.stdout?.toString().trim() || "",
+      error: err.stderr?.toString().trim() || err.message || String(error),
     };
   }
 }
@@ -30,7 +36,11 @@ export function execSafe(command, options = {}) {
 /**
  * Execute a command asynchronously
  */
-export function execAsync(command, args = [], options = {}) {
+export function execAsync(
+  command: string,
+  args: string[] = [],
+  options: { shell?: boolean | string; timeout?: number; cwd?: string } = {}
+): Promise<ExecResult> {
   return new Promise((resolve) => {
     const child = spawn(command, args, {
       stdio: ["pipe", "pipe", "pipe"],
@@ -41,24 +51,24 @@ export function execAsync(command, args = [], options = {}) {
     let stdout = "";
     let stderr = "";
 
-    child.stdout?.on("data", (data) => {
+    child.stdout?.on("data", (data: Buffer) => {
       stdout += data.toString();
     });
 
-    child.stderr?.on("data", (data) => {
+    child.stderr?.on("data", (data: Buffer) => {
       stderr += data.toString();
     });
 
-    child.on("close", (code) => {
+    child.on("close", (code: number | null) => {
       resolve({
         success: code === 0,
         output: stdout.trim(),
         error: stderr.trim(),
-        code,
+        code: code ?? undefined,
       });
     });
 
-    child.on("error", (err) => {
+    child.on("error", (err: Error) => {
       resolve({
         success: false,
         output: stdout.trim(),
@@ -72,7 +82,7 @@ export function execAsync(command, args = [], options = {}) {
 /**
  * Format bytes to human readable string
  */
-export function formatBytes(bytes) {
+export function formatBytes(bytes: number): string {
   if (bytes === 0) return "0 B";
   const k = 1024;
   const sizes = ["B", "KB", "MB", "GB", "TB"];
@@ -81,9 +91,9 @@ export function formatBytes(bytes) {
 }
 
 /**
- * Format duration
+ * Format duration in milliseconds
  */
-export function formatDuration(ms) {
+export function formatDuration(ms: number): string {
   if (ms < 1000) return ms + "ms";
   if (ms < 60000) return (ms / 1000).toFixed(1) + "s";
   if (ms < 3600000) return Math.floor(ms / 60000) + "m" + Math.floor((ms % 60000) / 1000) + "s";
@@ -93,12 +103,9 @@ export function formatDuration(ms) {
 /**
  * Check if a command exists in PATH
  */
-export function commandExists(command) {
+export function commandExists(command: string): boolean {
   try {
-    execSync(
-      process.platform === "win32" ? `where ${command}` : `which ${command}`,
-      { stdio: "ignore" }
-    );
+    execSync(process.platform === "win32" ? `where ${command}` : `which ${command}`, { stdio: "ignore" });
     return true;
   } catch {
     return false;
@@ -106,34 +113,13 @@ export function commandExists(command) {
 }
 
 /**
- * Get package.json from a package directory
+ * Read package.json from a directory
  */
-export function readPackageJson(dir) {
+export function readPackageJson(dir: string): Record<string, unknown> | null {
   const path = join(dir, "package.json");
   if (!existsSync(path)) return null;
   try {
-    return JSON.parse(readFileSync(path, "utf8"));
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Parse npm list JSON output safely
- */
-export function parseNpmList(jsonStr) {
-  try {
-    // npm list outputs lines, sometimes with warnings
-    const lines = jsonStr.split("\n").filter((l) => l.trim());
-    // Find the first valid JSON line
-    for (const line of lines) {
-      try {
-        return JSON.parse(line);
-      } catch {
-        continue;
-      }
-    }
-    return null;
+    return JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
   } catch {
     return null;
   }
@@ -143,8 +129,8 @@ export function parseNpmList(jsonStr) {
  * Compare two semantic versions
  * Returns: -1 if v1 < v2, 0 if equal, 1 if v1 > v2
  */
-export function compareVersions(v1, v2) {
-  const normalize = (v) =>
+export function compareVersions(v1: string, v2: string): number {
+  const normalize = (v: string): number[] =>
     v
       .replace(/^v/, "")
       .split(".")
@@ -161,7 +147,7 @@ export function compareVersions(v1, v2) {
 }
 
 /**
- * Colorize output (simple ANSI colors)
+ * Colorize output with ANSI codes
  */
 export const colors = {
   reset: "\x1b[0m",
@@ -177,21 +163,14 @@ export const colors = {
   gray: "\x1b[90m",
 };
 
-export function colorize(text, color) {
+export function colorize(text: string, color: keyof typeof colors): string {
   return `${colors[color] || ""}${text}${colors.reset}`;
 }
 
 /**
  * Truncate string with ellipsis
  */
-export function truncate(str, maxLength) {
+export function truncate(str: string, maxLength: number): string {
   if (str.length <= maxLength) return str;
   return str.slice(0, maxLength - 3) + "...";
-}
-
-/**
- * Get current timestamp
- */
-export function now() {
-  return new Date().toISOString();
 }

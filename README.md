@@ -1,189 +1,217 @@
 # DSH App Manager
 
-一个用于**发现、监控和管理**已安装 CLI 应用程序的统一工具。
+> 🇨🇳 一个用于**发现、监控和管理**已安装 CLI 应用程序的统一工具。
+> 🇺🇸 A unified tool for **discovering, monitoring, and managing** installed CLI applications.
 
-## ✨ 功能特性
+---
 
-- 🔍 **自动发现** - 扫描 npm、pnpm、npx-cache、scoop、choco、cargo、pipx 等来源的 CLI 工具
-- 📊 **统一视图** - 在一个界面查看所有 CLI 应用的版本、来源、状态
-- ⬆️ **更新检查** - 一键检查所有应用是否有新版本
-- 🏥 **健康检查** - 验证应用是否正常工作、命令是否在 PATH 中
-- 📈 **进程监控** - 查看哪些 CLI 工具正在运行
-- 🔎 **快速搜索** - 按名称、分类或命令搜索应用
-- 📤 **导出注册表** - 导出 JSON 格式的应用清单
+## ✨ Features / 功能特性
 
-## 📦 安装
+| Feature | 中文说明 |
+|---------|----------|
+| 🔍 Auto Discovery | 扫描 npm、pnpm、npx-cache、scoop、choco、cargo、pipx 等来源的 CLI 工具 |
+| 📊 Unified View | 在一个界面查看所有 CLI 应用的版本、来源、状态 |
+| ⬆️ Update Check | 一键检查所有应用是否有新版本 |
+| 🏥 Health Check | 验证应用是否正常工作、命令是否在 PATH 中 |
+| 📈 Process Monitor | 查看哪些 CLI 工具正在运行 |
+| 🔎 Quick Search | 按名称、分类或命令搜索应用 |
+| 📤 Export Registry | 导出 JSON 格式的应用清单 |
+| 🤖 DSH AI Tools | 注册 AI-callable tools，让 DSH 帮你查询和更新 |
+| 🌐 Web Dashboard | 在浏览器访问 `/app-manager` 管理页面 |
 
-### 作为独立 CLI 工具使用
+---
+
+## 📦 Installation / 安装
+
+### From npm / 从 npm 安装
 
 ```bash
-# 进入插件目录
+# Install globally as CLI tool
+npm install -g dsh-app-manager
+
+# Or install as DSH plugin
+dsh plugin --profile web add dsh-app-manager
+```
+
+### From source / 从源码安装
+
+```bash
+# Clone
+git clone https://github.com/BlankDevil/dsh-app-manager.git
 cd dsh-app-manager
 
-# 直接运行（无需安装）
-node bin/cli-app-manager.js list
+# Build
+pnpm install
+pnpm run build
 
-# 或链接为全局命令
+# Link as global CLI
 npm link
-# 然后可以直接使用
-app-manager list
-```
 
-### 作为 DSH 插件安装
-
-```bash
-# 安装到 web profile
+# Or install as DSH plugin
 dsh plugin --profile web add ./dsh-app-manager
-
-# 或安装到 headless profile
-dsh plugin --profile headless add ./dsh-app-manager
 ```
 
-## 🚀 使用方法
+---
 
-### 列出所有已安装的 CLI 应用
+## 🚀 Usage / 使用方法
+
+### CLI Commands / CLI 命令
 
 ```bash
+# List all installed CLI apps
 app-manager list
-# 或简写
 app-manager ls
-```
 
-输出示例：
-```
-🤖 AI (3)
-Name                          Version     Commands           Source       Update
-───────────────────────────────────────────────────────────────────────────────
-@anthropic-ai/claude-code     2.1.263     claude             npm
-@deepseek-ai/dsh              0.1.2-rc.1  dsh                npm
-@openai/codex                 0.153.4     codex              npm
-
-📦 PACKAGE-MANAGER (2)
-Name                          Version     Commands           Source       Update
-───────────────────────────────────────────────────────────────────────────────
-npm                           11.5.2      npm, npx           npm
-pnpm                          12.3.4      pnpm               npm
-
-✅ Found 10 CLI applications in 1.2s
-```
-
-### 检查更新
-
-```bash
+# Check for updates
 app-manager check
-```
+app-manager outdated
 
-### 查看应用详情
-
-```bash
+# Show app details
 app-manager info claude
 app-manager info dsh
-app-manager info codex
-```
 
-### 更新应用
-
-```bash
-# 更新单个应用
+# Update an app
 app-manager update dsh
+app-manager upgrade dsh
 
-# 更新所有有更新的应用
+# Update all outdated apps
 app-manager update-all
-```
 
-### 健康检查
-
-```bash
+# Health check
 app-manager doctor
-```
 
-检查所有应用：
-- ✅ 命令是否在 PATH 中
-- ✅ 包目录是否存在
-- ✅ 命令是否能正常返回版本
-
-### 监控运行中的进程
-
-```bash
+# Monitor running processes
 app-manager monitor
-```
 
-### 搜索应用
-
-```bash
+# Search apps
 app-manager search ai
-app-manager search package
-```
 
-### 导出注册表
-
-```bash
+# Export registry to JSON
 app-manager export --output my-apps.json
 ```
 
-## 📋 支持的来源
+### DSH AI Tools / DSH AI 工具
 
-| 来源 | 说明 | 支持操作 |
-|------|------|----------|
-| npm | 全局 npm 包 | 发现、检查更新、更新 |
-| pnpm | 全局 pnpm 包 | 发现、检查更新、更新 |
-| npx-cache | npx 缓存的包 | 发现 |
-| scoop | Scoop 安装的包 | 发现、更新 |
-| choco | Chocolatey 包 | 发现、更新 |
-| cargo | Rust cargo 包 | 发现 |
-| pipx | Python pipx 包 | 发现 |
+Install into DSH profile to register AI-callable tools:
 
-## 🏗️ 作为 DSH Bundle 使用
-
-本插件已配置为 DSH bundle，在 `package.json` 中声明了：
-
-```json
-{
-  "dsh": {
-    "bundle": {
-      "patch": "./patch.yml"
-    }
-  }
-}
+```bash
+dsh plugin --profile web add dsh-app-manager
 ```
 
-安装到 DSH profile 后，会自动注册应用管理服务。
+Registered tools:
+- `app_manager_list` — List all CLI apps (markdown table)
+- `app_manager_info` — Show details of one app
+- `app_manager_check_updates` — Check for available updates
+- `app_manager_update` — Update a specific app
+- `app_manager_doctor` — Run health check
 
-## 📁 项目结构
+### Web Dashboard / 网页管理台
+
+After installing into DSH web profile, visit:
+
+```
+http://127.0.0.1:3080/app-manager
+```
+
+Or access the JSON API:
+
+```
+http://127.0.0.1:3080/app-manager/api/apps
+```
+
+---
+
+## 📋 Supported Sources / 支持的来源
+
+| Source | Description | Operations |
+|--------|-------------|------------|
+| npm | Global npm packages | Discover, check updates, update |
+| pnpm | Global pnpm packages | Discover, check updates, update |
+| npx-cache | Cached npx packages | Discover |
+| scoop | Scoop packages (Windows) | Discover, update |
+| choco | Chocolatey packages (Windows) | Discover, update |
+| cargo | Rust cargo packages | Discover |
+| pipx | Python pipx packages | Discover |
+
+---
+
+## 🏗️ Architecture / 架构
 
 ```
 dsh-app-manager/
-├── package.json          # 包配置和 DSH bundle 声明
-├── patch.yml             # DSH 层叠配置补丁
-├── README.md             # 本文档
+├── package.json          # Package config + DSH bundle declaration
+├── patch.yml             # DSH bundle patch (Cordis entry)
+├── tsconfig.json         # TypeScript config
+├── LICENSE               # MIT License
+├── CHANGELOG.md          # Version history
+├── README.md             # This document
+├── PRD.md                # Product Requirements Document
+├── PUBLISH.md            # Marketplace publishing guide
+├── DESIGN.md             # Future feature design
 ├── bin/
-│   └── cli-app-manager.js    # CLI 入口
+│   └── cli-app-manager.ts    # CLI entry point
 └── src/
-    ├── index.js          # DSH 插件入口
-    ├── discovery.js      # 应用发现逻辑
-    ├── commands.js       # 命令处理
-    └── utils.js          # 工具函数
+    ├── index.ts          # DSH plugin entry (apply + inject)
+    ├── discovery.ts      # App discovery logic
+    ├── commands.ts       # CLI command handlers
+    ├── utils.ts          # Utility functions
+    └── types.ts          # Shared TypeScript types
 ```
 
-## 🔧 开发
+### DSH Integration / DSH 集成
+
+This plugin registers as a DSH bundle via `patch.yml`:
+
+```yaml
+- insert:
+    - id: app-manager
+      name: 'dsh-app-manager'
+```
+
+The plugin uses `ctx.inject()` to dynamically inject `tools` and `webServer` services:
+
+```typescript
+export function apply(ctx: CordisContext): () => void {
+  ctx.inject(["tools"], (c) => registerTools(c.tools));
+  ctx.inject(["webServer"], (c) => registerWebRoutes(c.webServer));
+}
+```
+
+---
+
+## 🔧 Development / 开发
 
 ```bash
-# 运行测试
-node bin/cli-app-manager.js list
-node bin/cli-app-manager.js check
-node bin/cli-app-manager.js doctor
+# Install dependencies
+pnpm install
 
-# 调试模式
-set DEBUG=1
-node bin/cli-app-manager.js list
+# Build TypeScript
+pnpm run build
+
+# Run CLI locally
+node lib/bin/cli-app-manager.js list
+
+# Test with DSH web profile
+dsh --profile web --dump-default-config
 ```
 
-## 📝 已知限制
+---
 
-- Windows 上进程监控依赖 PowerShell 或 tasklist
-- npm view 查询可能在网络不佳时超时
-- 某些包的版本检查可能失败（私有包、scoped 包等）
+## 📝 Known Limitations / 已知限制
 
-## 📄 License
+- Process monitoring on Windows relies on PowerShell or tasklist
+- `npm view` queries may timeout on poor network connections
+- Version checks may fail for private/scoped packages
+- Some sources (scoop, cargo, pipx) are discover-only (no auto-update yet)
+
+---
+
+## 📄 License / 许可证
 
 MIT
+
+---
+
+## 🤝 Contributing / 贡献
+
+Issues and PRs are welcome at [GitHub Issues](https://github.com/BlankDevil/dsh-app-manager/issues).

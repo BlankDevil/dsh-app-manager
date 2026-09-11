@@ -26,7 +26,9 @@ export declare function listUnmanaged(options?: CommandOptions): Promise<void>;
  */
 export declare function showScanMethod(options?: CommandOptions): Promise<void>;
 /**
- * Check for available updates
+ * Check for available updates. Each `npm view` was previously run sequentially;
+ * now they go through a 5-way concurrency pool so a machine with 30+ npm/pnpm
+ * packages finishes in seconds instead of tens.
  */
 export declare function checkUpdates(options?: CommandOptions): Promise<CliApp[]>;
 /**
@@ -42,7 +44,9 @@ export declare function updateApp(appName: string, options?: CommandOptions): Pr
  */
 export declare function updateAll(options?: CommandOptions): Promise<void>;
 /**
- * Run health check on all apps
+ * Run health check on all apps. The expensive `cmd --version` probe used to
+ * be sequential (~150s for 50+ apps on Windows); now they run with a small
+ * concurrency pool so the whole check finishes in tens of seconds.
  */
 export declare function runDoctor(options?: CommandOptions): Promise<void>;
 /**

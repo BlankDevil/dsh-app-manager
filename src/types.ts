@@ -147,13 +147,29 @@ export interface ToolParameter {
   description: string;
 }
 
+/** Text content block, matching `@deepseek-ai/dsh-llm`'s TextBlock. */
+export interface TextContentBlock {
+  type: "text";
+  text: string;
+}
+
+/** Any DSH content block; the plugin only ever emits text blocks. */
+export type ContentBlock = TextContentBlock;
+
+/**
+ * Tool definition compatible with `@deepseek-ai/dsh-tools` >= 0.1.5.
+ *
+ * In 0.1.5 the `output` field became mandatory and uses a structured shape:
+ * `schema` declares the canonical value and `render` must project that value
+ * into `ContentBlock[]` (previously an optional `(value) => string`).
+ */
 export interface ToolDefinition {
   name: string;
   description: string;
   parameters: Record<string, ToolParameter>;
-  output?: {
-    schema?: unknown;
-    render?: (value: unknown) => string;
+  output: {
+    schema: unknown;
+    render: (args: Record<string, unknown>, value: unknown) => ContentBlock[];
   };
   execute: (args: Record<string, unknown>, exec: { signal: AbortSignal }) => Promise<unknown>;
 }

@@ -5,6 +5,35 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.1] - 2026-09-11
+
+### Added
+- **Collapsible category sections** on the web page: each tool category
+  (source group) renders inside a native `<details>/<summary>` block, so long
+  lists stay scannable.
+- **Clickable top statistics module**: the four stat cards (`All`,
+  `Managed`, `Unmanaged`, `In PATH`) jump to the matching section, and source
+  chips filter the tables client-side.
+
+### Changed
+- **Unified typography** across the whole page via CSS custom properties
+  (`--font-ui`, `--font-mono`, `--fs-title`, `--fs-section`, `--fs-body`,
+  `--fs-small`) — every heading, table cell, and label now shares one font
+  family and a fixed size scale.
+- **Unified list format**: all category tables share a single fixed
+  `<colgroup>` column layout (name 22%, version 11%, command 20%, source 9%,
+  install 11%, path 21%, status 6%), replacing per-table ad-hoc widths.
+
+### Fixed
+- **Compatibility with dsh 0.1.5-rc.1** (bundled `@deepseek-ai/dsh-tools`
+  0.1.5-rc.2). The tool API changed in two breaking ways the plugin now
+  satisfies:
+  - `output` is now **mandatory** — every one of the 7 tools declares it.
+  - `output.render` must return **`ContentBlock[]`**, not a bare string; each
+    tool now projects its markdown through a shared `asText()` helper that
+    returns `[{ type: "text", text }]`.
+- `peerDependencies` for `@deepseek-ai/dsh-tools` raised to `^0.1.5-rc.2`.
+
 ## [0.4.0] - 2026-09-11
 
 ### Added

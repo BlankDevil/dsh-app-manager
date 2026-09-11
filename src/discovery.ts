@@ -34,6 +34,51 @@ import {
   readPackageJson,
 } from "./utils.js";
 
+/* -------------------------------------------------------------------------- */
+/*  Scan-result cache                                                         */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * TTL (ms) for the in-process scan cache. Override with the
+ * APP_MANAGER_SCAN_TTL_MS env var. CLI processes (one-shot) are unaffected
+ * because each invocation starts a fresh Node — only the in-process DSH
+ * tool + web routes benefit.
+ */
+const SCAN_TTL_MS = Number(process.env.APP_MANAGER_SCAN_TTL_MS) || 60_000;
+
+interface BaselineCacheEntry {
+  ts: number;
+  data: ManagedApp[];
+}
+interface AllCacheEntry {
+  ts: number;
+  apps: CliApp[];
+  baseline: ManagedApp[];
+}
+
+let baselineCache: BaselineCacheEntry | null = null;
+let allCache: AllCacheEntry | null = null;
+
+/** Internal: read the ARP baseline through a TTL cache. */
+function readBaselineCached(): ManagedApp[] {
+  if (baselineCache && Date.now() - baselineCache.ts < SCAN_TTL_MS) {
+    return baselineCache.data;
+  }
+  const data = readArpEntries();
+  baselineCache = { ts: Date.now(), data };
+  return data;
+}
+
+function invalidateAllCache(): void {
+  allCache = null;
+}
+
+/** Test/dev hook: drop both caches (used by the runner to force a fresh scan). */
+export function _resetScanCache(): void {
+  baselineCache = null;
+  allCache = null;
+}
+
 /**
  * Known CLI tool mappings (package name -> command names)
  */
@@ -734,7 +779,7 @@ const KNOWN_COMMAND_HINTS: Record<string, { category: AppCategory; desc: string 
  * Read the Windows ARP baseline once. Returns an empty array off Windows.
  */
 export function readManagedBaseline(): ManagedApp[] {
-  return readArpEntries();
+  return readBaselineCached();
 }
 
 /**
@@ -810,6 +855,15 @@ function pathUnderAnyInstallLocation(filePath: string, baseline: ManagedApp[]): 
  * baseline (and package-manager provenance).
  */
 export function discoverAll(options: { baseline?: ManagedApp[] } = {}): CliApp[] {
+  // Cache hit: same baseline, fresh result, no caller-supplied baseline.
+  if (
+    !options.baseline &&
+    allCache &&
+    Date.now() - allCache.ts < SCAN_TTL_MS
+  ) {
+    return allCache.apps;
+  }
+
   const sources: Array<{ name: string; fn: () => CliApp[] }> = [
     { name: "npm", fn: discoverNpmGlobal },
     { name: "pnpm", fn: discoverPnpmGlobal },
@@ -862,6 +916,11 @@ export function discoverAll(options: { baseline?: ManagedApp[] } = {}): CliApp[]
   const baseline = options.baseline ?? readManagedBaseline();
   for (const app of allApps) resolveManaged(app, baseline);
 
+  // Cache only when the caller didn't pass an explicit baseline (otherwise
+  // the cached snapshot could disagree with the caller's view).
+  if (!options.baseline) {
+    allCache = { ts: Date.now(), apps: allApps, baseline };
+  }
   return allApps;
 }
 

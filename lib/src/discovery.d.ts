@@ -9,6 +9,8 @@
  *                            is flagged as unmanaged (portable / manually-placed)
  */
 import type { CliApp, ManagedApp, ScanReport } from "./types.js";
+/** Test/dev hook: drop both caches (used by the runner to force a fresh scan). */
+export declare function _resetScanCache(): void;
 /**
  * Discover npm globally installed CLI packages by reading filesystem
  */

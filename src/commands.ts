@@ -26,6 +26,31 @@ interface CommandOptions {
 }
 
 /**
+ * Run `worker` over `items` with at most `limit` tasks in flight at once.
+ * Results stay indexed to match the input order so callers can print in
+ * the original sequence. Used by `runDoctor` (concurrent `--version`
+ * checks) and `checkUpdates` (concurrent `npm view`).
+ */
+async function runWithConcurrency<T, R>(
+  items: T[],
+  limit: number,
+  worker: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let cursor = 0;
+  const lanes = Math.max(1, Math.min(limit, items.length));
+  const runners = Array.from({ length: lanes }, async () => {
+    while (true) {
+      const i = cursor++;
+      if (i >= items.length) return;
+      results[i] = await worker(items[i]);
+    }
+  });
+  await Promise.all(runners);
+  return results;
+}
+
+/**
  * Print a formatted table
  */
 function printTable(headers: string[], rows: string[][], columnWidths: number[]): void {
@@ -259,7 +284,9 @@ export async function showScanMethod(options: CommandOptions = {}): Promise<void
 }
 
 /**
- * Check for available updates
+ * Check for available updates. Each `npm view` was previously run sequentially;
+ * now they go through a 5-way concurrency pool so a machine with 30+ npm/pnpm
+ * packages finishes in seconds instead of tens.
  */
 export async function checkUpdates(options: CommandOptions = {}): Promise<CliApp[]> {
   if (!options.silent) console.log(colorize("⬆️  Checking for updates...\n", "cyan"));
@@ -271,33 +298,44 @@ export async function checkUpdates(options: CommandOptions = {}): Promise<CliApp
     return [];
   }
 
-  const updates: CliApp[] = [];
   const checked = new Set<string>();
-
-  for (const app of apps) {
-    if (checked.has(app.name)) continue;
+  const toCheck = apps.filter((app) => {
+    if (checked.has(app.name)) return false;
     checked.add(app.name);
+    return true;
+  });
 
-    if (!options.silent) process.stdout.write(`Checking ${app.name}... `);
-
+  type CheckOutcome = { app: CliApp; update: boolean; latestVersion?: string; note?: string };
+  const checkOne = async (app: CliApp): Promise<CheckOutcome> => {
     const result = execSafe(`npm.cmd view ${app.name} version 2>nul`, { shell: true, timeout: 10000 });
+    if (!result.success || !result.output) {
+      return { app, update: false, note: "unable to check" };
+    }
+    const latestVersion = result.output.trim();
+    const cmp = compareVersions(latestVersion, app.version);
+    if (cmp > 0) {
+      app.hasUpdate = true;
+      app.latestVersion = latestVersion;
+      return { app, update: true, latestVersion };
+    }
+    if (cmp < 0) return { app, update: false, latestVersion, note: `newer than ${latestVersion}` };
+    return { app, update: false, latestVersion, note: "up to date" };
+  };
 
-    if (result.success && result.output) {
-      const latestVersion = result.output.trim();
-      const cmp = compareVersions(latestVersion, app.version);
+  const outcomes = await runWithConcurrency(toCheck, 5, checkOne);
 
-      if (cmp > 0) {
-        app.hasUpdate = true;
-        app.latestVersion = latestVersion;
-        updates.push(app);
-        if (!options.silent) console.log(colorize(`${app.version} → ${latestVersion}`, "yellow"));
-      } else if (cmp < 0) {
-        if (!options.silent) console.log(colorize(`${app.version} (newer than ${latestVersion})`, "green"));
-      } else {
-        if (!options.silent) console.log(colorize("up to date", "green"));
-      }
+  const updates: CliApp[] = [];
+  for (const o of outcomes) {
+    if (!options.silent) process.stdout.write(`Checking ${o.app.name}... `);
+    if (o.update && o.latestVersion) {
+      if (!options.silent) console.log(colorize(`${o.app.version} → ${o.latestVersion}`, "yellow"));
+      updates.push(o.app);
+    } else if (o.note === "up to date") {
+      if (!options.silent) console.log(colorize("up to date", "green"));
+    } else if (o.note?.startsWith("newer than")) {
+      if (!options.silent) console.log(colorize(`${o.app.version} (${o.note})`, "green"));
     } else {
-      if (!options.silent) console.log(colorize("unable to check", "gray"));
+      if (!options.silent) console.log(colorize(o.note ?? "unable to check", "gray"));
     }
   }
 
@@ -305,21 +343,19 @@ export async function checkUpdates(options: CommandOptions = {}): Promise<CliApp
 
   if (updates.length === 0) {
     if (!options.silent) console.log(colorize("✅ All packages are up to date!", "green"));
-  } else {
-    if (!options.silent) {
-      console.log(colorize(`⚠️  ${updates.length} update(s) available:\n`, "yellow"));
-      const rows = updates.map((app) => [
-        app.name,
-        colorize(app.version, "red"),
-        "→",
-        colorize(app.latestVersion || "", "green"),
-        colorize(app.source, "blue"),
-      ]);
-      printTable(["Package", "Current", "", "Latest", "Source"], rows, [25, 12, 3, 12, 10]);
-      console.log(
-        colorize("\nRun 'app-manager update <package>' or 'app-manager update-all' to update.", "gray")
-      );
-    }
+  } else if (!options.silent) {
+    console.log(colorize(`⚠️  ${updates.length} update(s) available:\n`, "yellow"));
+    const rows = updates.map((app) => [
+      app.name,
+      colorize(app.version, "red"),
+      "→",
+      colorize(app.latestVersion || "", "green"),
+      colorize(app.source, "blue"),
+    ]);
+    printTable(["Package", "Current", "", "Latest", "Source"], rows, [25, 12, 3, 12, 10]);
+    console.log(
+      colorize("\nRun 'app-manager update <package>' or 'app-manager update-all' to update.", "gray")
+    );
   }
 
   return updates;
@@ -468,7 +504,9 @@ export async function updateAll(options: CommandOptions = {}): Promise<void> {
 }
 
 /**
- * Run health check on all apps
+ * Run health check on all apps. The expensive `cmd --version` probe used to
+ * be sequential (~150s for 50+ apps on Windows); now they run with a small
+ * concurrency pool so the whole check finishes in tens of seconds.
  */
 export async function runDoctor(options: CommandOptions = {}): Promise<void> {
   console.log(colorize("🏥 Running health check...\n", "cyan"));
@@ -476,41 +514,36 @@ export async function runDoctor(options: CommandOptions = {}): Promise<void> {
   const apps = discoverAll();
   const issues: Array<{ app: string; severity: "error" | "warning"; message: string }> = [];
 
-  for (const app of apps) {
-    process.stdout.write(`Checking ${app.name}... `);
-
-    let commandsOk = true;
+  type CheckResult = { name: string; ok: boolean; issues: typeof issues };
+  const checkOne = async (app: CliApp): Promise<CheckResult> => {
+    const local: typeof issues = [];
     for (const cmd of app.commands) {
       if (!commandExists(cmd)) {
-        commandsOk = false;
-        issues.push({ app: app.name, severity: "error", message: `Command '${cmd}' not found in PATH` });
+        local.push({ app: app.name, severity: "error", message: `Command '${cmd}' not found in PATH` });
       }
     }
-
-    let pathOk = true;
     if (app.path && !existsSync(app.path)) {
-      pathOk = false;
-      issues.push({ app: app.name, severity: "warning", message: `Package directory missing: ${app.path}` });
+      local.push({ app: app.name, severity: "warning", message: `Package directory missing: ${app.path}` });
     }
-
-    let versionOk = true;
     if (app.commands.length > 0 && commandExists(app.commands[0])) {
       const versionResult = execSafe(`${app.commands[0]} --version 2>nul`, { shell: true, timeout: 5000 });
       if (!versionResult.success) {
-        versionOk = false;
-        issues.push({
+        local.push({
           app: app.name,
           severity: "warning",
           message: `Command '${app.commands[0]} --version' failed`,
         });
       }
     }
+    return { name: app.name, ok: local.length === 0, issues: local };
+  };
 
-    if (commandsOk && pathOk && versionOk) {
-      console.log(colorize("✅ OK", "green"));
-    } else {
-      console.log(colorize("⚠️  Issues found", "yellow"));
-    }
+  // 8 parallel is a safe ceiling on Windows; spawn is the bottleneck.
+  const results = await runWithConcurrency(apps, 8, checkOne);
+
+  for (const r of results) {
+    console.log(`Checking ${r.name}... ${r.ok ? colorize("✅ OK", "green") : colorize("⚠️  Issues found", "yellow")}`);
+    for (const i of r.issues) issues.push(i);
   }
 
   console.log();

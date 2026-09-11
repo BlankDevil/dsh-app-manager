@@ -98,3 +98,30 @@
 
 **合计**：A 组 18 · B 组 16 · C 组 5 · D 组 5 · E 组 7 = **51 条**
 （其中 ◆ 网络扩展 2 条，`--quick` 模式跳过）
+
+---
+
+## G 组 — 拖拽交互行为（`drag-behavior.test.mjs`，jsdom 真实事件）
+
+> 与 D 组的关键区别：D 组是**静态断言**（HTML 里有没有某个 class），
+> G 组是**行为验证**（真实派发 PointerEvent，断言 DOM 结果与持久化）。
+> 交互功能的唯一可信证据在 G 组——D 组全绿时 Q6/Q7 依然可能是坏的。
+
+| ID | 用例 | 断言 |
+|----|------|------|
+| TC-G01 | 分类区块数量 | 页面渲染出 ≥2 个 `details.category` |
+| TC-G02 | 分类手柄覆盖 | 每个分类头均有 `.drag-grip` |
+| TC-G03 | AI 默认置顶 | 首个分类为 `ai` |
+| TC-G04 | 手柄不触发折叠 | 在手柄上 pointerdown+pointerup 后 `details.open` 不变 |
+| TC-G05 | 分类拖拽换序 | 拖 A 到 B 下半区释放 → DOM 中 A 排在 B 之后 |
+| TC-G06 | 顺序持久化 | `localStorage:catorder` 已写入，且与当前 DOM 顺序一致 |
+| TC-G07 | 恢复路径存在 | 页面脚本含 `applySavedOrder` 且引用 `ORDER_KEY` |
+| TC-G08 | 行进不再用原生 draggable | `tr[draggable="true"]` 数为 0 |
+| TC-G09 | 行手柄覆盖 | 每个数据行名字单元格含 `.row-grip` |
+| TC-G10 | 跨分类移行 | 拖动行到另一分类释放 → `row.parentElement === 目标 tbody` |
+| TC-G11 | 移行持久化 | `localStorage:moves` 记录的分类与 DOM 实际归属一致 |
+| TC-G12 | 计数徽章刷新 | 每个分类 `.cat-count` === 该分类实际 `tbody tr` 数 |
+| TC-G13 | 点击阈值生效 | 无位移的 pointerdown+pointerup 不移动任何行 |
+
+**回归能力**：旧实现（原生 DnD + pointerdown preventDefault）对本组得
+7 PASS / 6 FAIL，新实现 13/13 PASS —— 该组能真正拦住「标记齐全但拖不动」。

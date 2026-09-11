@@ -43,17 +43,23 @@ check("S7: tooltip refresh logic", html.includes("refreshTooltips"));
 check("S7: tooltip only when overflow", html.includes("scrollWidth > td.clientWidth"));
 check("S7: NO auto-shrink (fixed px widths)", html.includes("savedWidths[cls] = Math.round(w)"));
 
-// Q6: draggable categories, AI first
+// Q6: draggable categories, AI first.
+// NOTE: implemented with Pointer Events, NOT native HTML5 DnD — the old
+// preventDefault-on-pointerdown approach killed dragstart entirely. Behaviour
+// is covered by drag-behavior.test.mjs; here we only check the wiring exists.
 check("Q6: drag-grip present", html.includes("drag-grip"));
-check("Q6: section dragstart", html.includes("text/dsh-section"));
+check("Q6: pointer-driven section drag", html.includes("startSectionDrag") && html.includes("sectionUnderPointer"));
+check("Q6: grip click suppressed", /drag-grip[\s\S]{0,900}stopPropagation/.test(html) || html.includes("cat-dragging"));
 check("Q6: order persisted", html.includes("dsh-app-manager:catorder"));
+check("Q6: no native draggable on sections", !html.includes("setAttribute('draggable'"));
 const aiIdx = html.indexOf('data-category="ai"');
 const firstCatIdx = html.search(/data-category="/);
 check("Q6: AI category rendered first", aiIdx >= 0 && aiIdx === firstCatIdx, `ai@${aiIdx} first@${firstCatIdx}`);
 
-// Q7: drag rows between categories
-check("Q7: rows draggable", html.includes('draggable="true" data-app='));
-check("Q7: row drag payload", html.includes("text/dsh-row"));
+// Q7: drag rows between categories (Pointer Events, threshold-gated).
+check("Q7: row grip present", html.includes("row-grip"));
+check("Q7: rows NOT natively draggable", !html.includes('draggable="true" data-app='));
+check("Q7: row drag threshold", html.includes("ROW_DRAG_THRESHOLD"));
 check("Q7: moves persisted", html.includes("dsh-app-manager:moves"));
 check("Q7: counts refresh after move", html.includes("refreshCounts"));
 

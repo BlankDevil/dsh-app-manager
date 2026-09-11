@@ -30,6 +30,7 @@ tests/
 ├── TEST-CASES.md        ← 测试用例规格（编号 / 前置 / 步骤 / 预期）
 ├── run-tests.mjs        ← 全量测试入口（51 用例自动化运行器）
 ├── smoke-features.mjs   ← 冒烟集（S6/S7/S9/Q6/Q7 等新特性快速回归，19 检查）
+├── drag-behavior.test.mjs ← **拖拽交互行为测试**（jsdom 真实派发 PointerEvent，13 检查）
 ├── verify-fixes.mjs     ← 历史修复验证（D1/D2/source-chip 等，8 检查）
 ├── reports/             ← 测试报告归档（机器生成 run-*.md + 人工结论 TEST-REPORT-*.md）
 ├── probe-plugin-runtime.mjs   ← 早期探针（已被 run-tests.mjs 取代，留档）
@@ -54,6 +55,8 @@ tests/
 ```bash
 npm test            # 全量（= node tests/run-tests.mjs）
 npm run test:quick  # 快速回归（跳过网络扩展用例 TC-A18 / TC-B15）
+npm run test:ui     # UI 相关组（= --group B,C,D）
+npm run test:drag   # 拖拽交互行为测试（需 jsdom）
 npm run smoke       # 冒烟集（= node tests/smoke-features.mjs）
 
 # 只跑指定组（用于「修 bug 只跑相关模块」）
@@ -77,6 +80,24 @@ node tests/run-tests.mjs --group B,C,D     # UI 改动 → 必带 B,C（见下�
 | C | Web 路由与 JSON API | 进程内伪 HTTP 调用 |
 | D | UI 需求断言（统一字体 / 统一列表 / 可折叠 / 可点击统计） | 基于真实生成的 HTML 做结构断言 |
 | E | 数据一致性（计数守恒 / 枚举合法 / 无重复） | 基于 C 组 JSON 交叉验证 |
+
+## 静态断言 ≠ 行为验证（重要教训）
+
+`run-tests.mjs` / `smoke-features.mjs` 属于**静态标记断言**：它们从生成的 HTML 里
+检查 `drag-grip` 这个 class 存不存在、脚本里有没有 `persistOrder` 这个函数名。
+
+问题是：**交互功能光有标记不代表能用。** 2026-09-11 的实际翻车案例——Q6/Q7 首版用
+原生 HTML5 拖放实现，在拖拽柄的 `pointerdown` 上调用 `e.preventDefault()`（本意是
+阻止 `<summary>` 折叠），副作用是把浏览器的拖拽启动也一并取消了，`dragstart`
+永不触发，**功能完全是死的**，但当时静态断言 19/19 全绿。
+
+因此凡是**交互行为**（拖拽、拖放、列宽调整、筛选跳转等），必须用
+`drag-behavior.test.mjs` 这类**行为测试**来验证：真实 DOM、真实事件、真实断言
+最终状态与持久化结果。
+
+- 依赖 `jsdom`（装在本机隔离工作区，非插件运行时依赖）；未安装时该测试**优雅跳过**（exit 0），不会误判为失败。
+- 该测试具备**回归能力**：用旧实现跑会稳定 FAIL（已反向验证：旧代码 7 PASS / 6 FAIL，
+  新代码 13/13 PASS），因此它能真正拦住「标记齐全但交互失效」的回归。
 
 ## 环境基线（首次归档时）
 

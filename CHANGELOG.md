@@ -5,6 +5,42 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.4] - 2026-09-11
+
+### Fixed
+- **Category drag-to-reorder (Q6) did not work at all.** The first
+  implementation used native HTML5 drag & drop and called
+  `preventDefault()` on the grip's `pointerdown` (intended to stop the
+  `<summary>` from collapsing). That call also cancels the browser's own
+  drag initiation, so `dragstart` never fired and nothing was draggable.
+  Rewritten with **Pointer Events**, which gives full control and behaves
+  identically across engines.
+- **Drag an app row between categories (Q7) did not work.** Native DnD on a
+  `<tr>` is unreliable (text selection fights the drag, drag image poorly
+  supported). Rewritten with Pointer Events and a movement threshold, so a
+  plain click still selects text and does not move the row.
+
+### Changed
+- Rows no longer carry `draggable="true"`; each name cell shows a `.row-grip`
+  handle on hover instead. Section grips stay, now with `cursor: grabbing`
+  feedback and a `body.cat-dragging` selection lock during the drag.
+- Section hit-testing uses `elementFromPoint` (with a geometric fallback) so
+  the translucent section being dragged does not keep matching itself.
+
+### Added
+- `tests/drag-behavior.test.mjs` — **behavioural** drag tests driven through
+  jsdom with real `PointerEvent`s (13 checks). Covers category reorder, the
+  resulting DOM order, localStorage persistence, row moves between
+  categories, badge refresh, and the click-vs-drag threshold.
+  Regression-proven: the old implementation scores 7 PASS / 6 FAIL against it,
+  the new one 13/13.
+- `npm run test:drag`.
+
+### Notes
+- Static marker assertions (`smoke-features.mjs`) were updated for the new
+  implementation. They **cannot** prove an interaction works — that is what
+  `drag-behavior.test.mjs` is for. See `tests/README.md` for the distinction.
+
 ## [0.4.3] - 2026-09-11
 
 ### Added

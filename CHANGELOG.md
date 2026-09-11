@@ -5,6 +5,46 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.3] - 2026-09-11
+
+### Added
+- **Resizable table columns (S7)**: every column header carries a drag handle.
+  Widths become fixed pixel values on first render (no auto-shrink) and persist
+  in `localStorage`, so a reload keeps the layout the user chose.
+- **Overflow tooltips (S7)**: any cell whose text does not fit gains a native
+  `title` tooltip showing the full value; cells that fit stay tooltip-free to
+  avoid noise. Re-evaluated on resize and after filtering.
+- **Drag-to-reorder categories (Q6)**: each category header has a grip; drag it
+  to move the whole section. Order persists in `localStorage`. AI still leads
+  by default.
+- **Drag apps between categories (Q7)**: drag any app row into another
+  category's table. The move is a view-level override persisted locally — the
+  backend scan still reports the package's real category. Row counts refresh.
+- `window.__resetLayout()` clears all three layout overrides (column widths,
+  category order, row moves) and reloads.
+- `tests/` now ships inside the plugin: full suite (`run-tests.mjs`), feature
+  smoke (`smoke-features.mjs`), probes, and archived reports.
+- The suite supports `--group B,C,D` for module-scoped regression runs, so a
+  UI change does not require the full 51-case sweep.
+
+### Changed
+- **Light/dark theming (S9)**: the page previously hardcoded a dark palette.
+  It now defines light tokens by default and switches to dark via
+  `prefers-color-scheme`, with every rule colour funnelled through tokens
+  (hover, header, count background, badges).
+- **Maintainability (S6)**: removed the unused `defineTool` import and the
+  `managedInCat` dead local; extracted `CATEGORY_ICONS` / `CATEGORY_ORDER` /
+  `categoryRank()` to module scope so unknown categories sort last instead of
+  first (a latent `indexOf === -1` bug).
+- `npm test` now runs the real suite (`node tests/run-tests.mjs`) instead of
+  globbing a non-existent `lib/**/*.test.js`. Added `test:quick` and `smoke`.
+- Scratch paths moved from the sibling `dsh-playground/tests/` into the plugin
+  repo so tests travel with the code.
+
+### Removed
+- Empty `slides/` directory; `.slidep/`, `slides/`, `*.pptx` and generated test
+  snapshots are now git-ignored as unrelated tooling artifacts.
+
 ## [0.4.1] - 2026-09-11
 
 ### Added

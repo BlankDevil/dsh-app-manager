@@ -4,7 +4,7 @@
  */
 
 import type { CliApp, CordisContext, HttpRequest, HttpResponse, ToolDefinition, WebServerService } from "./types.js";
-import { discoverAll, findApp } from "./discovery.js";
+import { buildScanReport, discoverAll, discoverUnmanaged, findApp, readManagedBaseline } from "./discovery.js";
 import { commandExists, compareVersions, execSafe } from "./utils.js";
 import { defineTool as dshDefineTool } from "@deepseek-ai/dsh-tools";
 
@@ -15,9 +15,16 @@ const defineTool = dshDefineTool as unknown as (tool: ToolDefinition) => ToolDef
  */
 function formatAppList(apps: CliApp[]): string {
   if (apps.length === 0) return "No CLI applications discovered.";
-  const lines = ["| Name | Version | Commands | Source |", "|------|---------|----------|--------|"];
+  const managedCount = apps.filter((a) => a.managed).length;
+  const lines = [
+    `${apps.length} apps (${managedCount} managed, ${apps.length - managedCount} unmanaged)`,
+    "",
+    "| Name | Version | Commands | Source | Install |",
+    "|------|---------|----------|--------|---------|",
+  ];
   for (const app of apps) {
-    lines.push(`| ${app.name} | ${app.version} | ${app.commands.join(", ")} | ${app.source} |`);
+    const install = app.managed ? "managed" : app.installKind;
+    lines.push(`| ${app.name} | ${app.version} | ${app.commands.join(", ")} | ${app.source} | ${install} |`);
   }
   return lines.join("\n");
 }
@@ -190,6 +197,56 @@ function registerTools(toolsService: { register: (tool: ToolDefinition) => (() =
     },
   });
 
+  register({
+    name: "app_manager_unmanaged",
+    description:
+      "List programs installed on this machine that are NOT managed by a Windows installer (Add/Remove Programs). These are portable, manually-placed, or user-dir tools discovered by cross-referencing the PATH enumeration against the Add/Remove-Programs registry baseline. On non-Windows platforms returns all tools not owned by a package manager.",
+    parameters: {},
+    output: {
+      schema: { type: "string", description: "Markdown table of unmanaged/portable programs." },
+    },
+    execute: async () => {
+      const apps = discoverUnmanaged();
+      if (apps.length === 0) return "No unmanaged programs found.";
+      const lines = [
+        `${apps.length} unmanaged program(s) — portable / manually placed:`,
+        "",
+        "| Name | Command | Install kind | Path |",
+        "|------|---------|--------------|------|",
+      ];
+      for (const app of apps) {
+        lines.push(`| ${app.name} | ${app.commands.join(", ")} | ${app.installKind} | ${app.path || "N/A"} |`);
+      }
+      return lines.join("\n");
+    },
+  });
+
+  register({
+    name: "app_manager_scan_method",
+    description:
+      "Explain how the app scan works: which discovery sources and techniques were used (PATH enumeration, package-manager queries, Add/Remove-Programs registry baseline), which were available on this machine, and how many entries each contributed.",
+    parameters: {},
+    output: {
+      schema: { type: "string", description: "Scan methodology report in markdown." },
+    },
+    execute: async () => {
+      const baseline = readManagedBaseline();
+      const report = buildScanReport({ baseline });
+      const lines = [
+        `Scan methodology (${report.platform}, ${report.durationMs}ms)`,
+        "",
+        `Total: ${report.totalApps} apps · ${report.managedCount} managed · ${report.unmanagedCount} unmanaged`,
+        "",
+        "| Source | Technique | Available | Found |",
+        "|--------|-----------|-----------|-------|",
+      ];
+      for (const s of report.sources) {
+        lines.push(`| ${s.source} | ${s.method} | ${s.available ? "yes" : "no"} | ${s.found} |`);
+      }
+      return lines.join("\n");
+    },
+  });
+
   return disposers;
 }
 
@@ -266,12 +323,16 @@ function generateAppManagerPage(): string {
         const status = app.commands.some((cmd) => commandExists(cmd))
           ? "<span class='status ok'>✅ PATH</span>"
           : "<span class='status missing'>❌ PATH</span>";
+        const installBadge = app.managed
+          ? "<span class='kind managed'>managed</span>"
+          : `<span class='kind unmanaged'>${escapeHtml(app.installKind)}</span>`;
         return `
           <tr>
             <td class="name">${escapeHtml(app.name)}</td>
             <td class="version">${escapeHtml(app.version)}</td>
             <td class="commands">${escapeHtml(app.commands.join(", "))}</td>
             <td class="source">${escapeHtml(app.source)}</td>
+            <td class="install">${installBadge}</td>
             <td class="path" title="${escapeHtml(app.path)}">${escapeHtml(app.path || "N/A")}</td>
             <td class="status-cell">${status}</td>
           </tr>
@@ -289,6 +350,7 @@ function generateAppManagerPage(): string {
               <th>Version</th>
               <th>Commands</th>
               <th>Source</th>
+              <th>Install</th>
               <th>Path</th>
               <th>Status</th>
             </tr>
@@ -307,6 +369,17 @@ function generateAppManagerPage(): string {
     .map(([source, count]) => `<span class="badge">${escapeHtml(source)}: ${count}</span>`)
     .join(" ");
 
+  const managedCount = apps.filter((a) => a.managed).length;
+  const unmanagedCount = apps.length - managedCount;
+  const methodReport = buildScanReport({ baseline: readManagedBaseline() });
+  const methodRows = methodReport.sources
+    .map(
+      (s) =>
+        `<tr><td class="mono">${escapeHtml(s.source)}</td><td>${escapeHtml(s.method)}</td>` +
+        `<td>${s.available ? "✅" : "—"}</td><td class="mono">${s.found}</td></tr>`
+    )
+    .join("");
+
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -323,6 +396,7 @@ function generateAppManagerPage(): string {
       --accent: #58a6ff;
       --ok: #238636;
       --missing: #da3633;
+      --warn: #d29922;
     }
     * { box-sizing: border-box; }
     body {
@@ -398,6 +472,31 @@ function generateAppManagerPage(): string {
     .status { font-size: 0.8rem; font-weight: 600; }
     .status.ok { color: var(--ok); }
     .status.missing { color: var(--missing); }
+    .kind {
+      display: inline-block;
+      font-size: 0.72rem;
+      font-weight: 600;
+      padding: 0.15rem 0.5rem;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+    }
+    .kind.managed { color: var(--ok); border-color: rgba(35,134,54,0.5); background: rgba(35,134,54,0.12); }
+    .kind.unmanaged { color: var(--warn); border-color: rgba(210,153,34,0.5); background: rgba(210,153,34,0.12); }
+    .mono { font-family: monospace; font-size: 0.8rem; }
+    .method-section {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      margin-bottom: 1.5rem;
+      overflow: hidden;
+    }
+    .method-section h2 {
+      margin: 0;
+      padding: 1rem;
+      background: rgba(210,153,34,0.1);
+      border-bottom: 1px solid var(--border);
+      font-size: 1.1rem;
+    }
     .empty {
       text-align: center;
       padding: 3rem;
@@ -418,10 +517,21 @@ function generateAppManagerPage(): string {
     <p class="subtitle">Discover, monitor, and manage installed CLI applications</p>
     <div class="summary">
       <span class="badge">Total: ${apps.length}</span>
+      <span class="badge">Managed: ${managedCount}</span>
+      <span class="badge">Unmanaged: ${unmanagedCount}</span>
       ${sourceSummary}
     </div>
   </header>
   <main>
+    <section class="method-section">
+      <h2>🧭 Scan methodology</h2>
+      <table>
+        <thead>
+          <tr><th>Source</th><th>Technique</th><th>Available</th><th>Found</th></tr>
+        </thead>
+        <tbody>${methodRows}</tbody>
+      </table>
+    </section>
     ${apps.length === 0 ? "<div class='empty'>No CLI applications discovered.</div>" : categoryHtml}
   </main>
   <footer>
@@ -463,10 +573,51 @@ function registerWebRoutes(webServer: WebServerService): Array<(() => void) | un
           source: app.source,
           description: app.description,
           path: app.path,
+          managed: app.managed,
+          installKind: app.installKind,
           inPath: app.commands.some((cmd) => commandExists(cmd)),
+        }));
+        const managedCount = apps.filter((a) => a.managed).length;
+        res.writeHead(200, { "content-type": "application/json; charset=utf-8" });
+        res.end(
+          JSON.stringify(
+            { total: apps.length, managedCount, unmanagedCount: apps.length - managedCount, apps },
+            null,
+            2
+          )
+        );
+      },
+    })
+  );
+
+  // Unmanaged-only JSON API
+  disposers.push(
+    webServer.register({
+      kind: "exact",
+      path: "/app-manager/api/unmanaged",
+      handler: (_req: HttpRequest, res: HttpResponse) => {
+        const apps = discoverUnmanaged().map((app) => ({
+          name: app.name,
+          commands: app.commands,
+          source: app.source,
+          installKind: app.installKind,
+          path: app.path,
         }));
         res.writeHead(200, { "content-type": "application/json; charset=utf-8" });
         res.end(JSON.stringify({ total: apps.length, apps }, null, 2));
+      },
+    })
+  );
+
+  // Scan methodology JSON API
+  disposers.push(
+    webServer.register({
+      kind: "exact",
+      path: "/app-manager/api/method",
+      handler: (_req: HttpRequest, res: HttpResponse) => {
+        const report = buildScanReport({ baseline: readManagedBaseline() });
+        res.writeHead(200, { "content-type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify(report, null, 2));
       },
     })
   );

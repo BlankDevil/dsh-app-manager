@@ -6,6 +6,8 @@
 
 import {
   listApps,
+  listUnmanaged,
+  showScanMethod,
   checkUpdates,
   showInfo,
   updateApp,
@@ -24,6 +26,7 @@ interface ParsedArgs {
     output?: string;
     json?: boolean;
     category?: string;
+    source?: string;
   };
 }
 
@@ -48,6 +51,10 @@ function parseArgs(argv: string[]): ParsedArgs {
       options.category = args[i + 1];
       i++;
     }
+    if (args[i] === "--source" || args[i] === "-s") {
+      options.source = args[i + 1];
+      i++;
+    }
   }
 
   return { command, subCommand, options };
@@ -64,6 +71,17 @@ async function main(): Promise<void> {
       case "list":
       case "ls":
         await listApps(options);
+        break;
+
+      case "unmanaged":
+      case "portable":
+        await listUnmanaged(options);
+        break;
+
+      case "method":
+      case "how":
+      case "scan":
+        await showScanMethod(options);
         break;
 
       case "check":

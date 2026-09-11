@@ -5,7 +5,7 @@
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import type { CliApp } from "./types.js";
-import { discoverAll, findApp } from "./discovery.js";
+import { buildScanReport, discoverAll, discoverUnmanaged, findApp, readManagedBaseline } from "./discovery.js";
 import {
   colorize,
   colors,
@@ -21,6 +21,7 @@ interface CommandOptions {
   output?: string;
   json?: boolean;
   category?: string;
+  source?: string;
   silent?: boolean;
 }
 
@@ -75,14 +76,30 @@ export async function listApps(options: CommandOptions = {}): Promise<void> {
   console.log(colorize("🔍 Scanning for installed CLI applications...\n", "cyan"));
 
   const startTime = Date.now();
-  const apps = discoverAll();
+  let apps = discoverAll();
   const duration = Date.now() - startTime;
+
+  if (options.source) {
+    apps = apps.filter((a) => a.source === options.source);
+  }
+  if (options.category) {
+    apps = apps.filter((a) => a.category === options.category);
+  }
 
   if (apps.length === 0) {
     console.log(colorize("No CLI applications found.", "yellow"));
     console.log(colorize("Try installing some global npm packages: npm install -g <package>", "gray"));
     return;
   }
+
+  const managedCount = apps.filter((a) => a.managed).length;
+  const unmanagedCount = apps.length - managedCount;
+  console.log(
+    colorize(
+      `Managed: ${managedCount}  ·  Unmanaged (portable): ${unmanagedCount}\n`,
+      "gray"
+    )
+  );
 
   const byCategory: Record<string, CliApp[]> = {};
   for (const app of apps) {
@@ -119,16 +136,24 @@ export async function listApps(options: CommandOptions = {}): Promise<void> {
 
     const rows = appsInCategory.map((app) => {
       const updateMarker = app.hasUpdate ? colorize(`↑${app.latestVersion}`, "yellow") : "";
+      const managedMarker = app.managed
+        ? colorize("managed", "green")
+        : colorize(app.installKind, "yellow");
       return [
         colorize(app.name, "white"),
         colorize(app.version, "green"),
         app.commands.join(", "),
         colorize(app.source, "blue"),
+        managedMarker,
         updateMarker,
       ];
     });
 
-    printTable(["Name", "Version", "Commands", "Source", "Update"], rows, [25, 12, 20, 12, 15]);
+    printTable(
+      ["Name", "Version", "Commands", "Source", "Install", "Update"],
+      rows,
+      [22, 12, 18, 11, 11, 12]
+    );
     console.log();
   }
 
@@ -141,6 +166,95 @@ export async function listApps(options: CommandOptions = {}): Promise<void> {
   console.log(colorize("\n📊 By source:", "gray"));
   for (const [source, count] of Object.entries(bySource)) {
     console.log(colorize(`  ${source}: ${count}`, "gray"));
+  }
+}
+
+/**
+ * List only the programs NOT managed by a Windows installer.
+ *
+ * These are portable / manually-placed tools discovered by cross-referencing
+ * the PATH enumeration against the Add/Remove-Programs registry baseline.
+ */
+export async function listUnmanaged(options: CommandOptions = {}): Promise<void> {
+  console.log(colorize("🔍 Finding programs not managed by a Windows installer...\n", "cyan"));
+
+  const baseline = readManagedBaseline();
+  if (process.platform === "win32") {
+    console.log(colorize(`Add/Remove-Programs baseline: ${baseline.length} managed entries\n`, "gray"));
+  } else {
+    console.log(colorize("Not on Windows — showing all non-package-manager tools.\n", "gray"));
+  }
+
+  const apps = discoverUnmanaged({ baseline });
+
+  if (apps.length === 0) {
+    console.log(colorize("✅ No unmanaged programs found.", "green"));
+    return;
+  }
+
+  const bySource: Record<string, CliApp[]> = {};
+  for (const app of apps) {
+    if (!bySource[app.source]) bySource[app.source] = [];
+    bySource[app.source].push(app);
+  }
+
+  for (const [source, list] of Object.entries(bySource)) {
+    console.log(colorize(`📎 ${source.toUpperCase()} (${list.length})`, "bright"));
+    const rows = list.map((app) => [
+      colorize(app.name, "white"),
+      colorize(app.installKind, "yellow"),
+      app.commands.join(", "),
+      colorize(truncate(app.path || "N/A", 46), "gray"),
+    ]);
+    printTable(["Name", "Kind", "Command", "Path"], rows, [22, 12, 18, 48]);
+    console.log();
+  }
+
+  console.log(
+    colorize(
+      `✅ ${apps.length} unmanaged program(s) — these are portable / manually placed.`,
+      "green"
+    )
+  );
+  console.log(
+    colorize(
+      "   Tip: portable tools live in user dirs (e.g. ~/.local/bin, ~/bin, AppData\\Roaming\\npm).",
+      "gray"
+    )
+  );
+}
+
+/**
+ * Show exactly which scan techniques were used and what each found.
+ * This is the self-documenting "how did you look?" report.
+ */
+export async function showScanMethod(options: CommandOptions = {}): Promise<void> {
+  console.log(colorize("🧭 Scan methodology report\n", "cyan"));
+
+  const baseline = readManagedBaseline();
+  const report = buildScanReport({ baseline });
+
+  console.log(colorize("Techniques used:", "bright"));
+  const rows = report.sources.map((s) => [
+    colorize(s.source, "white"),
+    s.available ? colorize("yes", "green") : colorize("no", "gray"),
+    s.found.toString(),
+    colorize(s.method, "gray"),
+  ]);
+  printTable(["Source", "Available", "Found", "Technique"], rows, [12, 10, 8, 52]);
+
+  console.log();
+  console.log(
+    colorize(
+      `✅ ${report.totalApps} apps  ·  ${report.managedCount} managed  ·  ${report.unmanagedCount} unmanaged  ·  ${formatDuration(report.durationMs)}`,
+      "green"
+    )
+  );
+
+  if (options.output) {
+    const { writeFileSync } = await import("node:fs");
+    writeFileSync(options.output, JSON.stringify(report, null, 2), "utf8");
+    console.log(colorize(`📄 Methodology report exported to ${options.output}`, "green"));
   }
 }
 
@@ -520,11 +634,14 @@ export async function monitorProcesses(options: CommandOptions = {}): Promise<vo
  */
 export async function exportRegistry(options: CommandOptions = {}): Promise<void> {
   const apps = discoverAll();
+  const managedCount = apps.filter((a) => a.managed).length;
   const registry = {
     generatedAt: new Date().toISOString(),
     platform: process.platform,
     nodeVersion: process.version,
     totalApps: apps.length,
+    managedCount,
+    unmanagedCount: apps.length - managedCount,
     apps: apps.map((app) => ({
       name: app.name,
       version: app.version,
@@ -533,6 +650,8 @@ export async function exportRegistry(options: CommandOptions = {}): Promise<void
       commands: app.commands,
       description: app.description,
       path: app.path,
+      managed: app.managed,
+      installKind: app.installKind,
     })),
   };
 
@@ -587,6 +706,8 @@ export function showHelp(): void {
 
   const commands: Array<[string, string]> = [
     ["list", "List all discovered CLI applications"],
+    ["unmanaged", "List programs NOT managed by a Windows installer"],
+    ["method", "Show how the scan works (sources + techniques)"],
     ["check", "Check for available updates"],
     ["info <app>", "Show detailed information about an app"],
     ["update <app>", "Update a specific application"],
@@ -605,6 +726,8 @@ export function showHelp(): void {
 
   console.log("\n" + colorize("Examples:", "bright"));
   console.log("  app-manager list");
+  console.log("  app-manager unmanaged");
+  console.log("  app-manager method --output scan.json");
   console.log("  app-manager check");
   console.log("  app-manager info claude");
   console.log("  app-manager update dsh");
@@ -613,7 +736,8 @@ export function showHelp(): void {
   console.log("  app-manager export --output registry.json");
 
   console.log("\n" + colorize("Supported sources:", "bright"));
-  console.log("  npm, pnpm, npx-cache, scoop, choco, cargo, pipx");
+  console.log("  npm, pnpm, npx-cache, scoop, choco, cargo, pipx, pip, uv, path");
+  console.log(colorize("  (+ Windows Add/Remove registry used as the managed/unmanaged baseline)", "gray"));
 }
 
 /**

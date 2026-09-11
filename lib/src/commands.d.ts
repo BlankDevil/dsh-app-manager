@@ -6,12 +6,25 @@ interface CommandOptions {
     output?: string;
     json?: boolean;
     category?: string;
+    source?: string;
     silent?: boolean;
 }
 /**
  * List all discovered CLI applications
  */
 export declare function listApps(options?: CommandOptions): Promise<void>;
+/**
+ * List only the programs NOT managed by a Windows installer.
+ *
+ * These are portable / manually-placed tools discovered by cross-referencing
+ * the PATH enumeration against the Add/Remove-Programs registry baseline.
+ */
+export declare function listUnmanaged(options?: CommandOptions): Promise<void>;
+/**
+ * Show exactly which scan techniques were used and what each found.
+ * This is the self-documenting "how did you look?" report.
+ */
+export declare function showScanMethod(options?: CommandOptions): Promise<void>;
 /**
  * Check for available updates
  */

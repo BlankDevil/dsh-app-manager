@@ -1,11 +1,38 @@
 /**
  * Discovery module - finds installed CLI tools across package managers
+ *
+ * Scanning strategy (multi-source cross-reference):
+ *   1. Package managers   -> npm / pnpm / npx-cache / scoop / choco / cargo / pipx / pip / uv
+ *   2. PATH enumeration   -> every executable directly callable on PATH
+ *   3. ARP registry       -> Windows Add/Remove baseline, used to mark "managed"
+ *   4. Cross-reference    -> anything on PATH but absent from the ARP baseline
+ *                            is flagged as unmanaged (portable / manually-placed)
  */
 
 import { existsSync, readdirSync } from "node:fs";
 import { basename, join } from "node:path";
-import type { AppCategory, AppSource, CliApp, KnownPackageInfo } from "./types.js";
-import { commandExists, execSafe, readPackageJson } from "./utils.js";
+import type {
+  AppCategory,
+  CliApp,
+  KnownPackageInfo,
+  ManagedApp,
+  PathExecutable,
+  ScanReport,
+  ScanSourceReport,
+} from "./types.js";
+import {
+  appDataDir,
+  commandExists,
+  dedupeBy,
+  enumPathExecutables,
+  execSafe,
+  homeDir,
+  localAppDataDir,
+  namesLikelyMatch,
+  pathIndexHas,
+  readArpEntries,
+  readPackageJson,
+} from "./utils.js";
 
 /**
  * Known CLI tool mappings (package name -> command names)
@@ -120,6 +147,8 @@ function detectCliFromPackageJson(pkgPath: string, pkgName: string): CliApp | nu
     path: pkgPath,
     hasUpdate: false,
     latestVersion: null,
+    managed: false,
+    installKind: "managed",
   };
 }
 
@@ -128,7 +157,7 @@ function detectCliFromPackageJson(pkgPath: string, pkgName: string): CliApp | nu
  */
 export function discoverNpmGlobal(): CliApp[] {
   const apps: CliApp[] = [];
-  const globalDir = join(process.env.APPDATA || "", "npm", "node_modules");
+  const globalDir = join(appDataDir(), "npm", "node_modules");
 
   if (!existsSync(globalDir)) return apps;
 
@@ -210,7 +239,7 @@ export function discoverPnpmGlobal(): CliApp[] {
  */
 export function discoverNpxCache(): CliApp[] {
   const apps: CliApp[] = [];
-  const npxCache = join(process.env.LOCALAPPDATA || "", "npm-cache", "_npx");
+  const npxCache = join(localAppDataDir(), "npm-cache", "_npx");
 
   if (!existsSync(npxCache)) return apps;
 
@@ -248,7 +277,7 @@ export function discoverNpxCache(): CliApp[] {
  */
 export function discoverScoop(): CliApp[] {
   const apps: CliApp[] = [];
-  const scoopDir = join(process.env.USERPROFILE || "", "scoop", "apps");
+  const scoopDir = join(homeDir(), "scoop", "apps");
   if (!existsSync(scoopDir)) return apps;
 
   try {
@@ -272,7 +301,7 @@ export function discoverScoop(): CliApp[] {
         }
       }
 
-      const shimDir = join(process.env.USERPROFILE || "", "scoop", "shims");
+      const shimDir = join(homeDir(), "scoop", "shims");
       if (existsSync(shimDir)) {
         try {
           const shims = readdirSync(shimDir).filter((f) =>
@@ -298,6 +327,8 @@ export function discoverScoop(): CliApp[] {
           path: appDir,
           hasUpdate: false,
           latestVersion: null,
+          managed: true,
+          installKind: "managed",
         });
       }
     }
@@ -332,6 +363,8 @@ export function discoverChoco(): CliApp[] {
         path: "",
         hasUpdate: false,
         latestVersion: null,
+        managed: true,
+        installKind: "managed",
       });
     }
   }
@@ -375,6 +408,8 @@ export function discoverCargo(): CliApp[] {
         path: "",
         hasUpdate: false,
         latestVersion: null,
+        managed: true,
+        installKind: "managed",
       });
     }
   }
@@ -417,6 +452,8 @@ export function discoverPipx(): CliApp[] {
         path: info.metadata?.venv_metadata?.venv_dir || "",
         hasUpdate: false,
         latestVersion: null,
+        managed: true,
+        installKind: "managed",
       });
     }
   } catch {
@@ -427,9 +464,352 @@ export function discoverPipx(): CliApp[] {
 }
 
 /**
- * Discover all installed CLI applications
+ * Discover pip globally installed packages (distinct from pipx).
+ * Reads the `pip list --format=json` output of the active interpreter.
  */
-export function discoverAll(): CliApp[] {
+export function discoverPipGlobal(): CliApp[] {
+  const apps: CliApp[] = [];
+  if (!commandExists("pip") && !commandExists("pip3")) return apps;
+
+  const cmd = commandExists("pip") ? "pip" : "pip3";
+  const result = execSafe(`${cmd} list --format=json 2>nul`, { shell: true, timeout: 15000 });
+  if (!result.success || !result.output) return apps;
+
+  try {
+    const data = JSON.parse(result.output) as Array<{ name: string; version: string }>;
+    for (const pkg of data) {
+      // pip packages are libraries more often than CLIs; only surface ones that
+      // actually expose a console_scripts entry we can see on PATH.
+      const command = pkg.name.toLowerCase().replace(/_/g, "-");
+      const hasCommand = pathIndexHas(command) || pathIndexHas(pkg.name.toLowerCase());
+      if (!hasCommand) continue;
+
+      apps.push({
+        name: pkg.name,
+        version: pkg.version || "unknown",
+        commands: [command],
+        category: "other",
+        description: "",
+        source: "pip",
+        path: "",
+        hasUpdate: false,
+        latestVersion: null,
+        managed: true,
+        installKind: "managed",
+      });
+    }
+  } catch {
+    // ignore parse errors
+  }
+
+  return apps;
+}
+
+/**
+ * Discover tools installed by `uv` (uv tool install / uv-managed Pythons).
+ * uv places shims in the uv tool bin directory (typically ~/.local/bin).
+ */
+export function discoverUvTools(): CliApp[] {
+  const apps: CliApp[] = [];
+  if (!commandExists("uv")) return apps;
+
+  const result = execSafe("uv tool list 2>nul", { shell: true, timeout: 15000 });
+  if (!result.success || !result.output) return apps;
+
+  const lines = result.output.split("\n");
+  for (const line of lines) {
+    // Format: "<package> v<version>" followed by indented "- <command>" lines
+    const pkgMatch = line.match(/^(\S+)\s+v?(\S+)\s*$/);
+    if (pkgMatch) {
+      apps.push({
+        name: pkgMatch[1],
+        version: pkgMatch[2],
+        commands: [pkgMatch[1].toLowerCase()],
+        category: "other",
+        description: "",
+        source: "uv",
+        path: "",
+        hasUpdate: false,
+        latestVersion: null,
+        managed: true,
+        installKind: "managed",
+      });
+    }
+  }
+
+  return apps;
+}
+
+/**
+ * Discover executables by enumerating PATH directories.
+ *
+ * This is the broadest source: it catches portable tools, manually-dropped
+ * binaries, and shims that no package manager knows about. System/Runtime
+ * directories are filtered out to keep the result meaningful.
+ */
+export function discoverFromPath(): CliApp[] {
+  const exes = enumPathExecutables();
+  const apps: CliApp[] = [];
+
+  for (const exe of dedupeBy(exes, (e) => `${e.command}|${e.path}`)) {
+    if (isNoiseExecutable(exe)) continue;
+
+    const known = KNOWN_COMMAND_HINTS[exe.command.toLowerCase()];
+    apps.push({
+      name: exe.command,
+      version: "unknown",
+      commands: [exe.command],
+      category: known?.category || "other",
+      description: known?.desc || "",
+      source: "path",
+      path: exe.path,
+      hasUpdate: false,
+      latestVersion: null,
+      // Managed-ness is resolved later during cross-referencing with ARP.
+      managed: false,
+      installKind: "path-shim",
+    });
+  }
+
+  return apps;
+}
+
+/** Directory fragments that indicate OS/runtime noise we should not report. */
+const PATH_NOISE_DIRS = [
+  "\\windows\\system32",
+  "\\windows\\syswow64",
+  "\\windows\\winsxs",
+  "\\windows\\servicing",
+  "\\windows\\system32\\wbem",
+  "\\windows\\system32\\windowspowershell",
+  "\\windows\\system32\\openssh",
+  "\\windows\\system32\\driverstore",
+  "\\windows\\microsoft.net",
+  "\\git\\usr\\bin",
+  "\\git\\mingw",
+  "\\git\\cmd",
+  "\\portablegit",
+  "\\nodejs\\node_modules\\npm\\bin",
+  "\\node_modules\\.bin",
+  "\\pnpm\\",
+  "\\npm-cache\\",
+  "\\_npx\\",
+  "\\binaries\\python\\envs",
+  "/usr/bin",
+  "/usr/sbin",
+  "/bin",
+  "/sbin",
+  "/mingw64/bin",
+];
+
+/** Directory fragments that indicate a bundled runtime we should skip. */
+const PATH_BUNDLED_RUNTIME_DIRS = [
+  "\\jetbrains\\",
+  "\\huawei\\deveco studio\\",
+];
+
+/**
+ * Windows OS root directories (e.g. `C:\WINDOWS`, `C:\Windows`). Executables
+ * sitting directly in these directories are OS components, not user tools.
+ */
+function isWindowsRootDir(dir: string): boolean {
+  const norm = dir.toLowerCase().replace(/\//g, "\\").replace(/\\+$/, "");
+  return /^[a-z]:\\windows(\.old)?$/.test(norm);
+}
+
+/** Command names that are pure OS utilities and add no value to the report. */
+const PATH_NOISE_COMMANDS = new Set([
+  "cmd", "powershell", "pwsh", "conhost", "wscript", "cscript", "bash", "wsl",
+  "notepad", "regedit", "reg", "tasklist", "taskkill", "where", "whoami",
+  "ipconfig", "netstat", "ping", "tracert", "pathping", "systeminfo", "shutdown",
+  "sc", "schtasks", "wmic", "diskpart", "certutil", "cipher", "attrib", "xcopy",
+  "robocopy", "findstr", "find", "sort", "chcp", "timeout", "curl", "tar", "setx",
+  "unzip", "makecert", "fsutil", "takeown", "icacls", "runas", "openfiles",
+  // PowerShell / cmd builtins & aliases
+  "activate", "deactivate", "cl", "nmake", "msbuild", "vswhere",
+  // Generic script helpers that are not user-facing tools
+  "install_tools", "nodevars",
+]);
+
+/**
+ * Command-name prefixes that belong to internal packaging machinery rather
+ * than user-facing CLI tools (git plumbing, Python test/helper entry points).
+ */
+const PATH_NOISE_PREFIXES = [
+  "git-",
+  "pywin32_",
+  "test_",
+];
+
+/** Command names that are internal Python package entry points, not tools. */
+const PYTHON_HELPER_COMMANDS = new Set([
+  "f2py", "idna", "normalizer", "numpy-config", "onnxruntime_test",
+  "py.test", "pygmentize", "tqdm", "brotli", "wheel", "easy_install",
+]);
+
+/**
+ * Pattern for command variants that are aliases / debug builds of a tool that
+ * is already reported under its canonical name (e.g. `python_d`,
+ * `pip3.13`, `pythonw3.13t`) or OS-bundled helpers.
+ */
+const VARIANT_COMMAND_PATTERNS: RegExp[] = [
+  /^pythonw?\d*(\.\d+)?[a-z_]*$/i, // python, python3, python_d, pythonw3.13t
+  /^pip\d*(\.\d+)?$/i, // pip, pip3, pip3.13
+  /^pyw?$/i, // py, pyw launchers
+  /^java(w|ws)?$/i, // javaw, javaws
+  /^corepack$/i,
+  /^(run|headless|test)-/i,
+];
+
+function isNoiseExecutable(exe: PathExecutable): boolean {
+  const dir = exe.dir.toLowerCase().replace(/\//g, "\\");
+  if (isWindowsRootDir(exe.dir)) return true;
+  if (PATH_NOISE_DIRS.some((noise) => dir.includes(noise.toLowerCase()))) return true;
+  if (PATH_BUNDLED_RUNTIME_DIRS.some((noise) => dir.includes(noise.toLowerCase()))) return true;
+
+  const cmd = exe.command.toLowerCase();
+  if (PATH_NOISE_COMMANDS.has(cmd)) return true;
+  if (PYTHON_HELPER_COMMANDS.has(cmd)) return true;
+  if (PATH_NOISE_PREFIXES.some((prefix) => cmd.startsWith(prefix))) return true;
+  if (VARIANT_COMMAND_PATTERNS.some((re) => re.test(cmd))) return true;
+
+  // Skip single-letter or purely numeric shims
+  if (/^[a-z]$/i.test(exe.command) || /^\d+$/.test(exe.command)) return true;
+  return false;
+}
+
+/**
+ * Lightweight command -> category/description hints for PATH-discovered tools
+ * that are not covered by KNOWN_CLI_PACKAGES (which is npm-package oriented).
+ */
+const KNOWN_COMMAND_HINTS: Record<string, { category: AppCategory; desc: string }> = {
+  git: { category: "dev", desc: "Distributed version control system" },
+  docker: { category: "deploy", desc: "Container platform CLI" },
+  "docker-compose": { category: "deploy", desc: "Docker Compose" },
+  "docker-machine": { category: "deploy", desc: "Docker Machine (legacy)" },
+  kubectl: { category: "deploy", desc: "Kubernetes CLI" },
+  node: { category: "dev", desc: "Node.js runtime" },
+  npm: { category: "package-manager", desc: "Node.js package manager" },
+  npx: { category: "package-manager", desc: "Node.js package runner" },
+  pnpm: { category: "package-manager", desc: "Fast disk-efficient package manager" },
+  yarn: { category: "package-manager", desc: "Yarn package manager" },
+  python: { category: "dev", desc: "Python interpreter" },
+  python3: { category: "dev", desc: "Python 3 interpreter" },
+  pip: { category: "package-manager", desc: "Python package installer" },
+  pip3: { category: "package-manager", desc: "Python 3 package installer" },
+  uv: { category: "package-manager", desc: "Extremely fast Python package manager" },
+  uvx: { category: "package-manager", desc: "uv tool runner" },
+  uvw: { category: "package-manager", desc: "uv wrapper (Windows)" },
+  py: { category: "dev", desc: "Python launcher" },
+  java: { category: "dev", desc: "Java runtime" },
+  javac: { category: "dev", desc: "Java compiler" },
+  go: { category: "dev", desc: "Go toolchain" },
+  cargo: { category: "dev", desc: "Rust package manager" },
+  rustc: { category: "dev", desc: "Rust compiler" },
+  choco: { category: "package-manager", desc: "Chocolatey package manager" },
+  scoop: { category: "package-manager", desc: "Scoop package manager" },
+  winget: { category: "package-manager", desc: "Windows Package Manager" },
+  code: { category: "dev", desc: "Visual Studio Code CLI" },
+  cursor: { category: "dev", desc: "Cursor editor CLI" },
+  claude: { category: "ai", desc: "Claude Code - AI coding assistant" },
+  codex: { category: "ai", desc: "OpenAI Codex CLI" },
+  dsh: { category: "ai", desc: "DeepSeek Harness CLI" },
+  kimi: { category: "ai", desc: "Kimi CLI" },
+  fd: { category: "dev", desc: "Fast file finder" },
+  rg: { category: "dev", desc: "ripgrep - fast search" },
+  jq: { category: "dev", desc: "JSON processor" },
+  ffmpeg: { category: "dev", desc: "Media transcoder" },
+  "7z": { category: "dev", desc: "7-Zip archiver" },
+  "trae-cn": { category: "dev", desc: "Trae CN editor CLI" },
+  idea: { category: "dev", desc: "IntelliJ IDEA launcher" },
+  pycharm: { category: "dev", desc: "PyCharm launcher" },
+  devecostudio: { category: "dev", desc: "Huawei DevEco Studio launcher" },
+};
+
+/* -------------------------------------------------------------------------- */
+/*  Cross-referencing: ARP baseline -> managed vs unmanaged                   */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Read the Windows ARP baseline once. Returns an empty array off Windows.
+ */
+export function readManagedBaseline(): ManagedApp[] {
+  return readArpEntries();
+}
+
+/**
+ * Decide whether a discovered app is "managed" by cross-referencing it against
+ * the ARP baseline and/or its own package-manager provenance.
+ */
+function resolveManaged(app: CliApp, baseline: ManagedApp[]): void {
+  // Package-manager apps are managed by definition.
+  if (
+    app.source === "npm" ||
+    app.source === "pnpm" ||
+    app.source === "npx-cache" ||
+    app.source === "scoop" ||
+    app.source === "choco" ||
+    app.source === "cargo" ||
+    app.source === "pipx" ||
+    app.source === "pip" ||
+    app.source === "uv" ||
+    app.source === "winget"
+  ) {
+    app.managed = true;
+    if (app.installKind === "unknown") app.installKind = "managed";
+    return;
+  }
+
+  // Is this executable located inside a directory owned by an ARP entry?
+  // This catches IDE launchers (idea64, pycharm64) whose command name does not
+  // resemble the product's registered display name.
+  if (app.path && pathUnderAnyInstallLocation(app.path, baseline)) {
+    app.managed = true;
+    app.installKind = "managed";
+    return;
+  }
+
+  // Otherwise try a name-based match against the ARP display names.
+  const candidates = [app.name, ...app.commands];
+  for (const candidate of candidates) {
+    if (baseline.some((b) => namesLikelyMatch(b.name, candidate))) {
+      app.managed = true;
+      app.installKind = "managed";
+      return;
+    }
+  }
+
+  // Not in ARP -> portable / manually placed.
+  app.managed = false;
+  app.installKind = app.source === "path" ? "path-shim" : "portable";
+}
+
+/**
+ * Does `filePath` live inside any ARP-recorded install location?
+ * Compares case-insensitively on normalised, slash-consistent prefixes.
+ */
+function pathUnderAnyInstallLocation(filePath: string, baseline: ManagedApp[]): boolean {
+  const norm = (p: string) => p.toLowerCase().replace(/\//g, "\\").replace(/\\+$/, "");
+  const target = norm(filePath);
+  if (!target) return false;
+
+  for (const entry of baseline) {
+    const loc = norm(entry.installLocation);
+    if (!loc || loc.length < 4) continue;
+    // Require a path-boundary match so "C:\Foo" does not match "C:\Foobar".
+    if (target.startsWith(loc + "\\") || target === loc) return true;
+  }
+  return false;
+}
+
+/**
+ * Discover all installed CLI applications.
+ *
+ * Sources are run in order; the first hit for a `name@source` key wins, then
+ * every app is classified as managed/unmanaged by cross-referencing the ARP
+ * baseline (and package-manager provenance).
+ */
+export function discoverAll(options: { baseline?: ManagedApp[] } = {}): CliApp[] {
   const sources: Array<{ name: string; fn: () => CliApp[] }> = [
     { name: "npm", fn: discoverNpmGlobal },
     { name: "pnpm", fn: discoverPnpmGlobal },
@@ -438,19 +818,40 @@ export function discoverAll(): CliApp[] {
     { name: "choco", fn: discoverChoco },
     { name: "cargo", fn: discoverCargo },
     { name: "pipx", fn: discoverPipx },
+    { name: "pip", fn: discoverPipGlobal },
+    { name: "uv", fn: discoverUvTools },
+    { name: "path", fn: discoverFromPath },
   ];
 
   const allApps: CliApp[] = [];
   const seen = new Set<string>();
+  /** Every command name already claimed by a higher-priority (manager) source. */
+  const claimedCommands = new Set<string>();
 
   for (const source of sources) {
     try {
       const apps = source.fn();
       for (const app of apps) {
         const key = `${app.name}@${app.source}`;
-        if (!seen.has(key)) {
-          seen.add(key);
-          allApps.push(app);
+        if (seen.has(key)) {
+          // Enrich an existing entry with a path if it was missing one.
+          const existing = allApps.find((a) => `${a.name}@${a.source}` === key);
+          if (existing && !existing.path && app.path) existing.path = app.path;
+          continue;
+        }
+
+        // A PATH-discovered shim that merely re-exposes a command already
+        // claimed by a package manager is a duplicate, not a distinct tool.
+        if (source.name === "path" && app.commands.some((c) => claimedCommands.has(c.toLowerCase()))) {
+          continue;
+        }
+
+        seen.add(key);
+        allApps.push(app);
+
+        // Package managers own their commands; PATH entries do not claim.
+        if (source.name !== "path") {
+          for (const cmd of app.commands) claimedCommands.add(cmd.toLowerCase());
         }
       }
     } catch {
@@ -458,7 +859,18 @@ export function discoverAll(): CliApp[] {
     }
   }
 
+  const baseline = options.baseline ?? readManagedBaseline();
+  for (const app of allApps) resolveManaged(app, baseline);
+
   return allApps;
+}
+
+/**
+ * Return only the apps that are NOT managed by a Windows installer.
+ * These are portable / manually-placed tools.
+ */
+export function discoverUnmanaged(options: { baseline?: ManagedApp[] } = {}): CliApp[] {
+  return discoverAll(options).filter((app) => !app.managed);
 }
 
 /**
@@ -470,4 +882,131 @@ export function findApp(name: string, apps: CliApp[]): CliApp[] {
       app.name.toLowerCase() === name.toLowerCase() ||
       app.commands.some((cmd) => cmd.toLowerCase() === name.toLowerCase())
   );
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Scan methodology report                                                   */
+/* -------------------------------------------------------------------------- */
+
+/** Static description of every technique this module uses. */
+const SOURCE_METHODS: Array<{
+  source: string;
+  label: string;
+  method: string;
+  probe: () => boolean;
+  note?: string;
+}> = [
+  {
+    source: "npm",
+    label: "npm global packages",
+    method: "fs:%APPDATA%/npm/node_modules + package.json bin",
+    probe: () => existsSync(join(appDataDir(), "npm", "node_modules")),
+  },
+  {
+    source: "pnpm",
+    label: "pnpm global packages",
+    method: "exec:pnpm list -g --json",
+    probe: () => commandExists("pnpm"),
+  },
+  {
+    source: "npx-cache",
+    label: "npx cache",
+    method: "fs:%LOCALAPPDATA%/npm-cache/_npx",
+    probe: () => existsSync(join(localAppDataDir(), "npm-cache", "_npx")),
+  },
+  {
+    source: "scoop",
+    label: "Scoop packages",
+    method: "fs:~/scoop/apps/*/current",
+    probe: () => existsSync(join(homeDir(), "scoop", "apps")),
+  },
+  {
+    source: "choco",
+    label: "Chocolatey packages",
+    method: "exec:choco list --local-only",
+    probe: () => commandExists("choco"),
+  },
+  {
+    source: "cargo",
+    label: "Cargo packages",
+    method: "exec:cargo install --list",
+    probe: () => commandExists("cargo"),
+  },
+  {
+    source: "pipx",
+    label: "pipx environments",
+    method: "exec:pipx list --json",
+    probe: () => commandExists("pipx"),
+  },
+  {
+    source: "pip",
+    label: "pip global packages",
+    method: "exec:pip list --format=json",
+    probe: () => commandExists("pip") || commandExists("pip3"),
+  },
+  {
+    source: "uv",
+    label: "uv tools",
+    method: "exec:uv tool list",
+    probe: () => commandExists("uv"),
+  },
+  {
+    source: "path",
+    label: "PATH enumeration",
+    method: "fs:PATH dirs -> executable extensions",
+    probe: () => true,
+  },
+  {
+    source: "arp",
+    label: "Windows Add/Remove baseline",
+    method: "registry:HKLM|HKCU Uninstall keys",
+    probe: () => process.platform === "win32",
+    note: "Used to classify managed vs unmanaged, not reported as apps",
+  },
+];
+
+/**
+ * Build a report describing exactly which techniques were used, whether each
+ * source was available, and how many entries it contributed. This makes the
+ * scan auditable ("how did you look?").
+ */
+export function buildScanReport(options: { baseline?: ManagedApp[] } = {}): ScanReport {
+  const start = Date.now();
+  const apps = discoverAll(options);
+  const durationMs = Date.now() - start;
+
+  const sources: ScanSourceReport[] = SOURCE_METHODS.map((meta) => {
+    let available = false;
+    try {
+      available = meta.probe();
+    } catch {
+      available = false;
+    }
+    const found =
+      meta.source === "arp"
+        ? (options.baseline ?? []).length
+        : apps.filter((a) => a.source === meta.source).length;
+
+    const report: ScanSourceReport = {
+      source: meta.source,
+      label: meta.label,
+      method: meta.method,
+      found,
+      available,
+    };
+    if (!available) report.note = meta.note || "not present on this machine";
+    else if (meta.note) report.note = meta.note;
+    return report;
+  });
+
+  const managedCount = apps.filter((a) => a.managed).length;
+  return {
+    generatedAt: new Date().toISOString(),
+    platform: process.platform,
+    durationMs,
+    totalApps: apps.length,
+    managedCount,
+    unmanagedCount: apps.length - managedCount,
+    sources,
+  };
 }

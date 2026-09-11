@@ -2,10 +2,11 @@
  * Utility functions for dsh-app-manager
  */
 
-import { execSync, spawn } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
-import type { ExecResult } from "./types.js";
+import { execFileSync, execSync, spawn } from "node:child_process";
+import { existsSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { basename, extname, join } from "node:path";
+import type { ExecResult, ManagedApp, PathExecutable } from "./types.js";
 
 /**
  * Execute a command synchronously and return stdout/stderr
@@ -101,7 +102,10 @@ export function formatDuration(ms: number): string {
 }
 
 /**
- * Check if a command exists in PATH
+ * Check if a command exists in PATH.
+ *
+ * This spawns a child process (`where` / `which`), so for bulk checks prefer
+ * `pathIndexHas()` which reuses a cached directory listing.
  */
 export function commandExists(command: string): boolean {
   try {
@@ -110,6 +114,35 @@ export function commandExists(command: string): boolean {
   } catch {
     return false;
   }
+}
+
+let pathIndexCache: Map<string, PathExecutable[]> | null = null;
+
+/** Build (once) an index of command name -> PATH executables. */
+function getPathIndex(): Map<string, PathExecutable[]> {
+  if (pathIndexCache) return pathIndexCache;
+  const index = new Map<string, PathExecutable[]>();
+  for (const exe of enumPathExecutables()) {
+    const key = exe.command.toLowerCase();
+    const list = index.get(key);
+    if (list) list.push(exe);
+    else index.set(key, [exe]);
+  }
+  pathIndexCache = index;
+  return index;
+}
+
+/**
+ * Check whether a command is on PATH using the cached directory index.
+ * Much faster than `commandExists` when checking many commands.
+ */
+export function pathIndexHas(command: string): boolean {
+  return getPathIndex().has(command.toLowerCase());
+}
+
+/** Clear the cached PATH index (useful for tests). */
+export function resetPathIndex(): void {
+  pathIndexCache = null;
 }
 
 /**
@@ -173,4 +206,252 @@ export function colorize(text: string, color: keyof typeof colors): string {
 export function truncate(str: string, maxLength: number): string {
   if (str.length <= maxLength) return str;
   return str.slice(0, maxLength - 3) + "...";
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Well-known directory resolution (env-var tolerant)                        */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Resolve the user's roaming AppData directory.
+ *
+ * `process.env.APPDATA` is not guaranteed to be present (e.g. when spawned from
+ * a shell that does not export it). Fall back to the conventional location
+ * derived from the home directory.
+ */
+export function appDataDir(env: NodeJS.ProcessEnv = process.env): string {
+  if (env.APPDATA) return env.APPDATA;
+  if (env.USERPROFILE) return join(env.USERPROFILE, "AppData", "Roaming");
+  if (env.HOME) return join(env.HOME, "AppData", "Roaming");
+  return "";
+}
+
+/** Resolve the user's local AppData directory with the same fallbacks. */
+export function localAppDataDir(env: NodeJS.ProcessEnv = process.env): string {
+  if (env.LOCALAPPDATA) return env.LOCALAPPDATA;
+  if (env.USERPROFILE) return join(env.USERPROFILE, "AppData", "Local");
+  if (env.HOME) return join(env.HOME, "AppData", "Local");
+  return "";
+}
+
+/** Resolve the user's home / profile directory. */
+export function homeDir(env: NodeJS.ProcessEnv = process.env): string {
+  return env.USERPROFILE || env.HOME || env.HOMEPATH || "";
+}
+
+/* -------------------------------------------------------------------------- */
+/*  PATH enumeration                                                          */
+/* -------------------------------------------------------------------------- */
+
+/** Executable extensions we treat as runnable commands on each platform. */
+export const EXECUTABLE_EXTS =
+  process.platform === "win32"
+    ? [".exe", ".cmd", ".bat", ".com", ".ps1"]
+    : [""];
+
+/** Extensions that are documentation / metadata rather than programs. */
+const NON_PROGRAM_EXTS = [".md", ".txt", ".json", ".yml", ".yaml", ".map"];
+
+/**
+ * Split the current PATH into a de-duplicated list of absolute directories.
+ * Empty segments and the literal `%VAR%` placeholders are dropped.
+ */
+export function getPathDirs(env: NodeJS.ProcessEnv = process.env): string[] {
+  const raw = env.PATH || env.Path || "";
+  const sep = process.platform === "win32" ? ";" : ":";
+  const seen = new Set<string>();
+  const dirs: string[] = [];
+
+  for (const segment of raw.split(sep)) {
+    const dir = segment.trim().replace(/^"|"$/g, "");
+    if (!dir) continue;
+    // Skip unresolved placeholders like %JAVA_HOME%\bin
+    if (/%[^%]+%/.test(dir)) continue;
+    const key = dir.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    dirs.push(dir);
+  }
+
+  return dirs;
+}
+
+/**
+ * Enumerate executables directly inside every PATH directory (non-recursive).
+ * This is the "PATH enumeration" technique — it finds every command-line tool
+ * that is directly callable, regardless of how it was installed.
+ */
+export function enumPathExecutables(options: { maxPerDir?: number } = {}): PathExecutable[] {
+  const { maxPerDir = 400 } = options;
+  const results: PathExecutable[] = [];
+
+  for (const dir of getPathDirs()) {
+    if (!existsSync(dir)) continue;
+    let entries: string[];
+    try {
+      entries = readdirSync(dir);
+    } catch {
+      continue;
+    }
+
+    let count = 0;
+    for (const entry of entries) {
+      if (count >= maxPerDir) break;
+      const ext = extname(entry).toLowerCase();
+      const isProgram =
+        (process.platform === "win32" && EXECUTABLE_EXTS.includes(ext)) ||
+        (process.platform !== "win32" && ext === "");
+
+      if (!isProgram) continue;
+      if (NON_PROGRAM_EXTS.includes(ext)) continue;
+
+      const full = join(dir, entry);
+      try {
+        if (!statSync(full).isFile()) continue;
+      } catch {
+        continue;
+      }
+
+      const command = process.platform === "win32" ? basename(entry, ext) : basename(entry);
+      results.push({ command, path: full, dir, ext });
+      count++;
+    }
+  }
+
+  return results;
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Windows Add/Remove Programs (ARP) registry baseline                       */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Read the Windows "Add or Remove Programs" registry keys. These entries
+ * represent programs managed by a Windows-level installer.
+ *
+ * Implementation note: we write the PowerShell snippet to a temporary `.ps1`
+ * file and invoke it with `-File`. This avoids the quote-escaping corruption
+ * that occurs when passing a complex script through `-Command` from Node, and
+ * it lets us force UTF-8 output so non-ASCII product names survive intact.
+ */
+export function readArpEntries(): ManagedApp[] {
+  if (process.platform !== "win32") return [];
+
+  const script = [
+    "$ErrorActionPreference = 'SilentlyContinue'",
+    "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8",
+    "$keys = @(",
+    "  'HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*',",
+    "  'HKLM:\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*',",
+    "  'HKCU:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*'",
+    ")",
+    "$rows = foreach ($k in $keys) {",
+    "  Get-ItemProperty $k | Where-Object { $_.DisplayName } |",
+    "    Select-Object DisplayName, DisplayVersion, Publisher, InstallLocation",
+    "}",
+    "$rows | ConvertTo-Json -Compress -Depth 3",
+  ].join("\n");
+
+  let tmpFile = "";
+  try {
+    const dir = tmpdir();
+    tmpFile = join(dir, `dsh-app-manager-arp-${process.pid}.ps1`);
+    writeFileSync(tmpFile, script, "utf8");
+
+    const out = execFileSync(
+      "powershell",
+      ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", tmpFile],
+      { encoding: "utf8", timeout: 30000, maxBuffer: 16 * 1024 * 1024 }
+    );
+
+    return parseArpJson(out);
+  } catch {
+    return [];
+  } finally {
+    if (tmpFile) {
+      try {
+        unlinkSync(tmpFile);
+      } catch {
+        // best effort cleanup
+      }
+    }
+  }
+}
+
+/** Parse the JSON emitted by the ARP PowerShell snippet into ManagedApp[]. */
+function parseArpJson(output: string): ManagedApp[] {
+  const trimmed = output.trim();
+  if (!trimmed) return [];
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch {
+    return [];
+  }
+
+  const rows = Array.isArray(parsed) ? parsed : [parsed];
+  const out: ManagedApp[] = [];
+  const seen = new Set<string>();
+
+  for (const row of rows as Array<Record<string, unknown>>) {
+    const name = typeof row.DisplayName === "string" ? row.DisplayName.trim() : "";
+    if (!name) continue;
+    const key = name.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+
+    out.push({
+      name,
+      version: typeof row.DisplayVersion === "string" ? row.DisplayVersion : "",
+      publisher: typeof row.Publisher === "string" ? row.Publisher : "",
+      installLocation:
+        typeof row.InstallLocation === "string" ? row.InstallLocation.replace(/^"|"$/g, "") : "",
+    });
+  }
+
+  return out;
+}
+
+/* -------------------------------------------------------------------------- */
+/*  De-duplication helpers                                                    */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Merge helper: keep the first occurrence of each key. Later duplicates are
+ * dropped but can be used to enrich (e.g. fill in a missing path).
+ */
+export function dedupeBy<T>(items: T[], keyOf: (item: T) => string): T[] {
+  const seen = new Set<string>();
+  const out: T[] = [];
+  for (const item of items) {
+    const key = keyOf(item).toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(item);
+  }
+  return out;
+}
+
+/**
+ * Normalise a name for fuzzy matching (strip scope, punctuation, casing).
+ */
+export function normalizeName(name: string): string {
+  return name
+    .toLowerCase()
+    .replace(/^@[^/]+\//, "")
+    .replace(/[^a-z0-9]/g, "");
+}
+
+/**
+ * Does an ARP display name correspond to a discovered command/package name?
+ * Uses a normalised substring match in either direction.
+ */
+export function namesLikelyMatch(a: string, b: string): boolean {
+  const na = normalizeName(a);
+  const nb = normalizeName(b);
+  if (!na || !nb) return false;
+  if (na === nb) return true;
+  if (na.length >= 4 && nb.length >= 4 && (na.includes(nb) || nb.includes(na))) return true;
+  return false;
 }

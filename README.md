@@ -9,8 +9,10 @@
 
 | Feature | 中文说明 |
 |---------|----------|
-| 🔍 Auto Discovery | 扫描 npm、pnpm、npx-cache、scoop、choco、cargo、pipx 等来源的 CLI 工具 |
-| 📊 Unified View | 在一个界面查看所有 CLI 应用的版本、来源、状态 |
+| 🔍 Auto Discovery | 扫描 npm、pnpm、npx-cache、scoop、choco、cargo、pipx、pip、uv 等来源的 CLI 工具 |
+| 🧭 PATH Enumeration | 遍历 PATH 每个目录，发现**便携版 / 手动放置**的可执行文件 |
+| 🏷️ Managed vs Unmanaged | 交叉比对 Windows「添加/删除程序」注册表，标出**非托管**程序 |
+| 📊 Unified View | 在一个界面查看所有 CLI 应用的版本、来源、托管状态 |
 | ⬆️ Update Check | 一键检查所有应用是否有新版本 |
 | 🏥 Health Check | 验证应用是否正常工作、命令是否在 PATH 中 |
 | 📈 Process Monitor | 查看哪些 CLI 工具正在运行 |
@@ -18,6 +20,25 @@
 | 📤 Export Registry | 导出 JSON 格式的应用清单 |
 | 🤖 DSH AI Tools | 注册 AI-callable tools，让 DSH 帮你查询和更新 |
 | 🌐 Web Dashboard | 在浏览器访问 `/app-manager` 管理页面 |
+
+---
+
+## 🧭 How It Scans / 扫描方法
+
+扫描采用**多源交叉比对**，确保既不漏掉包管理器安装的工具，也能发现散落的便携程序：
+
+| # | 数据源 | 方法 | 捕获内容 |
+|---|--------|------|----------|
+| 1 | 包管理器 | `npm`(读目录) / `pnpm list -g --json` / `npx-cache`(读目录) / `choco list` / `cargo install --list` / `pipx list --json` / `pip list --format=json` / `uv tool list` | 各包管理器托管的工具 |
+| 2 | **PATH 枚举** | 遍历 `PATH` 每个目录，匹配可执行扩展名（`.exe/.cmd/.bat/.com/.ps1`） | **便携 / 手动放置**的可执行文件 |
+| 3 | **ARP 注册表** | 读取 `HKLM\|HKCU` 下的 `Uninstall` 键 | Windows 安装器托管程序（基准） |
+| 4 | **交叉比对** | PATH 结果 ∩ ARP 基准 | 在 PATH 上但不在 ARP 中 = **非托管程序** |
+
+判定「托管」的两条路径：
+- **名称匹配**：ARP 显示名与命令名规范化后互相包含（如 `7-Zip` ↔ `7z`）；
+- **路径归属**：可执行文件位于某个 ARP 记录的 `InstallLocation` 之下（可捕获 `idea64`、`pycharm64` 这类与产品名不一致的启动器）。
+
+用 `app-manager method` 可以导出当前机器的实际扫描报告（哪些来源可用、各贡献多少条）。
 
 ---
 
@@ -62,6 +83,18 @@ dsh plugin --profile web add ./dsh-app-manager
 app-manager list
 app-manager ls
 
+# List programs NOT managed by a Windows installer (portable / manual)
+app-manager unmanaged
+app-manager portable
+
+# Show how the scan works (sources + techniques)
+app-manager method
+app-manager method --output scan.json
+
+# Filter list by source / category
+app-manager list --source npm
+app-manager list --category ai
+
 # Check for updates
 app-manager check
 app-manager outdated
@@ -104,6 +137,8 @@ Registered tools:
 - `app_manager_check_updates` — Check for available updates
 - `app_manager_update` — Update a specific app
 - `app_manager_doctor` — Run health check
+- `app_manager_unmanaged` — List programs not managed by a Windows installer
+- `app_manager_scan_method` — Explain the scan sources & techniques
 
 ### Web Dashboard / 网页管理台
 
@@ -113,10 +148,12 @@ After installing into DSH web profile, visit:
 http://127.0.0.1:3080/app-manager
 ```
 
-Or access the JSON API:
+Or access the JSON APIs:
 
 ```
-http://127.0.0.1:3080/app-manager/api/apps
+http://127.0.0.1:3080/app-manager/api/apps        # all apps (+ managed flags)
+http://127.0.0.1:3080/app-manager/api/unmanaged   # unmanaged only
+http://127.0.0.1:3080/app-manager/api/method      # scan methodology report
 ```
 
 ---
@@ -132,6 +169,10 @@ http://127.0.0.1:3080/app-manager/api/apps
 | choco | Chocolatey packages (Windows) | Discover, update |
 | cargo | Rust cargo packages | Discover |
 | pipx | Python pipx packages | Discover |
+| pip | Global pip packages with a PATH entry | Discover |
+| uv | uv-managed tools | Discover |
+| **path** | **PATH-enumerated executables (portable / manual)** | **Discover** |
+| _arp_ | _Windows Add/Remove registry — baseline for managed/unmanaged_ | _Cross-reference only_ |
 
 ---
 
@@ -152,9 +193,9 @@ dsh-app-manager/
 │   └── cli-app-manager.ts    # CLI entry point
 └── src/
     ├── index.ts          # DSH plugin entry (apply + inject)
-    ├── discovery.ts      # App discovery logic
+    ├── discovery.ts      # App discovery + managed/unmanaged cross-reference
     ├── commands.ts       # CLI command handlers
-    ├── utils.ts          # Utility functions
+    ├── utils.ts          # Utilities (exec, PATH enumeration, ARP registry)
     └── types.ts          # Shared TypeScript types
 ```
 

@@ -31,42 +31,51 @@
 2. **不要自行创建 `rel-*` 分支。** 只有明确要「发布新版本」时才从 `main` 拉。
 3. **不要自行打发布 tag。** 发布动作是独立步骤，由维护者发起。
 4. 按「怎么选分支」表选择分支，**不要混用**（例如别把文档改动提进 `bugfix`）。
-5. 分支命名见下方「分支命名」——**用连字符，不用斜杠**。
+5. **不要另造分支名。** 只用 `feat` / `bugfix` / `docs` / `chore` 四个既有分支，
+   也不要写 `chore/<主题>` 这种斜杠形式 —— 详见下方「分支命名」。
 
 ### 分支命名
 
-一个类型下同时有多个并行工作时，用 **`<类型>-<主题>`**（连字符）区分：
+**直接用既有的四个分支，不要另造名字：**
 
-```
-feat-<主题>    bugfix-<主题>    docs-<主题>    chore-<主题>
-```
+| 用途 | 分支 |
+|------|------|
+| 新功能 | `feat` |
+| 修 bug | `bugfix` |
+| 文档 | `docs` |
+| 杂项 / 构建 / 元信息 | `chore` |
 
-> ⚠️ **不要用斜杠**（`chore/<主题>`）。Git 的 ref 是文件路径：
-> `refs/heads/chore` 已经是一个**文件**，就再也建不出 `refs/heads/chore/` 这个**目录**，
-> `git switch -c chore/xxx` 会直接报
-> `cannot lock ref ... 'refs/heads/chore' exists`。
-> 同一类型只有一个进行中的分支时，也可以直接用裸名（`feat` / `bugfix` / `docs` / `chore`）。
+- ❌ **不要新建 `chore-<主题>` / `docs-<主题>` 这类衍生分支名。**
+  一个类型只需要一个分支，需要新工作时复用它。
+- ❌ **也不要写 `chore/<主题>`（斜杠形式）。** Git 的 ref 就是文件路径：
+  `refs/heads/chore` 已经是一个**文件**，就再也建不出 `refs/heads/chore/` 这个**目录**，
+  `git switch -c chore/xxx` 会直接报
+  `cannot lock ref ... 'refs/heads/chore' exists`。
+- ✅ 一个分支的 PR 合并后，把它**快进回 `main`** 即可继续复用：
+  ```bash
+  git switch chore && git merge --ff-only main
+  ```
 
 ### 典型流程
 
 ```
 # 新功能
-git switch -c feat-<主题> main
+git switch feat
 # ... 开发、提交 ...
-# 开 PR: feat-<主题> -> main，等 review / verify 通过后合入
+# 开 PR: feat -> main，等 review / verify 通过后合入
 
 # 修 bug
-git switch -c bugfix-<主题> main
+git switch bugfix
 # ... 修复、提交 ...
-# 开 PR: bugfix-<主题> -> main
+# 开 PR: bugfix -> main
 
 # 文档
-git switch -c docs-<主题> main
-# 开 PR: docs-<主题> -> main
+git switch docs
+# 开 PR: docs -> main
 
 # 杂项 / 构建 / 元信息
-git switch -c chore-<主题> main
-# 开 PR: chore-<主题> -> main
+git switch chore
+# 开 PR: chore -> main
 
 # 发布（仅在明确要发版时）
 git switch main && git pull

@@ -5,7 +5,7 @@
 import { execFileSync, execSync, spawn } from "node:child_process";
 import { existsSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, extname, join } from "node:path";
+import { basename, dirname, extname, join } from "node:path";
 import type { ExecResult, ManagedApp, PathExecutable } from "./types.js";
 
 /**
@@ -34,8 +34,55 @@ export function execSafe(command: string, options: { shell?: boolean | string; t
   }
 }
 
+/* -------------------------------------------------------------------------- */
+/*  Subprocess teardown                                                       */
+/* -------------------------------------------------------------------------- */
+
 /**
- * Execute a command asynchronously
+ * Kill a child process and everything it spawned.
+ *
+ * `shell: true` means the child we hold is `cmd.exe`/`sh`, not the real
+ * command — so a plain `kill()` would reap the wrapper and leave the actual
+ * process running as an orphan. On Windows `taskkill /T /F` is the only way to
+ * reach the whole tree; elsewhere the process group is signalled directly.
+ *
+ * Best effort by design: the caller has usually already settled its promise, so
+ * a failure here must never surface.
+ */
+export function killProcessTree(child: { pid?: number; kill: (signal?: NodeJS.Signals) => boolean }): void {
+  const pid = child.pid;
+  try {
+    if (process.platform === "win32" && pid) {
+      const killer = spawn("taskkill", ["/pid", String(pid), "/T", "/F"], {
+        stdio: "ignore",
+        windowsHide: true,
+      });
+      killer.on("error", () => {
+        /* taskkill unavailable/blocked — the promise already settled */
+      });
+      killer.unref?.();
+      return;
+    }
+    child.kill("SIGKILL");
+  } catch {
+    /* already gone */
+  }
+}
+
+/**
+ * Execute a command asynchronously.
+ *
+ * `timeout` is enforced with an explicit timer. This matters: `child_process
+ * .spawn` **ignores** a `timeout` option (only `exec`/`execFile` honour it), so
+ * passing it through silently produced unbounded waits. That turned into a real
+ * hang in the field — `doctor` probes `<cmd> --version` for every app, and one
+ * shim on PATH (`RefreshEnv`, a Chocolatey `.cmd` that shells out to
+ * `reg.exe`/`WMIC.exe`) blocks indefinitely when those are unavailable, so the
+ * health check never returned.
+ *
+ * Note for callers: `shell` defaults to `true` on Windows, and Node does not
+ * quote arguments for `cmd.exe`, so an argument containing spaces is split.
+ * Pass argv as an array of space-free tokens, or set `shell: false`.
  */
 export function execAsync(
   command: string,
@@ -43,14 +90,38 @@ export function execAsync(
   options: { shell?: boolean | string; timeout?: number; cwd?: string } = {}
 ): Promise<ExecResult> {
   return new Promise((resolve) => {
+    const { timeout, ...spawnOptions } = options;
     const child = spawn(command, args, {
       stdio: ["pipe", "pipe", "pipe"],
       shell: process.platform === "win32",
-      ...options,
+      ...spawnOptions,
     });
 
     let stdout = "";
     let stderr = "";
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+
+    const done = (result: ExecResult): void => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      resolve(result);
+    };
+
+    if (timeout && timeout > 0) {
+      timer = setTimeout(() => {
+        killProcessTree(child);
+        done({
+          success: false,
+          output: stdout.trim(),
+          error: stderr.trim() || `timed out after ${timeout}ms`,
+          code: -1,
+        });
+      }, timeout);
+      // The child's own handles keep the loop alive; the timer alone should not.
+      if (typeof timer === "object" && timer && "unref" in timer) timer.unref();
+    }
 
     child.stdout?.on("data", (data: Buffer) => {
       stdout += data.toString();
@@ -61,7 +132,7 @@ export function execAsync(
     });
 
     child.on("close", (code: number | null) => {
-      resolve({
+      done({
         success: code === 0,
         output: stdout.trim(),
         error: stderr.trim(),
@@ -70,7 +141,7 @@ export function execAsync(
     });
 
     child.on("error", (err: Error) => {
-      resolve({
+      done({
         success: false,
         output: stdout.trim(),
         error: err.message,
@@ -262,6 +333,121 @@ export function localAppDataDir(env: NodeJS.ProcessEnv = process.env): string {
 /** Resolve the user's home / profile directory. */
 export function homeDir(env: NodeJS.ProcessEnv = process.env): string {
   return env.USERPROFILE || env.HOME || env.HOMEPATH || "";
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Global package roots (cross-platform)                                     */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Candidate directories holding globally-installed npm packages, ordered so
+ * the *active* Node installation wins.
+ *
+ * Why this exists: the original implementation hardcoded
+ * `appDataDir()/npm/node_modules`. Off Windows `appDataDir()` falls back to
+ * `$HOME/AppData/Roaming`, a path that does not exist — so npm globals were
+ * silently reported as zero on macOS and Linux, which is exactly where `dsh`,
+ * `claude` and `codex` are usually installed.
+ */
+export function npmGlobalCandidates(
+  env: NodeJS.ProcessEnv = process.env,
+  execPathRaw: string = process.execPath,
+  platform: NodeJS.Platform = process.platform,
+): string[] {
+  const out: string[] = [];
+  const add = (p?: string): void => {
+    if (p && !out.includes(p)) out.push(p);
+  };
+
+  if (platform === "win32") {
+    // npm drops shims in %APPDATA%\npm alongside node_modules.
+    add(join(appDataDir(env), "npm", "node_modules"));
+    if (env.ProgramFiles) add(join(env.ProgramFiles, "nodejs", "node_modules"));
+    return out;
+  }
+
+  // POSIX: the global root is `<prefix>/lib/node_modules`. The running Node
+  // binary is the most reliable signal for what `<prefix>` is:
+  //   nvm      ~/.nvm/versions/node/v22.22.2/bin/node -> ~/.nvm/versions/node/v22.22.2
+  //   system   /usr/bin/node                          -> /usr
+  //   Homebrew /opt/homebrew/Cellar/node/22/bin/node  -> /opt/homebrew  (special-cased)
+  const execPath = execPathRaw.replace(/\\/g, "/");
+
+  // Homebrew keeps the real binary under Cellar/ but installs globals into the
+  // brew prefix, so cut at /Cellar/ instead of taking the binary's parent.
+  const cellarIdx = execPath.indexOf("/Cellar/");
+  if (cellarIdx > 0) add(join(execPath.slice(0, cellarIdx), "lib", "node_modules"));
+
+  const binDir = dirname(execPath);
+  // nvm / system / most Linux distros.
+  add(join(dirname(binDir), "lib", "node_modules"));
+  // Volta, fnm, asdf: <prefix>/bin/node with a sibling lib/.
+  add(join(binDir, "..", "lib", "node_modules"));
+
+  // Conventional user-level and system-wide locations.
+  add(join(homeDir(env), ".npm-global", "lib", "node_modules"));
+  add(join(homeDir(env), ".local", "lib", "node_modules"));
+  add("/usr/local/lib/node_modules");
+  add("/usr/lib/node_modules");
+  add("/opt/homebrew/lib/node_modules");
+
+  return out;
+}
+
+/**
+ * The active npm global `node_modules` directory, or `""` when none of the
+ * conventional locations exist. Only the first hit is used so the result
+ * matches what `npm root -g` would report (rather than unioning every Node
+ * version ever installed).
+ */
+export function npmGlobalRoot(env: NodeJS.ProcessEnv = process.env): string {
+  for (const dir of npmGlobalCandidates(env)) {
+    if (dir && existsSync(dir)) return dir;
+  }
+  return "";
+}
+
+/**
+ * Candidate npx cache directories. npx (npm >= 7) stores extracted packages
+ * under `<npm cache>/_npx`; the cache lives in `%LOCALAPPDATA%\npm-cache` on
+ * Windows and `~/.npm` everywhere else.
+ */
+export function npxCacheCandidates(
+  env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+): string[] {
+  const out: string[] = [];
+  const add = (p?: string): void => {
+    if (p && !out.includes(p)) out.push(p);
+  };
+  if (platform === "win32") add(join(localAppDataDir(env), "npm-cache", "_npx"));
+  add(join(homeDir(env), ".npm", "_npx"));
+  // Honour an explicit cache override if the user set one.
+  if (env.npm_config_cache) add(join(env.npm_config_cache, "_npx"));
+  return out;
+}
+
+/**
+ * Candidate pnpm global roots (the parent of `global/node_modules`).
+ * pnpm uses a different data dir per platform, same bug class as npm above.
+ */
+export function pnpmGlobalCandidates(
+  env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+): string[] {
+  const out: string[] = [];
+  const add = (p?: string): void => {
+    if (p && !out.includes(p)) out.push(p);
+  };
+  if (env.PNPM_HOME) add(join(env.PNPM_HOME, "global"));
+  if (platform === "win32") {
+    add(join(localAppDataDir(env), "pnpm", "global"));
+    add(join(appDataDir(env), "pnpm", "global"));
+  }
+  if (env.XDG_DATA_HOME) add(join(env.XDG_DATA_HOME, "pnpm", "global"));
+  add(join(homeDir(env), ".local", "share", "pnpm", "global"));
+  add(join(homeDir(env), "Library", "pnpm", "global"));
+  return out;
 }
 
 /* -------------------------------------------------------------------------- */

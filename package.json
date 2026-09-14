@@ -1,6 +1,6 @@
 {
   "name": "dsh-app-manager",
-  "version": "0.4.6",
+  "version": "0.5.0",
   "description": "A CLI application manager for discovering, monitoring, and managing installed command-line tools across package managers. DSH plugin with web UI.",
   "main": "lib/src/index.js",
   "types": "lib/src/index.d.ts",
@@ -23,6 +23,8 @@
     "test:ui": "node tests/run-tests.mjs --group B,C,D",
     "test:drag": "node tests/drag-behavior.test.mjs",
     "test:perf": "node tests/perf-guard.test.mjs",
+    "test:paths": "node tests/crossplatform-paths.test.mjs",
+    "test:approval": "node tests/approval-gate.test.mjs",
     "smoke": "node tests/smoke-features.mjs",
     "prepublishOnly": "npm run build"
   },

@@ -163,6 +163,20 @@ export type ContentBlock = TextContentBlock;
  * `schema` declares the canonical value and `render` must project that value
  * into `ContentBlock[]` (previously an optional `(value) => string`).
  */
+/**
+ * Execution identity the host hands to a tool's `execute`.
+ *
+ * Mirrors the relevant subset of DSH's `ToolExecution`: `callId` and `agent`
+ * are what the approval seam needs to attach a permission prompt to the tool
+ * call it already streamed. Both are optional because a host may dispatch a
+ * tool outside an agent loop (tests, nested dispatchers).
+ */
+export interface ToolRunContext {
+  signal: AbortSignal;
+  callId?: unknown;
+  agent?: unknown;
+}
+
 export interface ToolDefinition {
   name: string;
   description: string;
@@ -171,7 +185,7 @@ export interface ToolDefinition {
     schema: unknown;
     render: (args: Record<string, unknown>, value: unknown) => ContentBlock[];
   };
-  execute: (args: Record<string, unknown>, exec: { signal: AbortSignal }) => Promise<unknown>;
+  execute: (args: Record<string, unknown>, exec: ToolRunContext) => Promise<unknown>;
 }
 
 export interface HttpRequest {
@@ -193,6 +207,35 @@ export interface WebServerService {
   }) => (() => void);
 }
 
+/**
+ * Vocabularly of an approval decision. `allowed-once` is the only grant;
+ * everything else — including a missing answerer, which fails closed as
+ * `unavailable` — means the action must not proceed.
+ */
+export type ApprovalOutcome =
+  | "allowed-once"
+  | "rejected"
+  | "cancelled"
+  | "unavailable"
+  | (string & {});
+
+/**
+ * The host's approval seam (`@deepseek-ai/dsh-user-approval`).
+ *
+ * Deliberately optional on {@link CordisContext}: not every deployment composes
+ * an answerer (headless/CI runs resolve to `never`), so callers must handle its
+ * absence instead of assuming a prompt will appear.
+ */
+export interface ApprovalService {
+  request(req: {
+    agent: unknown;
+    toolName: string;
+    callId?: unknown;
+    reason?: string;
+    signal?: AbortSignal;
+  }): Promise<ApprovalOutcome>;
+}
+
 export interface CordisContext {
   logger?: {
     info: (msg: string) => void;
@@ -201,6 +244,7 @@ export interface CordisContext {
     register: (tool: ToolDefinition) => (() => void);
   };
   webServer?: WebServerService;
+  approval?: ApprovalService;
   service?: (name: string, instance: unknown) => void;
   inject?: (services: string[], callback: (ctx: CordisContext) => void) => (() => void);
 }

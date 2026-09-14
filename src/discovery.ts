@@ -29,7 +29,10 @@ import {
   homeDir,
   localAppDataDir,
   namesLikelyMatch,
+  npmGlobalRoot,
+  npxCacheCandidates,
   pathIndexHas,
+  pnpmGlobalCandidates,
   readArpEntries,
   readPackageJson,
 } from "./utils.js";
@@ -308,13 +311,35 @@ function detectCliFromPackageJson(pkgPath: string, pkgName: string): CliApp | nu
 }
 
 /**
+ * Resolve the active npm global `node_modules` directory.
+ *
+ * Filesystem candidates come first because they cost ~1ms. Only when none of
+ * them exist do we ask npm itself — that spawns a process (~1.5s), so it is
+ * guarded by a PATH check and, in practice, runs at most once per scan-cache
+ * TTL (the whole `discoverNpmGlobal` source is memoised).
+ */
+function resolveNpmGlobalRoot(): string {
+  const conventional = npmGlobalRoot();
+  if (conventional) return conventional;
+
+  if (!pathIndexHas("npm")) return "";
+  const res = execSafe("npm root -g", { shell: process.platform === "win32", timeout: 15000 });
+  const out = res.output.trim();
+  return res.success && out ? out : "";
+}
+
+/**
  * Discover npm globally installed CLI packages by reading filesystem
+ *
+ * The global root is resolved per-platform (see `npmGlobalCandidates`); the
+ * old code assumed `%APPDATA%\npm\node_modules`, which silently yielded zero
+ * packages on macOS and Linux.
  */
 function discoverNpmGlobalRaw(): CliApp[] {
   const apps: CliApp[] = [];
-  const globalDir = join(appDataDir(), "npm", "node_modules");
+  const globalDir = resolveNpmGlobalRoot();
 
-  if (!existsSync(globalDir)) return apps;
+  if (!globalDir) return apps;
 
   try {
     const entries = readdirSync(globalDir, { withFileTypes: true });
@@ -370,11 +395,10 @@ function discoverPnpmGlobalRaw(): CliApp[] {
   // subprocess entirely.
   const pnpmHome = process.env.PNPM_HOME || localAppDataDir();
   const globalRoots = [
+    ...pnpmGlobalCandidates(),
     join(pnpmHome, "global"),
-    join(localAppDataDir(), "pnpm", "global"),
-    join(appDataDir(), "pnpm", "global"),
   ];
-  const hasGlobalRoot = globalRoots.some((d) => existsSync(d));
+  const hasGlobalRoot = globalRoots.some((d) => d && existsSync(d));
   if (!hasGlobalRoot) return apps; // never installed a global package
   const result = execSafe("pnpm list -g --json 2>nul", { shell: true, timeout: 15000 });
   if (!result.success) return apps;
@@ -404,14 +428,24 @@ function discoverPnpmGlobalRaw(): CliApp[] {
 }
 
 /**
- * Discover npx cached packages
+ * Discover npx cached packages.
+ *
+ * The cache lives under a different directory per platform, so every candidate
+ * is probed and all hits are scanned (a machine can legitimately have both).
  */
 function discoverNpxCacheRaw(): CliApp[] {
   const apps: CliApp[] = [];
-  const npxCache = join(localAppDataDir(), "npm-cache", "_npx");
+  const roots = npxCacheCandidates().filter((d) => d && existsSync(d));
+  if (roots.length === 0) return apps;
 
-  if (!existsSync(npxCache)) return apps;
+  for (const npxCache of roots) {
+    scanNpxCacheDir(npxCache, apps);
+  }
+  return apps;
+}
 
+/** Read one `_npx` directory and append discovered packages to `apps`. */
+function scanNpxCacheDir(npxCache: string, apps: CliApp[]): void {
   try {
     const entries = readdirSync(npxCache, { withFileTypes: true });
     for (const entry of entries) {
@@ -437,8 +471,6 @@ function discoverNpxCacheRaw(): CliApp[] {
   } catch {
     // ignore
   }
-
-  return apps;
 }
 
 /**
@@ -872,8 +904,11 @@ const PATH_NOISE_COMMANDS = new Set([
   "unzip", "makecert", "fsutil", "takeown", "icacls", "runas", "openfiles",
   // PowerShell / cmd builtins & aliases
   "activate", "deactivate", "cl", "nmake", "msbuild", "vswhere",
-  // Generic script helpers that are not user-facing tools
-  "install_tools", "nodevars",
+  // Generic script helpers that are not user-facing tools.
+  // RefreshEnv is Chocolatey's environment-reload shim: it shells out to
+  // reg.exe/WMIC, which can block indefinitely on locked-down machines (and
+  // made `doctor` hang trying to probe it).
+  "install_tools", "nodevars", "refreshenv",
 ]);
 
 /**

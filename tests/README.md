@@ -31,7 +31,9 @@ tests/
 ├── run-tests.mjs        ← 全量测试入口（51 用例自动化运行器）
 ├── smoke-features.mjs   ← 冒烟集（S6/S7/S9/Q6/Q7 等新特性快速回归，22 检查）
 ├── drag-behavior.test.mjs ← **拖拽交互行为测试**（jsdom 真实派发 PointerEvent，13 检查）
-├── perf-guard.test.mjs  ← **性能守卫**（子进程/缓存/页面渲染耗时预算，7 检查）
+├── perf-guard.test.mjs  ← **性能守卫 + 子进程健壮性**（耗时预算 / 超时切断，12 检查）
+├── crossplatform-paths.test.mjs ← **跨平台全局路径推导**（注入 platform/execPath，15 检查）
+├── approval-gate.test.mjs ← **审批门槛**（真实调用 update 工具，spawn 为桩，11 检查）
 ├── verify-fixes.mjs     ← 历史修复验证（D1/D2/source-chip 等，8 检查）
 ├── reports/             ← 测试报告归档（机器生成 run-*.md + 人工结论 TEST-REPORT-*.md）
 ├── probe-plugin-runtime.mjs   ← 早期探针（已被 run-tests.mjs 取代，留档）
@@ -59,6 +61,8 @@ npm run test:quick  # 快速回归（跳过网络扩展用例 TC-A18 / TC-B15）
 npm run test:ui     # UI 相关组（= --group B,C,D）
 npm run test:drag   # 拖拽交互行为测试（需 jsdom）
 npm run test:perf   # 性能守卫（子进程/缓存/渲染耗时预算）
+npm run test:paths  # 跨平台全局路径推导
+npm run test:approval # 审批门槛（spawn 为桩，不会真装任何东西）
 npm run smoke       # 冒烟集（= node tests/smoke-features.mjs）
 
 # 只跑指定组（用于「修 bug 只跑相关模块」）
@@ -84,6 +88,8 @@ node tests/run-tests.mjs --group B,C,D     # UI 改动 → 必带 B,C（见下�
 | E | 数据一致性（计数守恒 / 枚举合法 / 无重复） | 基于 C 组 JSON 交叉验证 |
 | G | 拖拽交互行为（分类换序 / 跨分类移行 / 持久化） | jsdom 真实事件，独立脚本 `drag-behavior.test.mjs` |
 | H | 性能守卫（子进程预算 / 缓存命中 / 渲染耗时） | 独立脚本 `perf-guard.test.mjs` |
+| I | 跨平台全局路径（Windows / Linux / nvm / Homebrew / npx / pnpm） | 独立脚本 `crossplatform-paths.test.mjs`（注入 platform+execPath） |
+| J | 变更类工具审批门槛（拒绝路径 + 放行路径 + 逃生口） | 独立脚本 `approval-gate.test.mjs`（真实调 execute，spawn 打桩） |
 
 ## 静态断言 ≠ 行为验证（重要教训）
 
@@ -129,9 +135,51 @@ node tests/run-tests.mjs --group B,C,D     # UI 改动 → 必带 B,C（见下�
   3 PASS / 4 FAIL，渲染断言实测 7547ms；恢复后 7/7 PASS）。
 - 预算故意给得宽松（冷扫描 20s），目的是抓**数量级**回归，不在慢 CI 上抖动。
 
+## ⚠️ 给子进程打桩：必须在 import 插件之前（真实踩过的坑）
+
+`node:child_process` 的 **ESM 命名空间在首次被 import 时就固定了绑定值**。
+
+后果：如果你想给 `spawn` 打桩、先 `import` 插件（其 `utils.js` 静态
+`import { execSync, spawn } from "node:child_process"`）、再 patch CJS 对象上的
+`spawn`，那么插件里 `await import("node:child_process")` 拿到的仍是**真实 spawn**
+—— 桩完全失效，而且**没有任何报错**。
+
+开发 `approval-gate.test.mjs` 时真的踩到了：测试本意是「审批通过后验证会调用
+spawn」，结果桩没生效，**真实执行了 `npm install -g 9router@latest`**。
+（事后全盘扫描确认 npm 前缀下 90 分钟内 0 个条目被改动 —— 该包本就已是最新版，
+未产生实际变更。但这是运气，不是设计。）
+
+**正确姿势**（`approval-gate.test.mjs` 已按此实现）：
+1. 测试文件**不静态 import** `node:child_process`（否则提前固定绑定）；
+2. 用 `createRequire(import.meta.url)` 拿 CJS 对象，在**任何 ESM import 之前**打桩；
+3. 打桩后立刻 `await import("node:child_process")` 验证桩可见，
+   **不可见就 `process.exit(3)` 中止整个套件**。
+
+> 通用教训：凡是测试里要拦截副作用，先证明**拦截器确实生效**，再执行被测逻辑。
+> 「我打了桩」和「桩生效了」是两件事。
+
+## `execAsync` 的两个坑（写测试时会踩）
+
+1. **`spawn` 不认 `timeout` 选项**。只有 `exec`/`execFile` 认。把 `timeout` 透传给
+   `spawn` 会**静默无效**，调用方无限等待。0.4.6 把 `--version` 探测改成 `execAsync`
+   「并发」后，超时随之丢失，`doctor` 在本机因为 `RefreshEnv` 调被拦截的
+   `reg.exe`/`WMIC.exe` 而**永久挂起**（撞到 300s 上限）。0.5.0 用显式 timer 修复，
+   并在 Windows 上用 `taskkill /T /F` 杀**进程树**（`shell: true` 时拿到的 child 是
+   `cmd.exe`，直接 `kill()` 会把真正的命令留成孤儿进程）。
+2. **`shell: true` 时参数不会加引号**，含空格的参数会被 `cmd.exe` **按空格拆散**。
+   本仓库测试里给 `node -e` 传脚本时必须写成**无空格**形式
+   （`setTimeout(function(){},60000)`），否则子进程秒退报语法错误。
+
+> 第 2 点还教了我们一件事：TC-H11 最初写成 `()=>{},60000`（含空格），子进程秒退，
+> 而断言只检查「耗时 < 8s」→ **假通过**。改成同时断言「耗时 **≥** timeout」后
+> 才暴露出来。**测超时，必须证明它真的等过。**
+
 ## 环境基线（首次归档时）
 
-- 被测插件：dsh-app-manager 0.4.3（`dsh-app-manager/`）
+- 被测插件：dsh-app-manager 0.5.0（`dsh-app-manager/`）
 - 宿主 dsh：0.1.5-rc.1（内置 @deepseek-ai/dsh-tools 0.1.5-rc.2）
 - 运行时：Node 22.22.2（managed）
 - 平台：Windows 10 (win32)
+- 注意：本沙箱内 `npm` 会经 `wsl.exe`，被程序黑名单拦截 → `npm view` / `npm pack`
+  无法执行；`RefreshEnv`（Chocolatey shim）会调被拦的 `reg.exe`/`WMIC.exe`，
+  在沙箱内跑长耗时 CLI 子进程会被卡住，需放开沙箱。

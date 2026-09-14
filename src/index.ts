@@ -3,7 +3,7 @@
  * Registers AI-callable tools and a web management page for CLI applications.
  */
 
-import type { CliApp, ContentBlock, CordisContext, HttpRequest, HttpResponse, ToolDefinition, WebServerService } from "./types.js";
+import type { ApprovalOutcome, ApprovalService, CliApp, ContentBlock, CordisContext, HttpRequest, HttpResponse, ToolDefinition, ToolRunContext, WebServerService } from "./types.js";
 import { buildScanReport, discoverAll, discoverUnmanaged, findApp, readManagedBaseline } from "./discovery.js";
 import { compareVersions, execAsync, pathIndexHas } from "./utils.js";
 
@@ -18,10 +18,84 @@ function asText(text: string): ContentBlock[] {
   return [{ type: "text", text }];
 }
 
+/* -------------------------------------------------------------------------- */
+/*  Approval gate for mutating tools                                          */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Host capabilities read at *call* time rather than captured at registration.
+ *
+ * The approval service is optional — headless deployments and older DSH builds
+ * do not provide one — so it is resolved through a mutable holder that
+ * `ctx.inject` fills in when (and if) the service appears. Tool registration
+ * itself must never depend on it, or the tools would vanish entirely on hosts
+ * without an answerer.
+ */
+interface HostCapabilities {
+  approval?: ApprovalService;
+}
+
+/**
+ * Escape hatch for unattended runs (CI, scripted setup). Off by default: the
+ * whole point of the gate is that a third-party plugin does not silently
+ * rewrite a user's global packages.
+ */
+const ALLOW_UNATTENDED =
+  process.env.APP_MANAGER_ALLOW_UNATTENDED_UPDATE === "1";
+
+/**
+ * Ask the host for permission before mutating the user's global environment.
+ *
+ * Fail-closed by design: when no approval service is present the action is
+ * REFUSED, not silently permitted. `install -g` on a package the user did not
+ * ask for is an irreversible change to a machine this plugin does not own, and
+ * "no answerer" must therefore not read as "yes".
+ *
+ * @param host - resolved host capabilities (may lack `approval`).
+ * @param exec - the tool's execution context, carrying `agent`/`callId`.
+ * @param name - the package the caller wants to install, for the prompt text.
+ * @returns `null` when the caller may proceed, otherwise a refusal message.
+ */
+async function requireApproval(
+  host: HostCapabilities,
+  exec: ToolRunContext,
+  name: string
+): Promise<string | null> {
+  if (ALLOW_UNATTENDED) return null;
+
+  const approval = host.approval;
+  if (!approval || typeof approval.request !== "function") {
+    return (
+      `Refused to update "${name}": this tool installs packages globally and no ` +
+      `approval service is available in this DSH deployment, so permission ` +
+      `cannot be requested.\n\n` +
+      `Nothing was changed. To proceed either:\n` +
+      `- run \`app-manager update ${name}\` yourself, or\n` +
+      `- set APP_MANAGER_ALLOW_UNATTENDED_UPDATE=1 for unattended runs (CI).`
+    );
+  }
+
+  let outcome: ApprovalOutcome;
+  try {
+    outcome = await approval.request({
+      agent: exec.agent,
+      toolName: "app_manager_update",
+      callId: exec.callId,
+      reason: `Run "npm install -g ${name}@latest" — this rewrites a global package on your machine.`,
+      signal: exec.signal,
+    });
+  } catch (error) {
+    const detail = (error as { message?: string })?.message ?? String(error);
+    return `Refused to update "${name}": the approval request failed (${detail}). Nothing was changed.`;
+  }
+
+  if (outcome === "allowed-once") return null;
+  return `Did not update "${name}": the request was not approved (${outcome}). Nothing was changed.`;
+}
+
 /**
  * Format app list as a concise markdown table for LLM consumption
- */
-function formatAppList(apps: CliApp[]): string {
+ */function formatAppList(apps: CliApp[]): string {
   if (apps.length === 0) return "No CLI applications discovered.";
   const managedCount = apps.filter((a) => a.managed).length;
   const lines = [
@@ -57,7 +131,10 @@ async function checkLatestVersion(app: CliApp): Promise<string | null> {
 /**
  * Register tools with DSH using the provided tools service
  */
-function registerTools(toolsService: { register: (tool: ToolDefinition) => (() => void) }): Array<(() => void) | undefined> {
+function registerTools(
+  toolsService: { register: (tool: ToolDefinition) => (() => void) },
+  host: HostCapabilities = {}
+): Array<(() => void) | undefined> {
   const disposers: Array<(() => void) | undefined> = [];
   const register = (tool: ToolDefinition) => disposers.push(toolsService.register(tool));
 
@@ -166,7 +243,7 @@ function registerTools(toolsService: { register: (tool: ToolDefinition) => (() =
       schema: { type: "string", description: "Result of the update operation." },
       render: (_args, value) => asText(String(value)),
     },
-    execute: async (args: Record<string, unknown>, exec: { signal: AbortSignal }) => {
+    execute: async (args: Record<string, unknown>, exec: ToolRunContext) => {
       const name = String(args.name);
       const apps = discoverAll();
       const matches = findApp(name, apps);
@@ -178,6 +255,12 @@ function registerTools(toolsService: { register: (tool: ToolDefinition) => (() =
       }
 
       exec.signal.throwIfAborted();
+
+      // This mutates global packages, so it needs explicit consent. See
+      // requireApproval() — without an answerer the call is refused, not allowed.
+      const denial = await requireApproval(host, exec, app.name);
+      if (denial) return denial;
+
       const cmd = app.source === "npm" ? "npm.cmd" : "pnpm";
       const argsList = app.source === "npm" ? ["install", "-g", `${app.name}@latest`] : ["add", "-g", `${app.name}@latest`];
 
@@ -1524,11 +1607,27 @@ function registerWebRoutes(webServer: WebServerService): Array<(() => void) | un
 export function apply(ctx: CordisContext): () => void {
   const disposers: Array<(() => void) | undefined> = [];
 
+  // Host capabilities the mutating tools need at call time. Populated by the
+  // optional `approval` injection below; absent on hosts without an answerer.
+  const host: HostCapabilities = {};
+
+  if (ctx.inject) {
+    // The approval seam is OPTIONAL and injected separately from `tools`, so a
+    // deployment without it still gets every read-only tool.
+    const approvalDisposer = ctx.inject(["approval"], (approvalCtx) => {
+      host.approval = approvalCtx.approval;
+      return () => {
+        host.approval = undefined;
+      };
+    });
+    disposers.push(approvalDisposer);
+  }
+
   if (ctx.inject) {
     // Dynamically inject tools service to avoid Cordis inject export issues
     const injectDisposer = ctx.inject(["tools"], (toolsCtx) => {
       if (toolsCtx.tools?.register) {
-        disposers.push(...registerTools(toolsCtx.tools));
+        disposers.push(...registerTools(toolsCtx.tools, host));
       }
     });
     disposers.push(injectDisposer);

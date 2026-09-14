@@ -5,6 +5,94 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-09-14
+
+Release-readiness pass: fixes the cross-platform discovery bug and puts a
+consent gate in front of the one tool that mutates the user's machine.
+
+### Fixed
+- **`app-manager doctor` could hang forever.** `execAsync()` forwarded its
+  `timeout` option to `child_process.spawn`, which **ignores** it — only
+  `exec`/`execFile` honour `timeout`. So when 0.4.6 moved the `--version` probes
+  onto `execAsync` for real concurrency, it also silently dropped their timeout.
+  On this machine `doctor` then never returned: `RefreshEnv` (a Chocolatey
+  `.cmd` on PATH) shells out to `reg.exe`/`WMIC.exe`, which are blocked by the
+  security policy, so the probe blocked indefinitely and the whole health check
+  hit the harness's 300s ceiling.
+
+  `execAsync` now enforces its `timeout` with an explicit timer, and tears the
+  process down with `taskkill /T /F` on Windows so the real command dies too
+  (with `shell: true` the child handle is `cmd.exe`, so a plain `kill()` would
+  orphan the actual process). Measured: `doctor` **300s timeout → 20.6s**.
+  Version probes also moved from a 5s to an 8s budget, since cold-starting a
+  bundled CLI can take ~3s and the probes run 12-wide.
+
+- **`RefreshEnv` was treated as an installable tool.** It is Chocolatey's
+  environment-reload helper — same category as the already-excluded
+  `install_tools` / `nodevars` — and it is also what triggered the hang above.
+  Added to the noise list.
+
+- **npm and npx global discovery silently returned nothing on macOS/Linux.**
+  `discoverNpmGlobal()` hardcoded `appDataDir()/npm/node_modules`, and off
+  Windows `appDataDir()` falls back to `$HOME/AppData/Roaming` — a path that
+  does not exist. `discoverNpxCache()` had the same shape of bug via
+  `localAppDataDir()`. The failure mode was the worst kind: no error, no crash,
+  just a quietly short list — and npm globals are exactly where `dsh`, `claude`
+  and `codex` live, so the headline feature was dead for every non-Windows user.
+
+  Global roots are now resolved per platform and per Node install by
+  `npmGlobalCandidates()` (`src/utils.ts`), which derives the active prefix from
+  `process.execPath` and special-cases the ones that need it:
+  nvm (`~/.nvm/versions/node/vX/lib/node_modules`), system (`/usr/lib`),
+  Homebrew (`/opt/homebrew`, cutting at `/Cellar/` rather than the binary's
+  parent), plus `~/.npm-global`, `~/.local` and the `/usr/local` fallbacks.
+  Only the first existing root is used, so the result matches what
+  `npm root -g` reports rather than unioning every Node version installed.
+  `npm root -g` itself is the last-resort fallback, guarded by a PATH check.
+  pnpm got the same treatment (`~/.local/share/pnpm`, `~/Library/pnpm`, XDG).
+  npx cache resolves to `~/.npm/_npx` off Windows and honours `npm_config_cache`.
+
+### Added
+- **Approval gate on `app_manager_update`.** The tool runs
+  `npm install -g <pkg>@latest`, which rewrites a global package on the user's
+  machine. It now asks the host through the `approval` service
+  (`@deepseek-ai/dsh-user-approval`) and proceeds **only** on `allowed-once`.
+
+  Fail-closed by design: when no approval service is composed (headless, CI,
+  older hosts) the call is **refused**, not silently permitted — "no answerer"
+  must not read as "yes". Refusals name both ways forward: run
+  `app-manager update <pkg>` directly, or set
+  `APP_MANAGER_ALLOW_UNATTENDED_UPDATE=1` for unattended runs.
+
+  The `approval` service is injected **separately** from `tools`, so a
+  deployment without an answerer still gets all 7 tools — the gate governs
+  execution, never registration.
+
+  Note the safety property that made this easy to add: `findApp()` is an exact
+  (case-insensitive) match on name or command, and the spawn arguments use the
+  *discovered* `app.name` rather than the raw tool input, so there is no
+  argument-injection surface.
+
+### Added
+- **`tests/crossplatform-paths.test.mjs`** (15 checks). Asserts the derived
+  global roots for Windows, system Linux, `/usr/local`, nvm and Homebrew by
+  injecting `platform`/`execPath`, so the logic is verified on any machine. It
+  explicitly asserts `AppData` never leaks into a POSIX candidate list — the
+  exact defect this release fixes.
+- **`tests/approval-gate.test.mjs`** (11 checks). Drives the real
+  `app_manager_update` tool and asserts the gate blocks on
+  `rejected`/`cancelled`/`unavailable`/unknown outcomes and on a throwing
+  answerer, always with **zero spawn calls**; that `allowed-once` proceeds, with
+  the prompt carrying `toolName`/`callId`/`agent`/`reason`; and that the env
+  escape hatch works in a real child process.
+
+  Safety note for future maintainers: `node:child_process`'s ESM namespace fixes
+  its bindings at first import, so patching `spawn` *after* importing the plugin
+  leaves the real one in place and the test silently performs a genuine global
+  install. The suite therefore patches `spawn` via `createRequire` **before any
+  ESM import**, then verifies through a dynamic import that the stub is visible
+  and aborts if it is not.
+
 ## [0.4.6] - 2026-09-11
 
 ### Fixed

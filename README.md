@@ -135,10 +135,29 @@ Registered tools:
 - `app_manager_list` — List all CLI apps (markdown table)
 - `app_manager_info` — Show details of one app
 - `app_manager_check_updates` — Check for available updates
-- `app_manager_update` — Update a specific app
+- `app_manager_update` — Update a specific app ⚠️ **requires approval**
 - `app_manager_doctor` — Run health check
 - `app_manager_unmanaged` — List programs not managed by a Windows installer
 - `app_manager_scan_method` — Explain the scan sources & techniques
+
+#### `app_manager_update` needs approval / 更新工具需要审批
+
+This is the only tool that **changes your machine** — it runs
+`npm install -g <pkg>@latest`. It asks DSH's approval service first and proceeds
+only on an `allowed-once` grant.
+
+**It fails closed.** If the deployment composes no approval answerer (headless,
+CI, older hosts) the call is *refused* rather than silently allowed, because
+"nobody to ask" must not mean "yes". The refusal message tells you both ways
+forward:
+
+```bash
+app-manager update <pkg>                      # do it yourself
+APP_MANAGER_ALLOW_UNATTENDED_UPDATE=1 ...     # opt out of the prompt (CI)
+```
+
+Only the *AI-callable tool* is gated. The `app-manager update` CLI you run
+yourself is not — you are already the approver.
 
 ### Web Dashboard / 网页管理台
 
@@ -155,6 +174,24 @@ http://127.0.0.1:3080/app-manager/api/apps        # all apps (+ managed flags)
 http://127.0.0.1:3080/app-manager/api/unmanaged   # unmanaged only
 http://127.0.0.1:3080/app-manager/api/method      # scan methodology report
 ```
+
+---
+
+## 🖥️ Platform Support / 平台支持
+
+| Capability | Windows | macOS / Linux |
+|------------|---------|---------------|
+| npm / pnpm / npx-cache discovery | ✅ | ✅ (v0.5.0+) |
+| cargo / pipx / pip / uv discovery | ✅ | ✅ |
+| PATH enumeration (portable tools) | ✅ | ✅ |
+| managed / unmanaged classification | ✅ via Add/Remove-Programs registry | ✅ package-manager provenance only¹ |
+| scoop / choco discovery | ✅ | n/a (not installed) |
+| Process monitor (`app-manager monitor`) | ✅ PowerShell / tasklist | ❌ not implemented |
+
+¹ Off Windows there is no "Add/Remove Programs" baseline, so a package-manager
+install is `managed` and anything found by PATH enumeration is `unmanaged` — i.e.
+"not owned by a package manager". The label keeps its meaning; only the source
+of truth changes.
 
 ---
 
@@ -240,10 +277,31 @@ dsh --profile web --dump-default-config
 
 ## 📝 Known Limitations / 已知限制
 
-- Process monitoring on Windows relies on PowerShell or tasklist
+- Process monitoring is Windows-only (PowerShell / tasklist)
 - `npm view` queries may timeout on poor network connections
 - Version checks may fail for private/scoped packages
 - Some sources (scoop, cargo, pipx) are discover-only (no auto-update yet)
+- Global-package discovery reads the filesystem, so it reports what is
+  *installed*, not what is currently on `PATH` — a tool can show up here and
+  still fail `app-manager doctor` if its `bin` directory is missing from `PATH`
+
+---
+
+## 🧪 Tests / 测试
+
+```bash
+npm test              # 全量套件（51 用例）
+npm run test:quick    # 跳过网络用例
+npm run test:ui       # 只跑 UI 相关组
+npm run test:paths    # 跨平台全局路径推导（15）
+npm run test:approval # 审批门槛（11）
+npm run test:perf     # 性能守卫 + 子进程超时健壮性（12）
+npm run test:drag     # 拖拽交互行为（13）
+npm run smoke         # 特性冒烟（22）
+```
+
+`test:approval` **stubs `child_process.spawn`, so it never installs anything** —
+but please read the safety note at the top of the file before editing it.
 
 ---
 

@@ -101,7 +101,9 @@
 
 **独立行为/性能组**（不在 `run-tests.mjs` 计数内，各自单独运行）：
 - G 组 13 条 · 拖拽交互行为（`node tests/drag-behavior.test.mjs`）
-- H 组 7 条 · 性能守卫（`node tests/perf-guard.test.mjs`）
+- H 组 12 条 · 性能守卫（`node tests/perf-guard.test.mjs`）
+- I 组 15 条 · 跨平台全局路径（`node tests/crossplatform-paths.test.mjs`）
+- J 组 11 条 · 审批门槛（`node tests/approval-gate.test.mjs`）
 
 ---
 
@@ -151,11 +153,87 @@
 | TC-H05 | 生成 `/app-manager` 页面（缓存已热） | < 300ms | 渲染路径不得有未缓存的子进程；必须先 `discoverAll()` 模拟真实服务的预热态 |
 | TC-H06 | 二次调用各 `discoverXxx()` | < 50ms | 10 个源全部命中 per-source memo |
 | TC-H07 | `buildScanReport` 二次调用 | < 300ms | 直接调用路径同样受益于 memo |
+| TC-H08 | commands 不含启动器扩展名 | — | 无 `.exe/.cmd/.js` 等后缀 |
+| TC-H09 | commands 不含内部入口点 | — | 无 `node-gyp-bin`/`npm-cli`/`npm-prefix`/`npx-cli` |
+| TC-H10 | 发现的命令绝大多数在 PATH 可解析 | 缺失率 < 20% | 命令提取未退化 |
+| TC-H11 | `execAsync` 遵守 timeout | ≥ timeout 且 < 8s | 挂起子进程必须被超时切断；**断言耗时 ≥ timeout**，防止子进程因参数被空格拆散而秒退、伪装成超时成功 |
+| TC-H12 | `execAsync` 正常命令仍返回 stdout | — | 加超时后未破坏正常路径 |
 
 **回归能力（已实测）**：把 `SCAN_TTL_MS` 置 0 后本组得 3 PASS / 4 FAIL，
-页面渲染断言实测 **7547ms**（预算 300ms）；恢复后 7/7 PASS。
+页面渲染断言实测 **7547ms**（预算 300ms）。回退命令名归一化会让 TC-H09 失败。
+TC-H11 的断言曾抓到自己的假阳性（`-e` 脚本被 cmd.exe 按空格拆散 → 秒退 → 误判通过）。
 
 **为何 TC-H05 要先调 `discoverAll()`**：首次渲染确实要付冷扫描成本，那是
 TC-H03 的职责。真实 dsh 服务在插件 `apply()` 时有后台预热（`setTimeout(...,0)`
 调用 `discoverAll()` + `buildScanReport()`），所以用户看到的第一次请求
 本就应该命中缓存。TC-H05 测的是这个稳态，TC-H03 测的是最坏情况。
+
+---
+
+## I 组 — 跨平台全局路径推导（`crossplatform-paths.test.mjs`，15 条）
+
+> 缺陷背景：`discoverNpmGlobal()` 硬编码 `appDataDir()/npm/node_modules`，
+> 而 `appDataDir()` 在非 Windows 上回退到 `$HOME/AppData/Roaming`（不存在）
+> → **macOS/Linux 上 npm 全局发现静默返回 0 条**，而 `dsh`/`claude`/`codex`
+> 正是从那里发现的。失败方式是最糟的一类：不报错、不崩溃，只是安静地少显示。
+>
+> 测试手法：把 `platform` / `execPath` 作为**参数注入**，于是可以在任意机器上
+> 断言 nvm / Homebrew / 系统 node 的推导结果 —— 静态断言永远抓不到这类 bug。
+
+| ID | 用例 | 断言 |
+|----|------|------|
+| TC-I01 | Windows | 首候选为 `%APPDATA%\npm\node_modules`；不混入 POSIX 路径 |
+| TC-I02 | Linux 系统 node | `/usr/bin/node` → `/usr/lib/node_modules` 优先 |
+| TC-I03 | Linux 用户级 node | `/usr/local/bin/node` → `/usr/local/lib/node_modules` 优先 |
+| TC-I04 | nvm | 推导出 `~/.nvm/versions/node/vX/lib/node_modules` |
+| TC-I05 | Homebrew (arm64) | 推导出 `/opt/homebrew/lib/node_modules`，**且不含 `Cellar`** |
+| TC-I06 | macOS 系统 node | `/usr/local/lib/node_modules` 优先 |
+| TC-I07 | 用户级回退 | 候选表含 `~/.npm-global`、`~/.local` |
+| TC-I08 | **缺陷本身** | 任何 POSIX 候选列表都**不含 `AppData`** |
+| TC-I09 | Windows npx | `%LOCALAPPDATA%\npm-cache\_npx` |
+| TC-I10 | macOS/Linux npx | 含 `~/.npm/_npx` |
+| TC-I11 | npx 覆盖 | 尊重 `npm_config_cache` |
+| TC-I12 | pnpm Linux | 含 `~/.local/share/pnpm/global`；`XDG_DATA_HOME` 优先 |
+| TC-I13 | pnpm macOS | 含 `~/Library/pnpm/global` |
+| TC-I14 | 真实自检 | 当前平台候选表非空且无空串 |
+| TC-I15 | 真实自检 | `npmGlobalRoot()` 解析到的目录形如 `node_modules` |
+
+---
+
+## J 组 — 变更类工具的审批门槛（`approval-gate.test.mjs`，11 条）
+
+> `app_manager_update` 会执行 `npm install -g <pkg>@latest`，是**不可逆**改动。
+> 对外发布后，第三方插件无声改动用户全局环境不可接受。
+> J 组**真实调用**工具的 `execute`，不是检查「代码里有没有 requireApproval」——
+> 那正是 Q6/Q7 栽过的坑。
+
+| ID | 用例 | 断言 |
+|----|------|------|
+| TC-J01 | 只读工具不受影响 | 无审批服务时 7 个工具**仍全部注册** |
+| TC-J02 | 工具数不变 | 有审批服务时仍 7 个 |
+| TC-J03 | fail closed | 无审批服务 → 拒绝，且 **0 次 spawn** |
+| TC-J04 | 可操作的拒绝信息 | 含 `app-manager update` 与 `APP_MANAGER_ALLOW_UNATTENDED_UPDATE=1` |
+| TC-J05 | rejected | 不执行、0 spawn |
+| TC-J06 | cancelled | 不执行、0 spawn |
+| TC-J07 | unavailable | 不执行、0 spawn |
+| TC-J08 | 未知词表值 | 不执行、0 spawn |
+| TC-J09 | 审批器抛错 | 拒绝（**不是放行**）、0 spawn |
+| TC-J10 | allowed-once | 放行；spawn 参数含 `-g`；请求带齐 `toolName`/`callId`/`agent`/`reason` |
+| TC-J11 | 逃生口 | 子进程实测 `APP_MANAGER_ALLOW_UNATTENDED_UPDATE=1` 无需审批直接放行 |
+
+### ⚠️ 维护者必读：为什么 spawn 桩必须在 import 插件**之前**打
+
+`node:child_process` 的 **ESM 命名空间在首次 import 时固定绑定值**。若先
+`import` 插件（其 `utils.js` 静态 import 了 `child_process`），再 patch `spawn`，
+插件里 `await import("node:child_process")` 拿到的仍是**真实 spawn** ——
+桩失效，TC-J10 会**真的执行 `npm install -g`**。
+
+本文件因此：
+1. 不静态 `import` `node:child_process`（否则提前固定绑定）；
+2. 用 `createRequire` 拿 CJS 对象，**在任何 ESM import 之前**打桩；
+3. 打桩后立刻用动态 import 验证桩可见，**不可见就 `exit(3)` 中止套件**。
+
+（此坑已在开发中真实触发过一次：真实执行了 `npm install -g 9router@latest`。
+经全盘扫描确认 npm 前缀下 90 分钟内 0 个条目被改动 —— 该包本就已是最新版，
+未产生实际变更。教训已写入本节。）
+

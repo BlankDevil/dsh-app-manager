@@ -266,6 +266,63 @@ await check("发现的命令绝大多数在 PATH 上可解析", () => {
   return `${cmds.length - missing.length}/${cmds.length} resolvable`;
 });
 
+console.log("");
+console.log("━━━ 子进程健壮性 ━━━");
+
+await check("execAsync 遵守 timeout，不无限等待", async () => {
+  // Regression guard: `child_process.spawn` IGNORES a `timeout` option (only
+  // exec/execFile honour it), so forwarding it used to leave callers waiting
+  // forever. That became a real hang — `doctor` probes `<cmd> --version` for
+  // every app, and a PATH shim that blocks (RefreshEnv shells out to
+  // reg.exe/WMIC) made the whole health check never return.
+  //
+  // The child must genuinely hang. Two details matter:
+  //   - the script must contain NO SPACES. `execAsync` uses `shell: true` on
+  //     Windows and Node does not quote argv for cmd.exe, so an argument with a
+  //     space is split and the child dies with a syntax error instead of
+  //     hanging — the timeout would then never be exercised;
+  //   - assert the elapsed time is AT LEAST the timeout, so an early exit
+  //     cannot masquerade as a passing timeout.
+  const TIMEOUT_MS = 1500;
+  const t0 = Date.now();
+  const res = await utils.execAsync(
+    process.execPath,
+    ["-e", "setTimeout(function(){},60000)"],
+    { timeout: TIMEOUT_MS }
+  );
+  const ms = Date.now() - t0;
+
+  assert(
+    ms >= TIMEOUT_MS - 100,
+    `child returned in ${ms}ms, before the ${TIMEOUT_MS}ms timeout — it exited early ` +
+      `(likely argv was split on a space), so the timeout path was not exercised: ${res.error.slice(0, 120)}`
+  );
+  assert(
+    ms < 8000,
+    `a hanging child took ${ms}ms despite a ${TIMEOUT_MS}ms timeout — the promise never settled`
+  );
+  assert(res.success === false, "a timed-out child must not report success");
+  assert(
+    /timed out after/i.test(res.error),
+    `expected a timeout note in the error, got: ${JSON.stringify(res.error.slice(0, 120))}`
+  );
+  return `settled in ${ms}ms with "${res.error}"`;
+});
+
+await check("execAsync 正常命令仍返回 stdout", async () => {
+  const res = await utils.execAsync(
+    process.execPath,
+    ["-e", "process.stdout.write('ok-marker')"],
+    { timeout: 15000 }
+  );
+  assert(res.success, `expected success, got error="${res.error}"`);
+  assert(
+    res.output.includes("ok-marker"),
+    `stdout not captured: ${JSON.stringify(res.output)}`
+  );
+  return "stdout captured";
+});
+
 // The page-render check is async; the sequential `await check(...)` calls
 // above already awaited it. Nothing further to do here.
 console.log("");console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");

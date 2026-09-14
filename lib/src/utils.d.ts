@@ -11,7 +11,34 @@ export declare function execSafe(command: string, options?: {
     cwd?: string;
 }): ExecResult;
 /**
- * Execute a command asynchronously
+ * Kill a child process and everything it spawned.
+ *
+ * `shell: true` means the child we hold is `cmd.exe`/`sh`, not the real
+ * command — so a plain `kill()` would reap the wrapper and leave the actual
+ * process running as an orphan. On Windows `taskkill /T /F` is the only way to
+ * reach the whole tree; elsewhere the process group is signalled directly.
+ *
+ * Best effort by design: the caller has usually already settled its promise, so
+ * a failure here must never surface.
+ */
+export declare function killProcessTree(child: {
+    pid?: number;
+    kill: (signal?: NodeJS.Signals) => boolean;
+}): void;
+/**
+ * Execute a command asynchronously.
+ *
+ * `timeout` is enforced with an explicit timer. This matters: `child_process
+ * .spawn` **ignores** a `timeout` option (only `exec`/`execFile` honour it), so
+ * passing it through silently produced unbounded waits. That turned into a real
+ * hang in the field — `doctor` probes `<cmd> --version` for every app, and one
+ * shim on PATH (`RefreshEnv`, a Chocolatey `.cmd` that shells out to
+ * `reg.exe`/`WMIC.exe`) blocks indefinitely when those are unavailable, so the
+ * health check never returned.
+ *
+ * Note for callers: `shell` defaults to `true` on Windows, and Node does not
+ * quote arguments for `cmd.exe`, so an argument containing spaces is split.
+ * Pass argv as an array of space-free tokens, or set `shell: false`.
  */
 export declare function execAsync(command: string, args?: string[], options?: {
     shell?: boolean | string;
@@ -85,6 +112,35 @@ export declare function appDataDir(env?: NodeJS.ProcessEnv): string;
 export declare function localAppDataDir(env?: NodeJS.ProcessEnv): string;
 /** Resolve the user's home / profile directory. */
 export declare function homeDir(env?: NodeJS.ProcessEnv): string;
+/**
+ * Candidate directories holding globally-installed npm packages, ordered so
+ * the *active* Node installation wins.
+ *
+ * Why this exists: the original implementation hardcoded
+ * `appDataDir()/npm/node_modules`. Off Windows `appDataDir()` falls back to
+ * `$HOME/AppData/Roaming`, a path that does not exist — so npm globals were
+ * silently reported as zero on macOS and Linux, which is exactly where `dsh`,
+ * `claude` and `codex` are usually installed.
+ */
+export declare function npmGlobalCandidates(env?: NodeJS.ProcessEnv, execPathRaw?: string, platform?: NodeJS.Platform): string[];
+/**
+ * The active npm global `node_modules` directory, or `""` when none of the
+ * conventional locations exist. Only the first hit is used so the result
+ * matches what `npm root -g` would report (rather than unioning every Node
+ * version ever installed).
+ */
+export declare function npmGlobalRoot(env?: NodeJS.ProcessEnv): string;
+/**
+ * Candidate npx cache directories. npx (npm >= 7) stores extracted packages
+ * under `<npm cache>/_npx`; the cache lives in `%LOCALAPPDATA%\npm-cache` on
+ * Windows and `~/.npm` everywhere else.
+ */
+export declare function npxCacheCandidates(env?: NodeJS.ProcessEnv, platform?: NodeJS.Platform): string[];
+/**
+ * Candidate pnpm global roots (the parent of `global/node_modules`).
+ * pnpm uses a different data dir per platform, same bug class as npm above.
+ */
+export declare function pnpmGlobalCandidates(env?: NodeJS.ProcessEnv, platform?: NodeJS.Platform): string[];
 /** Executable extensions we treat as runnable commands on each platform. */
 export declare const EXECUTABLE_EXTS: string[];
 /**

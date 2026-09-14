@@ -5,6 +5,45 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.2] - 2026-09-14
+
+First public release to npm. Metadata and docs only — no runtime behaviour
+changes, so an upgrade from 0.5.1 carries no risk.
+
+### Added
+- **The plugin description now states where the dashboard actually lives.**
+  `package.json` `description` ends with
+  `... DSH plugin: 7 AI-callable tools plus a web dashboard at
+  http://127.0.0.1:3080/app-manager.` A freshly installed plugin previously
+  gave no hint that a UI existed at all — the only way to find the page was to
+  read the source.
+
+  The port is **3080**, taken from the host's own declaration in
+  `@deepseek-ai/dsh-web-app/cordis.patch.yml`:
+  ```yaml
+  port: !!js ctx.webStartup.port ?? 3080
+  ```
+  Worth flagging because the host's `--port 8080` help text is an *example of
+  how to change the port*, not the default — it is easy to copy the wrong one.
+
+- **README**: the features table and the install section both name the default
+  address, and install now ends with an explicit "open
+  http://127.0.0.1:3080/app-manager" line.
+
+### Changed
+- **`author` is now `BlankDevil <blank.devil.yang@gmail.com>`** instead of the
+  placeholder. npm shows this on the package page.
+
+- **`keywords` gained `dashboard`, `web-ui`, `tool-manager`** so the package is
+  findable by what it provides rather than only by `dsh`.
+
+### Fixed
+- **The "install from source" snippet could not be run.** It ended with
+  `dsh plugin --profile web add ./dsh-app-manager` *after* `cd dsh-app-manager`,
+  but dsh's `anchorPathSpec()` anchors a relative path to the **invoking cwd**,
+  so that resolves to `<repo>/dsh-app-manager` — which does not exist. Now
+  `add .`.
+
 ## [0.5.1] - 2026-09-14
 
 Release-readiness pass on the packaging and tooling around the plugin. No

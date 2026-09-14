@@ -88,8 +88,18 @@ git switch -c rel-0.6.0
 
 ## 提交身份
 
-本仓库使用统一署名 **`BlankDevil`**（与 `LICENSE` 的版权人、`package.json` 的 `author` 一致）。
-配置为**仓库级**，不要改全局：
+### 其他贡献者：用你自己的身份，**不需要改任何配置**
+
+直接用你本地已有的 git 身份提交即可 —— 仓库**不会**要求你改成维护者的名字。
+GitHub 会按提交里的邮箱把这个 commit 归属到**你自己的**账号，
+你的贡献记录也留在你自己的名下。
+
+> 换句话说：「统一署名 `BlankDevil`」只约束仓库维护者，不是对贡献者的要求。
+
+### 维护者：统一署名 `BlankDevil`
+
+只有仓库所有者（`@BlankDevil`）在本仓库使用统一署名，与 `LICENSE` 的版权人、
+`package.json` 的 `author` 保持一致。配置为**仓库级**，不要改全局：
 
 ```bash
 git config user.name  "BlankDevil"

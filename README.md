@@ -19,7 +19,11 @@
 | 🔎 Quick Search | 按名称、分类或命令搜索应用 |
 | 📤 Export Registry | 导出 JSON 格式的应用清单 |
 | 🤖 DSH AI Tools | 注册 AI-callable tools，让 DSH 帮你查询和更新 |
-| 🌐 Web Dashboard | 在浏览器访问 `/app-manager` 管理页面 |
+| 🌐 Web Dashboard | 在浏览器访问 **`/app-manager`** 管理页面（默认 `http://127.0.0.1:3080/app-manager`） |
+
+> 🌐 **装好后怎么用**：启动 `dsh web`，在浏览器打开 **`http://127.0.0.1:3080/app-manager`**
+> 即进入管理界面。（端口以你的 dsh web 配置为准；`dsh --profile web --port <port>` 可改。）
+> 命令行用户也可以直接跑 `app-manager list`。
 
 ---
 
@@ -54,6 +58,8 @@ npm install -g dsh-app-manager
 dsh plugin --profile web add dsh-app-manager
 ```
 
+装完打开管理页面：**`http://127.0.0.1:3080/app-manager`**（`dsh web` 启动后）。
+
 ### From source / 从源码安装
 
 ```bash
@@ -68,8 +74,9 @@ pnpm run build
 # Link as global CLI
 npm link
 
-# Or install as DSH plugin
-dsh plugin --profile web add ./dsh-app-manager
+# Or install as DSH plugin —— 在仓库目录里用 `add .`
+# （相对路径会被 dsh 锚定到当前目录，所以 `add .` 即指本仓库）
+dsh plugin --profile web add .
 ```
 
 ---

@@ -177,12 +177,28 @@ jsdom 26 及更早**没有 `PointerEvent` 构造器**，而拖拽测试完全依
 ## 8. 仍未做 / 待决策
 
 - **`dsh.client` 未声明 —— 决定：本次发布不做。**
-  这不是一个元信息字段，而是一次**客户端集成**：需要引入
-  `@deepseek-ai/dsh-client-locale` / `-ui-slots` 等客户端包，并提供一个真正的
-  客户端 UI 模块与构建流程。本机 profile 里没有可参照的现成实现，
-  而**声明了却没有对应的客户端产物，会让 DSH 加载插件时直接失败** ——
-  这比"没有 UI 入口"严重得多。网页版已可通过固定 URL 使用，
-  入口可发现性属锦上添花，不应阻塞发布。若要补，建议作为独立需求排期。
+  这不是一个元信息字段，而是一次**客户端集成**。本机 `dsh-better-sidebar@0.19.1`
+  就是现成参照，它的声明是：
+
+  ```json
+  "dsh": {
+    "bundle": { "patch": "./cordis.patch.yml" },
+    "client": {
+      "inject": ["@deepseek-ai/dsh-client-locale", "@deepseek-ai/dsh-client-ui-slots",
+                 "@deepseek-ai/dsh-client-ui-conversation",
+                 "@deepseek-ai/dsh-client-ui-sidebar-right",
+                 "@deepseek-ai/dsh-client-modules"],
+      "platform": "web"
+    }
+  }
+  ```
+
+  而它的 `files` 里确实带着 `lib/client.js`、`lib/client-registry.js`、
+  `lib/client-terminal.js` 等**真正的客户端产物**。
+  也就是说：`dsh.client` 必须配一套客户端 bundle 才有意义，
+  **声明了却没有对应产物会让 DSH 加载插件直接失败** —— 比"没有 UI 入口"严重得多。
+  网页版已可通过固定 URL 使用，入口可发现性属锦上添花。
+  若要补，建议作为独立需求排期（需要引入上述 client 包 + 单独的客户端构建流程）。
 - 仓库描述目前是 `manager local CLI apps`（偏简陋，会出现在搜索结果里）—— 只能改 GitHub 设置，git 改不了。
 - `engines: >=18` 未在 CI 中实测（CI 用 Node 22，因为 `jsdom >= 27` 要求 Node >= 20）。
   **注意**：`engines` 约束的是发布包的运行时，而本包**零运行时依赖**，所以

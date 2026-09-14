@@ -18,6 +18,13 @@ DSH 会：用 pnpm 把包装进 profile → 读 `package.json` 的 `dsh.bundle.p
 
 所以：**只要包在 npm registry 上，其他人就能装。** 无需官方审核。
 
+> **依赖自包含（硬性约束）**：发布包只含本插件自身（29 个文件、
+> 0 个 `node_modules` 文件），`dependencies` 为空 —— 安装时**只下载
+> dsh-app-manager 需要的东西，不牵扯其他插件的依赖**。
+> `lib/` 只 import Node 内置模块与相对路径；宿主能力走
+> `peerDependencies`（`@deepseek-ai/dsh-tools`）由 DSH 注入。
+> 新增依赖前先读 `PRD.md` §10 / `CONTRIBUTING.md`。
+
 （本机实测：`~/.dsh/profiles/web/package.json` 的 `dsh.profile.bundles`
 里就有 `dsh-app-manager`，通过 `link:` 指向本地仓库。）
 

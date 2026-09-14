@@ -5,6 +5,121 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.6] - 2026-09-11
+
+### Fixed
+- **`/app-manager` still took ~10s to open even with a warm `discoverAll` cache.**
+  The 0.4.5 fix addressed `commandExists()` (a *general* slowness), but the page
+  handler was measurably still 9.6s while `discoverAll()` returned in **0ms** —
+  proving a second, independent bottleneck. Tracing every
+  `execSync`/`spawn` during one render found four package-manager probes that
+  re-ran on **every request**, because `buildScanReport()` and `doctor` call the
+  individual discoverers directly and therefore bypassed `allCache`:
+
+  | probe | cost |
+  |-------|------|
+  | `pip list --format=json` | 3.4s |
+  | `choco list --local-only` | 2.7s |
+  | `pnpm list -g --json` | 2.2s |
+  | `uv tool list` | 0.8s |
+
+  Fixes:
+  - The per-source memo now lives **inside each discoverer** (`memoized()`
+    wrappers around `discoverXxxRaw`), so any call path — `discoverAll`,
+    `buildScanReport`, `doctor`, the web method panel — hits the TTL cache.
+  - **Filesystem fast paths** for `choco`, `pnpm`, and `uv`: when the package
+    manager's data directory is absent we can prove there are no packages and
+    skip the subprocess entirely. `choco` 2741ms → **2ms**, `uv` 4191ms → **1ms**,
+    `pnpm` 2401ms → **310ms**.
+  - `choco` now reads `<ChocolateyInstall>/lib/*/*.nuspec` (version included)
+    instead of parsing CLI output. This also **fixes a latent bug**: the old
+    fallback ran `choco list --local-only`, but Chocolatey v2 **removed** that
+    flag (`Invalid argument --local-only`), so on any modern Chocolatey the
+    probe silently returned zero packages.
+
+  Result: warm page render **9626ms → 9ms**; cold `discoverAll` **11.8s → 4.5s**.
+
+- **`doctor` reported ~34 false "not found in PATH" issues.** `commands` was
+  being populated with launcher filenames and internal entry points instead of
+  the names you actually invoke:
+  - `@anthropic-ai/claude-code` declared bin keys `claude` **and** `claude.exe`
+  - `@openai/codex` declared `codex` and `codex.js`
+  - `npm`'s own `bin/` directory contains `node-gyp-bin/` (a *directory*) plus
+    `npm-cli.js`, `npm-prefix.js`, `npx-cli.js`
+
+  None of those resolve on PATH — the PATH index stores extensionless names —
+  so every one produced a spurious issue. Fixed in `detectCliFromPackageJson`:
+  skip directories when scanning `bin/`, strip launcher extensions
+  (`.exe .cmd .bat .com .ps1 .js .mjs .cjs`), and keep a `bin/`-directory
+  candidate only if it was explicitly declared in `package.json#bin` or
+  actually resolves on PATH. Total command count **113 → 56**, all invocable;
+  real "not found" issues **34 → 7** (all genuine npx-cache entries).
+
+- **`choco` reported the command `chocolatey`.** The Chocolatey install dir is
+  named `chocolatey` but the command it provides is `choco`; other packages map
+  name → command directly.
+
+- **Fake "concurrency" in `doctor` and `checkUpdates`.** Both used
+  `runWithConcurrency(..., 8|5, ...)` to overlap subprocess work, but the work
+  called the blocking `execSync`-based `execSafe`, which stalls the event loop —
+  so the lanes ran strictly serially. `doctor` measured **98.6s**. Version
+  probes and `npm view` lookups now go through the spawn-based `execAsync`
+  (with a `probeVersion()` memo, TTL 5min), so the pools genuinely overlap and
+  the limits were raised to 8/6/12.
+  Affected: `src/commands.ts` (`checkUpdates`, `showInfo`, `runDoctor`,
+  `monitorProcesses`), `src/index.ts` (`checkLatestVersion`).
+
+### Added
+- **`tests/perf-guard.test.mjs`** (10 checks) — a dedicated perf guard, because
+  performance regressions have **no functional symptom**: the page renders
+  perfectly, just slowly. Covers the bulk-`pathIndexHas` budget, cold/warm scan
+  budgets, warm page-render budget, per-source cache hits, `buildScanReport` on
+  a warm cache, plus three **command-name hygiene** assertions that lock in the
+  `doctor` fix above. Verified to have real regression power: forcing
+  `SCAN_TTL_MS=0` yields 3 PASS / 4 FAIL with the render assertion measuring
+  7547ms against a 300ms budget, and reverting the command normalisation fails
+  the internal-entry-point check.
+- **`lastSpawnError` diagnostics** (`utils.ts`). The ARP registry read returns
+  `[]` when the PowerShell spawn is blocked (e.g. by a Windows Application
+  Control / security-agent program blacklist), which silently degrades every app
+  to "unmanaged". The reason is now captured and logged once instead of
+  swallowed.
+- `npm run test:perf` script.
+
+### Notes
+- 0.4.5's "cold scan ~5.9s" and "page renders instantly once warm" claims were
+  incomplete: the page still cost ~9.6s warm. Both numbers are corrected above.
+
+## [0.4.5] - 2026-09-11
+
+### Fixed
+- **`/app-manager` took ~40s on a cold cache.** The page and `/api/apps`
+  computed `inPath` with `commandExists()`, which spawns `where`/`which` per
+  command — 66 spawns ≈ **35s**, and it ran *inside the row-render loop*.
+  Everything now uses the already-cached `pathIndexHas()` (a PATH index build
+  + Map lookup): 66 checks went **35,297ms → 0ms**. Cold scan is now ~5.9s
+  (was ~10.7s after that), and the page renders instantly once warm.
+  Affected: `src/index.ts` (row status, `inPath` stat, `/api/apps`, doctor
+  tool), `src/commands.ts` (`info` status line, `doctor` checks),
+  `src/discovery.ts` (every source guard and scan-report probe, 13 sites).
+  `commandExists()` is kept for genuine one-off checks.
+
+### Added
+- **Background scan warm-up.** The plugin primes the discovery cache on load
+  (deferred to the next macrotask, `unref`ed, failures non-fatal) so the first
+  visit to `/app-manager` does not pay the ~5.9s scan cost.
+- **Command subtitle in the Name column.** Scoped npm packages now show the
+  callable command beneath the package name — `@anthropic-ai/claude-code`
+  displays `claude`, `@openai/codex` displays `codex`. Rows whose command and
+  package name already match stay single-line, so only 4 of 52 rows gain a
+  subtitle. Rows also carry `data-cmd` for filtering.
+
+### Notes
+- A worker-thread parallel scanner was prototyped and **reverted**: `execSync`
+  blocks its thread, and `Atomics.wait` on the main thread deadlocks because
+  worker `message` events cannot be delivered. The real win was removing the
+  per-command subprocess spawns, not parallelising the sources.
+
 ## [0.4.4] - 2026-09-11
 
 ### Fixed

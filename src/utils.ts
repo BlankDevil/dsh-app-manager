@@ -145,6 +145,31 @@ export function resetPathIndex(): void {
   pathIndexCache = null;
 }
 
+/* -------------------------------------------------------------------------- */
+/*  Subprocess diagnostics                                                    */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * One-line reason why the last child process failed, or `""` if it succeeded.
+ *
+ * Why this exists: on Windows with a locked-down Application Control policy
+ * (or a security agent's program blacklist), spawning `powershell` can fail
+ * outright. The old ARP reader swallowed the exception and returned `[]`, so
+ * the whole "managed vs unmanaged" classification silently degraded to
+ * "everything is unmanaged" with no visible cause. Callers can surface this
+ * string in the scan report instead of guessing.
+ */
+let lastSpawnError = "";
+
+export function getLastSpawnError(): string {
+  return lastSpawnError;
+}
+
+/** Record a spawn failure reason (best effort — truncates very long text). */
+export function noteSpawnError(message: string): void {
+  lastSpawnError = message.length > 300 ? message.slice(0, 300) + "..." : message;
+}
+
 /**
  * Read package.json from a directory
  */
@@ -365,7 +390,10 @@ export function readArpEntries(): ManagedApp[] {
     );
 
     return parseArpJson(out);
-  } catch {
+  } catch (error: unknown) {
+    // Keep the reason so callers can report *why* the baseline is missing
+    // rather than silently treating every app as unmanaged.
+    noteSpawnError((error as { message?: string })?.message || String(error));
     return [];
   } finally {
     if (tmpFile) {

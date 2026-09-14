@@ -1,0 +1,275 @@
+#!/usr/bin/env node
+/**
+ * dsh-app-manager — 性能守卫测试
+ *
+ * 为什么需要：`/app-manager` 曾经冷启动要 ~40 秒，根因是渲染循环里对每个
+ * 命令调用 `commandExists()`（每次都 spawn 一个 `where`/`which` 子进程，
+ * 66 次约 35 秒）。这类性能退化**不会**让任何功能断言失败——页面照样渲染
+ * 正确，只是慢——所以必须有专门的耗时守卫。
+ *
+ * 本测试断言：
+ *   1. 批量命令检查走缓存索引（pathIndexHas），不得用 commandExists
+ *   2. discoverAll 冷扫描在合理上限内完成
+ *   3. discoverAll 二次调用命中缓存（接近 0ms）
+ *   4. 渲染页面不触发逐命令子进程
+ *
+ * 运行：node tests/perf-guard.test.mjs
+ */
+
+import { fileURLToPath, pathToFileURL } from "node:url";
+import path from "node:path";
+
+const TESTS_DIR = path.dirname(fileURLToPath(import.meta.url));
+const PLUGIN_DIR = path.resolve(TESTS_DIR, "..");
+
+const results = [];
+async function check(label, fn) {
+  try {
+    const detail = await fn();
+    results.push({ label, ok: true });
+    console.log(`PASS  ${label}${detail ? "  --  " + detail : ""}`);
+  } catch (e) {
+    results.push({ label, ok: false, err: e.message });
+    console.log(`FAIL  ${label}`);
+    console.log(`      ↳ ${e.message}`);
+  }
+}
+function assert(cond, msg) {
+  if (!cond) throw new Error(msg);
+}
+
+// Budgets are deliberately generous: they must not flake on a slow CI box,
+// but they do catch an order-of-magnitude regression like the 35s one.
+const COLD_SCAN_BUDGET_MS = 20_000;
+const WARM_SCAN_BUDGET_MS = 50;
+const BULK_CHECK_BUDGET_MS = 500;
+
+const utils = await import(
+  pathToFileURL(path.join(PLUGIN_DIR, "lib/src/utils.js")).href
+);
+const discovery = await import(
+  pathToFileURL(path.join(PLUGIN_DIR, "lib/src/discovery.js")).href
+);
+
+console.log("");
+console.log("━━━ 批量命令检查 ━━━");
+
+await check("pathIndexHas 批量检查 66 个命令 < 500ms", () => {
+  discovery.discoverAll(); // ensure apps + PATH index are ready
+  const apps = discovery.discoverAll();
+  const cmds = apps.flatMap((a) => a.commands);
+  assert(cmds.length > 0, "no commands to check");
+  const t0 = Date.now();
+  for (const c of cmds) utils.pathIndexHas(c);
+  const ms = Date.now() - t0;
+  assert(
+    ms < BULK_CHECK_BUDGET_MS,
+    `${cmds.length} checks took ${ms}ms (budget ${BULK_CHECK_BUDGET_MS}ms) — ` +
+      `is something still calling commandExists() per command?`
+  );
+  return `${cmds.length} checks in ${ms}ms`;
+});
+
+await check("pathIndexHas 与 commandExists 结论一致（抽样）", () => {
+  const apps = discovery.discoverAll();
+  const cmds = apps.flatMap((a) => a.commands).slice(0, 12);
+  const diffs = [];
+  for (const c of cmds) {
+    const slow = utils.commandExists(c);
+    const fast = utils.pathIndexHas(c);
+    // PATH shims and real executables can legitimately disagree on edge
+    // cases; we only flag it when the cached index *misses* something the
+    // authoritative check finds, which would hide a tool.
+    if (slow && !fast) diffs.push(c);
+  }
+  assert(
+    diffs.length === 0,
+    `pathIndexHas missed commands that commandExists found: ${diffs.join(", ")}`
+  );
+  return `${cmds.length} sampled, 0 misses`;
+});
+
+console.log("");
+console.log("━━━ 扫描耗时 ━━━");
+
+await check(`discoverAll 冷扫描 < ${COLD_SCAN_BUDGET_MS}ms`, () => {
+  utils.resetPathIndex?.();
+  // Bust the discovery cache so this is a genuine cold scan.
+  discovery._resetScanCache?.();
+  const t0 = Date.now();
+  const apps = discovery.discoverAll();
+  const ms = Date.now() - t0;
+  assert(apps.length > 0, "scan returned no apps");
+  assert(
+    ms < COLD_SCAN_BUDGET_MS,
+    `cold scan took ${ms}ms (budget ${COLD_SCAN_BUDGET_MS}ms)`
+  );
+  return `${ms}ms for ${apps.length} apps`;
+});
+
+await check(`discoverAll 二次调用命中缓存 < ${WARM_SCAN_BUDGET_MS}ms`, () => {
+  discovery.discoverAll();
+  const t0 = Date.now();
+  const apps = discovery.discoverAll();
+  const ms = Date.now() - t0;
+  assert(
+    ms < WARM_SCAN_BUDGET_MS,
+    `warm scan took ${ms}ms (budget ${WARM_SCAN_BUDGET_MS}ms) — cache not effective`
+  );
+  return `${ms}ms for ${apps.length} apps`;
+});
+
+console.log("");
+console.log("━━━ 页面渲染 ━━━");
+
+await check("生成 /app-manager 页面 < 300ms（缓存已热）", async () => {
+  const routes = [];
+  const plugin = await import(
+    pathToFileURL(path.join(PLUGIN_DIR, "lib/src/index.js")).href
+  );
+  plugin.apply({
+    logger: { info: () => {} },
+    inject(_d, cb) {
+      cb({
+        tools: { register: () => () => {} },
+        webServer: { register: (r) => (routes.push(r), () => {}) },
+      });
+      return () => {};
+    },
+  });
+  const page = routes.find((r) => r.path === "/app-manager");
+  assert(page, "/app-manager route not registered");
+
+  // Simulate the real server: the background warm-up (or a prior request)
+  // has already populated the caches. Without this the very first render
+  // legitimately pays the cold-scan cost — that is what the cold-scan
+  // assertion above covers, not this one.
+  discovery.discoverAll();
+
+  const render = async () => {
+    let html = "";
+    await page.handler(
+      { url: "/app-manager", method: "GET", headers: {} },
+      { writeHead: () => {}, end: (d) => { html = String(d ?? ""); } }
+    );
+    return html;
+  };
+
+  // Discard one render so module/route initialisation is not measured.
+  await render();
+
+  const t0 = Date.now();
+  const html = await render();
+  const ms = Date.now() - t0;
+  assert(html.length > 10000, `page too small (${html.length} bytes)`);
+  assert(
+    ms < 300,
+    `warm page render took ${ms}ms (budget 300ms) — ` +
+      `is a source probe no longer memoised, or is the ARP baseline re-read per render?`
+  );
+  return `${ms}ms, ${html.length} bytes`;
+});
+
+console.log("");
+console.log("━━━ 源探测缓存 ━━━");
+
+await check("二次调用各 discoverXxx 命中缓存 < 50ms", () => {
+  // Regression guard for the 14.5s page render: every discoverXxx() shells out
+  // to a package manager, and those calls were NOT covered by the allCache TTL
+  // because buildScanReport()/doctor call the discoverers directly.
+  discovery._resetScanCache?.();
+  const fns = [
+    ["npm", discovery.discoverNpmGlobal],
+    ["pnpm", discovery.discoverPnpmGlobal],
+    ["npx-cache", discovery.discoverNpxCache],
+    ["scoop", discovery.discoverScoop],
+    ["choco", discovery.discoverChoco],
+    ["cargo", discovery.discoverCargo],
+    ["pipx", discovery.discoverPipx],
+    ["pip", discovery.discoverPipGlobal],
+    ["uv", discovery.discoverUvTools],
+    ["path", discovery.discoverFromPath],
+  ];
+  // Cold pass through discoverAll() to fill the per-source memo.
+  discovery.discoverAll();
+
+  const slow = [];
+  for (const [name, fn] of fns) {
+    const t0 = Date.now();
+    fn();
+    const ms = Date.now() - t0;
+    if (ms >= 50) slow.push(`${name}=${ms}ms`);
+  }
+  assert(
+    slow.length === 0,
+    `these sources re-ran their subprocess instead of hitting the cache: ${slow.join(", ")}`
+  );
+  return `${fns.length} sources all cached`;
+});
+
+await check("buildScanReport 二次调用 < 300ms（源探测已缓存）", () => {
+  const baseline = discovery.readManagedBaseline();
+  discovery.buildScanReport({ baseline }); // warm
+  const t0 = Date.now();
+  discovery.buildScanReport({ baseline });
+  const ms = Date.now() - t0;
+  assert(
+    ms < 300,
+    `buildScanReport took ${ms}ms on a warm cache — a source probe is not memoised`
+  );
+  return `${ms}ms`;
+});
+
+console.log("");
+console.log("━━━ 命令名卫生（doctor 误报回归） ━━━");
+
+await check("commands 不含启动器扩展名", () => {
+  // Regression guard: `@anthropic-ai/claude-code` declared bin keys of both
+  // `claude` and `claude.exe`; `@openai/codex` had `codex.js`; npm's bin/ dir
+  // contained `npm-cli.js`. Those names never resolve on PATH (the PATH index
+  // stores extensionless names), so doctor reported ~34 false "not found".
+  const apps = discovery.discoverAll();
+  const bad = [];
+  for (const a of apps) {
+    for (const c of a.commands) {
+      if (/\.(exe|cmd|bat|com|ps1|js|mjs|cjs)$/i.test(c)) bad.push(`${a.name}:${c}`);
+    }
+  }
+  assert(bad.length === 0, `commands still carry launcher extensions: ${bad.join(", ")}`);
+  return `${apps.reduce((n, a) => n + a.commands.length, 0)} commands, none with extensions`;
+});
+
+await check("commands 不含内部入口点（node-gyp-bin / npm-cli 等）", () => {
+  const apps = discovery.discoverAll();
+  const noisy = apps
+    .flatMap((a) => a.commands)
+    .filter((c) => /^(node-gyp-bin|npm-cli|npm-prefix|npx-cli)$/i.test(c));
+  assert(
+    noisy.length === 0,
+    `internal entry points leaked into commands: ${[...new Set(noisy)].join(", ")}`
+  );
+  return "no internal entry points";
+});
+
+await check("发现的命令绝大多数在 PATH 上可解析", () => {
+  const apps = discovery.discoverAll();
+  const cmds = apps.flatMap((a) => a.commands);
+  const missing = cmds.filter((c) => !utils.pathIndexHas(c));
+  // npx-cache entries legitimately are not globally installed; tolerate a
+  // handful, but a large number means command extraction regressed.
+  const ratio = missing.length / Math.max(1, cmds.length);
+  assert(
+    ratio < 0.2,
+    `${missing.length}/${cmds.length} commands missing from PATH ` +
+      `(${missing.slice(0, 10).join(", ")}) — command extraction regressed`
+  );
+  return `${cmds.length - missing.length}/${cmds.length} resolvable`;
+});
+
+// The page-render check is async; the sequential `await check(...)` calls
+// above already awaited it. Nothing further to do here.
+console.log("");console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+const pass = results.filter((r) => r.ok).length;
+const fail = results.length - pass;
+console.log(`结果: PASS ${pass} · FAIL ${fail} / 共 ${results.length}`);
+process.exit(fail === 0 ? 0 : 1);

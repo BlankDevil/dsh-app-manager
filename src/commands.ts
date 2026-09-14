@@ -9,12 +9,11 @@ import { buildScanReport, discoverAll, discoverUnmanaged, findApp, readManagedBa
 import {
   colorize,
   colors,
-  commandExists,
   compareVersions,
   execAsync,
-  execSafe,
   formatBytes,
   formatDuration,
+  pathIndexHas,
 } from "./utils.js";
 
 interface CommandOptions {
@@ -53,6 +52,63 @@ async function runWithConcurrency<T, R>(
 /**
  * Print a formatted table
  */
+/**
+ * Timeout (ms) for a single `cmd --version` probe.
+ */
+const VERSION_PROBE_TIMEOUT_MS = 5000;
+
+/**
+ * Cached `cmd --version` probes, keyed by command name.
+ *
+ * Why: `doctor` and `info` both probe versions, and a single `doctor` run used
+ * to spawn one child process per app. Caching means a repeat probe inside
+ * `--version-cache-ttl` returns instantly instead of paying another ~500ms
+ * `cmd.exe` spawn. Failures are cached too — a missing broken shim should not
+ * be retried 50 times.
+ */
+const versionProbeCache = new Map<string, { ok: boolean; output: string; at: number }>();
+const VERSION_CACHE_TTL_MS = Number(process.env.APP_MANAGER_VERSION_CACHE_TTL_MS ?? 300_000);
+
+/** Drop the version-probe cache (used by tests and after installs). */
+export function resetVersionCache(): void {
+  versionProbeCache.clear();
+}
+
+/**
+ * Probe `cmd --version`, memoised. Returns `{ ok, output }` where `ok` means
+ * the process exited 0. Uses the async spawn path so concurrent probes really
+ * do overlap (see `execAsync`).
+ */
+async function probeVersion(cmd: string): Promise<{ ok: boolean; output: string }> {
+  const hit = versionProbeCache.get(cmd);
+  if (hit && Date.now() - hit.at < VERSION_CACHE_TTL_MS) {
+    return { ok: hit.ok, output: hit.output };
+  }
+  const res = await execAsync(cmd, ["--version"], {
+    shell: process.platform === "win32",
+    timeout: VERSION_PROBE_TIMEOUT_MS,
+  });
+  const entry = { ok: res.success, output: res.output.trim(), at: Date.now() };
+  versionProbeCache.set(cmd, entry);
+  return { ok: entry.ok, output: entry.output };
+}
+
+/**
+ * Fetch the latest published version of an npm package.
+ *
+ * Uses `spawn` (via `execAsync`) rather than the blocking `execSync` used by
+ * `execSafe`. This matters: `execSync` blocks the whole event loop, which
+ * silently serialised the "concurrent" pools in `checkUpdates` and `doctor`.
+ */
+async function fetchNpmLatest(pkg: string): Promise<string | null> {
+  const res = await execAsync("npm.cmd", ["view", pkg, "version"], {
+    shell: process.platform === "win32",
+    timeout: 10_000,
+  });
+  const out = res.output.trim();
+  return res.success && out ? out : null;
+}
+
 function printTable(headers: string[], rows: string[][], columnWidths: number[]): void {
   let headerLine = "";
   for (let i = 0; i < headers.length; i++) {
@@ -307,11 +363,10 @@ export async function checkUpdates(options: CommandOptions = {}): Promise<CliApp
 
   type CheckOutcome = { app: CliApp; update: boolean; latestVersion?: string; note?: string };
   const checkOne = async (app: CliApp): Promise<CheckOutcome> => {
-    const result = execSafe(`npm.cmd view ${app.name} version 2>nul`, { shell: true, timeout: 10000 });
-    if (!result.success || !result.output) {
+    const latestVersion = await fetchNpmLatest(app.name);
+    if (!latestVersion) {
       return { app, update: false, note: "unable to check" };
     }
-    const latestVersion = result.output.trim();
     const cmp = compareVersions(latestVersion, app.version);
     if (cmp > 0) {
       app.hasUpdate = true;
@@ -322,7 +377,7 @@ export async function checkUpdates(options: CommandOptions = {}): Promise<CliApp
     return { app, update: false, latestVersion, note: "up to date" };
   };
 
-  const outcomes = await runWithConcurrency(toCheck, 5, checkOne);
+  const outcomes = await runWithConcurrency(toCheck, 6, checkOne);
 
   const updates: CliApp[] = [];
   for (const o of outcomes) {
@@ -390,16 +445,15 @@ export async function showInfo(appName: string, options: CommandOptions = {}): P
 
     if (app.commands.length > 0) {
       const cmd = app.commands[0];
-      const works = commandExists(cmd);
+      const works = pathIndexHas(cmd);
       console.log(
         `  ${colorize("Status:", "gray")}      ${works ? colorize("✅ Available in PATH", "green") : colorize("❌ Not in PATH", "red")}`
       );
     }
 
     if (app.source === "npm" || app.source === "pnpm") {
-      const result = execSafe(`npm.cmd view ${app.name} version 2>nul`, { shell: true, timeout: 10000 });
-      if (result.success && result.output) {
-        const latest = result.output.trim();
+      const latest = await fetchNpmLatest(app.name);
+      if (latest) {
         const cmp = compareVersions(latest, app.version);
         if (cmp > 0) {
           console.log(`  ${colorize("Update:", "gray")}      ${colorize(`${app.version} → ${latest}`, "yellow")}`);
@@ -518,16 +572,16 @@ export async function runDoctor(options: CommandOptions = {}): Promise<void> {
   const checkOne = async (app: CliApp): Promise<CheckResult> => {
     const local: typeof issues = [];
     for (const cmd of app.commands) {
-      if (!commandExists(cmd)) {
+      if (!pathIndexHas(cmd)) {
         local.push({ app: app.name, severity: "error", message: `Command '${cmd}' not found in PATH` });
       }
     }
     if (app.path && !existsSync(app.path)) {
       local.push({ app: app.name, severity: "warning", message: `Package directory missing: ${app.path}` });
     }
-    if (app.commands.length > 0 && commandExists(app.commands[0])) {
-      const versionResult = execSafe(`${app.commands[0]} --version 2>nul`, { shell: true, timeout: 5000 });
-      if (!versionResult.success) {
+    if (app.commands.length > 0 && pathIndexHas(app.commands[0])) {
+      const probe = await probeVersion(app.commands[0]);
+      if (!probe.ok) {
         local.push({
           app: app.name,
           severity: "warning",
@@ -538,8 +592,10 @@ export async function runDoctor(options: CommandOptions = {}): Promise<void> {
     return { name: app.name, ok: local.length === 0, issues: local };
   };
 
-  // 8 parallel is a safe ceiling on Windows; spawn is the bottleneck.
-  const results = await runWithConcurrency(apps, 8, checkOne);
+  // 12 parallel is a safe ceiling on Windows now that the probes go through
+  // the async spawn path — with the old blocking execSync these lanes were
+  // cosmetic and the whole check ran serially (~98s for 50+ apps).
+  const results = await runWithConcurrency(apps, 12, checkOne);
 
   for (const r of results) {
     console.log(`Checking ${r.name}... ${r.ok ? colorize("✅ OK", "green") : colorize("⚠️  Issues found", "yellow")}`);
@@ -593,17 +649,21 @@ export async function monitorProcesses(options: CommandOptions = {}): Promise<vo
   }
 
   let processes: ProcInfo[] = [];
-  try {
-    const result = execSafe(
-      'powershell -Command "Get-Process | Select-Object Name, Id, Path, WorkingSet | ConvertTo-Json -Compress"',
-      { shell: true, timeout: 10000 }
-    );
-    if (result.success) {
-      const data = JSON.parse(result.output) as ProcInfo | ProcInfo[];
+  const ps = await execAsync(
+    "powershell -Command \"Get-Process | Select-Object Name, Id, Path, WorkingSet | ConvertTo-Json -Compress\"",
+    [],
+    { shell: true, timeout: 10_000 }
+  );
+  if (ps.success) {
+    try {
+      const data = JSON.parse(ps.output) as ProcInfo | ProcInfo[];
       processes = Array.isArray(data) ? data : [data];
+    } catch {
+      processes = [];
     }
-  } catch {
-    const result = execSafe("tasklist /FO CSV /NH", { shell: true, timeout: 10000 });
+  }
+  if (processes.length === 0) {
+    const result = await execAsync("tasklist", ["/FO", "CSV", "/NH"], { shell: true, timeout: 10_000 });
     if (result.success) {
       const lines = result.output.split("\n").filter((l) => l.trim());
       for (const line of lines) {

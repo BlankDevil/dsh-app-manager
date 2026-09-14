@@ -5,7 +5,7 @@
 
 import type { CliApp, ContentBlock, CordisContext, HttpRequest, HttpResponse, ToolDefinition, WebServerService } from "./types.js";
 import { buildScanReport, discoverAll, discoverUnmanaged, findApp, readManagedBaseline } from "./discovery.js";
-import { commandExists, compareVersions, execSafe } from "./utils.js";
+import { compareVersions, execAsync, pathIndexHas } from "./utils.js";
 
 /**
  * Project a markdown string into DSH content blocks.
@@ -38,13 +38,20 @@ function formatAppList(apps: CliApp[]): string {
 }
 
 /**
- * Check latest version of an npm/pnpm package
+ * Check latest version of an npm/pnpm package.
+ *
+ * Goes through `execAsync` (real spawn) instead of the blocking `execSync`
+ * used by `execSafe`, so several lookups can genuinely overlap when this is
+ * called from a `Promise.all`.
  */
 async function checkLatestVersion(app: CliApp): Promise<string | null> {
   if (app.source !== "npm" && app.source !== "pnpm") return null;
-  const result = execSafe(`npm.cmd view ${app.name} version 2>nul`, { shell: true, timeout: 10000 });
-  if (!result.success || !result.output) return null;
-  return result.output.trim();
+  const res = await execAsync("npm.cmd", ["view", app.name, "version"], {
+    shell: process.platform === "win32",
+    timeout: 10_000,
+  });
+  const out = res.output.trim();
+  return res.success && out ? out : null;
 }
 
 /**
@@ -202,7 +209,7 @@ function registerTools(toolsService: { register: (tool: ToolDefinition) => (() =
       const issues: string[] = [];
       for (const app of apps) {
         for (const cmd of app.commands) {
-          if (!commandExists(cmd)) issues.push(`${app.name}: command '${cmd}' not found in PATH`);
+          if (!pathIndexHas(cmd)) issues.push(`${app.name}: command '${cmd}' not found in PATH`);
         }
       }
       if (issues.length === 0) return "✅ All discovered CLI applications are healthy.";
@@ -353,15 +360,26 @@ function generateAppManagerPage(): string {
 
     const rows = appsInCategory
       .map((app) => {
-        const status = app.commands.some((cmd) => commandExists(cmd))
+        // pathIndexHas() reuses a cached PATH listing; commandExists() would
+        // spawn a process per command (≈0.5s each) inside this render loop.
+        const status = app.commands.some((cmd) => pathIndexHas(cmd))
           ? "<span class='status ok'>✅ PATH</span>"
           : "<span class='status missing'>❌ PATH</span>";
         const installBadge = app.managed
           ? "<span class='kind managed'>managed</span>"
           : `<span class='kind unmanaged'>${escapeHtml(app.installKind)}</span>`;
+        // Show the callable command(s) under the package name. A scoped npm
+        // package like @anthropic-ai/claude-code is what you actually invoke
+        // as `claude`, so surfacing the command makes the list searchable by
+        // the name people use day to day.
+        const primaryName = app.name.split("/").pop() ?? app.name;
+        const showSubtitle = app.commands.length > 0 && !app.commands.includes(app.name);
+        const subtitle = showSubtitle
+          ? `<span class="name-sub">${escapeHtml(app.commands.join(", "))}</span>`
+          : "";
         return `
-          <tr data-app="${escapeHtml(app.name)}" data-source="${escapeHtml(app.source)}">
-            <td class="name" title="${escapeHtml(app.name)}"><span class="row-grip" aria-hidden="true">⠿</span>${escapeHtml(app.name)}</td>
+          <tr data-app="${escapeHtml(app.name)}" data-source="${escapeHtml(app.source)}" data-cmd="${escapeHtml(app.commands.join(" "))}">
+            <td class="name" title="${escapeHtml(app.name)}"><span class="row-grip" aria-hidden="true">⠿</span><span class="name-main">${escapeHtml(app.name)}</span>${subtitle}</td>
             <td class="version" title="${escapeHtml(app.version)}">${escapeHtml(app.version)}</td>
             <td class="commands" title="${escapeHtml(app.commands.join(", "))}">${escapeHtml(app.commands.join(", "))}</td>
             <td class="source" title="${escapeHtml(app.source)}">${escapeHtml(app.source)}</td>
@@ -412,7 +430,7 @@ function generateAppManagerPage(): string {
 
   const managedCount = apps.filter((a) => a.managed).length;
   const unmanagedCount = apps.length - managedCount;
-  const inPathCount = apps.filter((a) => a.commands.some((cmd) => commandExists(cmd))).length;
+  const inPathCount = apps.filter((a) => a.commands.some((cmd) => pathIndexHas(cmd))).length;
 
   const methodReport = buildScanReport({ baseline: readManagedBaseline() });
   const methodRows = methodReport.sources
@@ -727,6 +745,18 @@ function generateAppManagerPage(): string {
     }
     tbody.row-drop-target { outline: 2px dashed var(--accent); outline-offset: -2px; }
     body.row-dragging-active { cursor: grabbing; }
+    /* The name cell shows the package name with the callable command(s)
+       underneath, so the everyday command name is findable even when the
+       package itself is scoped (e.g. @anthropic-ai/claude-code -> claude). */
+    td.name .name-main { display: inline; }
+    td.name .name-sub {
+      display: block;
+      color: var(--muted);
+      font-size: var(--fs-small);
+      font-family: var(--font-mono);
+      margin-left: 1.1rem;
+      opacity: 0.85;
+    }
     /* The grip is a visual affordance inside the name cell. */
     td.name .row-grip {
       color: var(--muted);
@@ -1438,7 +1468,7 @@ function registerWebRoutes(webServer: WebServerService): Array<(() => void) | un
           path: app.path,
           managed: app.managed,
           installKind: app.installKind,
-          inPath: app.commands.some((cmd) => commandExists(cmd)),
+          inPath: app.commands.some((cmd) => pathIndexHas(cmd)),
         }));
         const managedCount = apps.filter((a) => a.managed).length;
         res.writeHead(200, { "content-type": "application/json; charset=utf-8" });
@@ -1518,7 +1548,29 @@ export function apply(ctx: CordisContext): () => void {
     ctx.logger.info("dsh-app-manager: plugin loaded");
   }
 
+  // Warm the discovery cache in the background so the first visit to
+  // /app-manager does not pay the cold-scan cost (~4.7s: the pip and pnpm
+  // package-manager probes dominate, and the ARP registry read adds ~1.7s).
+  // Deferred to the next macrotask so plugin loading itself is never delayed,
+  // and failures are non-fatal.
+  const warmTimer = setTimeout(() => {
+    try {
+      const apps = discoverAll();
+      // The method panel on the page calls buildScanReport(), which walks
+      // every source probe. Warm it too so the first render is fully cached.
+      buildScanReport({ baseline: readManagedBaseline() });
+      ctx.logger?.info?.(
+        `dsh-app-manager: scan cache warmed (${apps.length} apps)`
+      );
+    } catch {
+      /* warm-up is best-effort */
+    }
+  }, 0);
+  // Don't let the warm-up timer keep the process alive on shutdown.
+  if (typeof warmTimer === "object" && "unref" in warmTimer) warmTimer.unref();
+
   return () => {
+    clearTimeout(warmTimer);
     for (const dispose of disposers) dispose?.();
   };
 }

@@ -9,54 +9,18 @@
  *                            is flagged as unmanaged (portable / manually-placed)
  */
 import type { CliApp, ManagedApp, ScanReport } from "./types.js";
+export declare const discoverNpmGlobal: () => CliApp[];
+export declare const discoverPnpmGlobal: () => CliApp[];
+export declare const discoverNpxCache: () => CliApp[];
+export declare const discoverScoop: () => CliApp[];
+export declare const discoverChoco: () => CliApp[];
+export declare const discoverCargo: () => CliApp[];
+export declare const discoverPipx: () => CliApp[];
+export declare const discoverPipGlobal: () => CliApp[];
+export declare const discoverUvTools: () => CliApp[];
+export declare const discoverFromPath: () => CliApp[];
 /** Test/dev hook: drop both caches (used by the runner to force a fresh scan). */
 export declare function _resetScanCache(): void;
-/**
- * Discover npm globally installed CLI packages by reading filesystem
- */
-export declare function discoverNpmGlobal(): CliApp[];
-/**
- * Discover pnpm globally installed CLI packages
- */
-export declare function discoverPnpmGlobal(): CliApp[];
-/**
- * Discover npx cached packages
- */
-export declare function discoverNpxCache(): CliApp[];
-/**
- * Discover scoop installed apps
- */
-export declare function discoverScoop(): CliApp[];
-/**
- * Discover chocolatey installed apps
- */
-export declare function discoverChoco(): CliApp[];
-/**
- * Discover cargo installed apps
- */
-export declare function discoverCargo(): CliApp[];
-/**
- * Discover pipx installed apps
- */
-export declare function discoverPipx(): CliApp[];
-/**
- * Discover pip globally installed packages (distinct from pipx).
- * Reads the `pip list --format=json` output of the active interpreter.
- */
-export declare function discoverPipGlobal(): CliApp[];
-/**
- * Discover tools installed by `uv` (uv tool install / uv-managed Pythons).
- * uv places shims in the uv tool bin directory (typically ~/.local/bin).
- */
-export declare function discoverUvTools(): CliApp[];
-/**
- * Discover executables by enumerating PATH directories.
- *
- * This is the broadest source: it catches portable tools, manually-dropped
- * binaries, and shims that no package manager knows about. System/Runtime
- * directories are filtered out to keep the result meaningful.
- */
-export declare function discoverFromPath(): CliApp[];
 /**
  * Read the Windows ARP baseline once. Returns an empty array off Windows.
  */

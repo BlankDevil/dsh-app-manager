@@ -9,6 +9,8 @@ interface CommandOptions {
     source?: string;
     silent?: boolean;
 }
+/** Drop the version-probe cache (used by tests and after installs). */
+export declare function resetVersionCache(): void;
 /**
  * List all discovered CLI applications
  */

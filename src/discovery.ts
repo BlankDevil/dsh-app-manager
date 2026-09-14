@@ -9,7 +9,7 @@
  *                            is flagged as unmanaged (portable / manually-placed)
  */
 
-import { existsSync, readdirSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import type {
   AppCategory,
@@ -22,10 +22,10 @@ import type {
 } from "./types.js";
 import {
   appDataDir,
-  commandExists,
   dedupeBy,
   enumPathExecutables,
   execSafe,
+  getLastSpawnError,
   homeDir,
   localAppDataDir,
   namesLikelyMatch,
@@ -65,6 +65,18 @@ function readBaselineCached(): ManagedApp[] {
     return baselineCache.data;
   }
   const data = readArpEntries();
+  if (data.length === 0 && process.platform === "win32") {
+    // On Windows a healthy ARP read always returns many rows. Getting zero
+    // means the PowerShell spawn was blocked or failed, which would make every
+    // app look "unmanaged". Log the reason once instead of failing silently.
+    const why = getLastSpawnError();
+    if (why) {
+      console.warn(
+        `[dsh-app-manager] ARP baseline unavailable — managed/unmanaged classification ` +
+          `will be degraded. Reason: ${why}`
+      );
+    }
+  }
   baselineCache = { ts: Date.now(), data };
   return data;
 }
@@ -73,10 +85,63 @@ function invalidateAllCache(): void {
   allCache = null;
 }
 
+/* -------------------------------------------------------------------------- */
+/*  Slow source-probe memoisation                                             */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Per-source TTL cache for `discoverXxx()` results.
+ *
+ * Why this matters: each `discoverXxx()` shells out to a package manager
+ * (`pnpm list -g`, `pip list`, `uv tool list`, `cargo install --list`, ...).
+ * On Windows every one of those spawns `cmd.exe` -> batch shim -> interpreter,
+ * which measured 0.8-3.4s each. They are *not* covered by the `allCache` TTL
+ * above, because `buildScanReport()` and the doctor/legacy paths call the
+ * individual discoverers directly — so a page render used to pay ~7s of
+ * blocking subprocess time on *every* request.
+ *
+ * Memoising here makes that cost once-per-TTL no matter which entry point
+ * is used.
+ */
+const sourceProbeCache = new Map<string, { ts: number; data: CliApp[] }>();
+
+function memoSource(name: string, fn: () => CliApp[]): CliApp[] {
+  const hit = sourceProbeCache.get(name);
+  if (hit && Date.now() - hit.ts < SCAN_TTL_MS) return hit.data;
+  const data = fn();
+  sourceProbeCache.set(name, { ts: Date.now(), data });
+  return data;
+}
+
+/**
+ * Wrap a raw discoverer with the per-source memo and return the public
+ * function. Every exported `discoverXxx` goes through this, so callers that
+ * reach a discoverer directly (doctor, buildScanReport, the web method panel)
+ * get the cache too — not just the `discoverAll` path.
+ */
+function memoized<T extends () => CliApp[]>(name: string, fn: T): () => CliApp[] {
+  return () => memoSource(name, fn);
+}
+
+/* --- Public (memoised) discoverers. Each shells out to a package manager on
+       a cache miss, which costs 0.3-7s per call on Windows. --- */
+
+export const discoverNpmGlobal = memoized("npm", discoverNpmGlobalRaw);
+export const discoverPnpmGlobal = memoized("pnpm", discoverPnpmGlobalRaw);
+export const discoverNpxCache = memoized("npx-cache", discoverNpxCacheRaw);
+export const discoverScoop = memoized("scoop", discoverScoopRaw);
+export const discoverChoco = memoized("choco", discoverChocoRaw);
+export const discoverCargo = memoized("cargo", discoverCargoRaw);
+export const discoverPipx = memoized("pipx", discoverPipxRaw);
+export const discoverPipGlobal = memoized("pip", discoverPipGlobalRaw);
+export const discoverUvTools = memoized("uv", discoverUvToolsRaw);
+export const discoverFromPath = memoized("path", discoverFromPathRaw);
+
 /** Test/dev hook: drop both caches (used by the runner to force a fresh scan). */
 export function _resetScanCache(): void {
   baselineCache = null;
   allCache = null;
+  sourceProbeCache.clear();
 }
 
 /**
@@ -150,42 +215,87 @@ const KNOWN_CLI_PACKAGES: Record<string, KnownPackageInfo> = {
 /**
  * Detect CLI metadata from a package directory
  */
+/**
+ * Strip a launcher extension from a command name so it matches the name you
+ * actually type. The PATH index (and `where`) resolve `claude`, not
+ * `claude.exe`, so keeping extensions in `commands` produced false
+ * "not found in PATH" reports in `doctor`.
+ */
+const LAUNCHER_EXTS = [".exe", ".cmd", ".bat", ".com", ".ps1", ".js", ".mjs", ".cjs"];
+
+function stripLauncherExt(name: string): string {
+  const lower = name.toLowerCase();
+  for (const ext of LAUNCHER_EXTS) {
+    if (lower.endsWith(ext)) return name.slice(0, -ext.length);
+  }
+  return name;
+}
+
 function detectCliFromPackageJson(pkgPath: string, pkgName: string): CliApp | null {
   const pkg = readPackageJson(pkgPath);
   if (!pkg) return null;
 
   const commands: string[] = [];
+  /** Names explicitly declared in `package.json#bin` — always authoritative. */
+  const declared = new Set<string>();
 
-  // Check bin field
+  // Check bin field. When `bin` is an object, the **keys** are the command
+  // names users type — the values are repo-relative script paths, so only the
+  // keys are taken.
   if (pkg.bin) {
     if (typeof pkg.bin === "string") {
       commands.push(basename(pkgName));
+      declared.add(basename(pkgName).toLowerCase());
     } else if (typeof pkg.bin === "object" && pkg.bin !== null) {
-      commands.push(...Object.keys(pkg.bin));
+      for (const key of Object.keys(pkg.bin)) {
+        commands.push(key);
+        declared.add(key.toLowerCase());
+      }
     }
   }
 
-  // Check direct binaries in package directory
+  // Check direct binaries in the package's own bin/ directory.
+  //
+  // Two filters matter here, both learned from real breakage:
+  //   - skip directories (`npm` ships `bin/node-gyp-bin/`, which is not a
+  //     command);
+  //   - strip launcher extensions (`npm-cli.js` -> `npm-cli`, `claude.exe` ->
+  //     `claude`) so the name matches what is actually on PATH.
   const binDir = join(pkgPath, "bin");
   if (existsSync(binDir)) {
     try {
-      const bins = readdirSync(binDir).filter((f) => !f.endsWith(".md") && !f.endsWith(".txt"));
-      for (const bin of bins) {
-        const cleanBin = bin.replace(/\.cmd$/, "").replace(/\.ps1$/, "");
-        if (!commands.includes(cleanBin)) commands.push(cleanBin);
+      for (const entry of readdirSync(binDir, { withFileTypes: true })) {
+        if (entry.isDirectory()) continue;
+        const name = entry.name;
+        if (name.endsWith(".md") || name.endsWith(".txt")) continue;
+        const clean = stripLauncherExt(name);
+        if (clean) commands.push(clean);
       }
     } catch {
       // ignore
     }
   }
 
-  if (commands.length === 0) return null;
+  // Normalise anything that arrived with an extension from the `bin` keys.
+  const normalised = commands
+    .map((c) => stripLauncherExt(c.trim()))
+    .filter(Boolean)
+    // Drop internal entry points: the `bin/` directory of a package often
+    // contains helper modules (`npm-cli`, `npm-prefix`, `npx-cli`) that are
+    // implementation details, not commands a user runs. A candidate is kept if
+    // it is one of the declared `bin` keys, or if it actually resolves on PATH.
+    .filter((c) => {
+      if (declared.has(c.toLowerCase())) return true;
+      return pathIndexHas(c);
+    });
+
+  if (normalised.length === 0) return null;
 
   const known = KNOWN_CLI_PACKAGES[pkgName];
   return {
     name: pkgName,
     version: typeof pkg.version === "string" ? pkg.version : "unknown",
-    commands: [...new Set(commands)],
+    commands: [...new Set(normalised)],
     category: known?.category || "other",
     description: known?.desc || (typeof pkg.description === "string" ? pkg.description : ""),
     source: "npm",
@@ -200,7 +310,7 @@ function detectCliFromPackageJson(pkgPath: string, pkgName: string): CliApp | nu
 /**
  * Discover npm globally installed CLI packages by reading filesystem
  */
-export function discoverNpmGlobal(): CliApp[] {
+function discoverNpmGlobalRaw(): CliApp[] {
   const apps: CliApp[] = [];
   const globalDir = join(appDataDir(), "npm", "node_modules");
 
@@ -248,11 +358,25 @@ export function discoverNpmGlobal(): CliApp[] {
 /**
  * Discover pnpm globally installed CLI packages
  */
-export function discoverPnpmGlobal(): CliApp[] {
+function discoverPnpmGlobalRaw(): CliApp[] {
   const apps: CliApp[] = [];
-  if (!commandExists("pnpm")) return apps;
+  if (!pathIndexHas("pnpm")) return apps;
 
-  const result = execSafe("pnpm list -g --json 2>nul", { shell: true });
+  // Fast path: pnpm keeps global packages under a `global/node_modules` tree
+  // (or drops shims into `bin`). `pnpm list -g --json` costs ~2.2s — it spawns
+  // `cmd.exe` -> the pnpm shim -> node — while reading the filesystem costs
+  // ~1ms. On a machine where pnpm exists for project work but no global
+  // packages are installed, we can prove there is nothing to list and skip the
+  // subprocess entirely.
+  const pnpmHome = process.env.PNPM_HOME || localAppDataDir();
+  const globalRoots = [
+    join(pnpmHome, "global"),
+    join(localAppDataDir(), "pnpm", "global"),
+    join(appDataDir(), "pnpm", "global"),
+  ];
+  const hasGlobalRoot = globalRoots.some((d) => existsSync(d));
+  if (!hasGlobalRoot) return apps; // never installed a global package
+  const result = execSafe("pnpm list -g --json 2>nul", { shell: true, timeout: 15000 });
   if (!result.success) return apps;
 
   try {
@@ -282,7 +406,7 @@ export function discoverPnpmGlobal(): CliApp[] {
 /**
  * Discover npx cached packages
  */
-export function discoverNpxCache(): CliApp[] {
+function discoverNpxCacheRaw(): CliApp[] {
   const apps: CliApp[] = [];
   const npxCache = join(localAppDataDir(), "npm-cache", "_npx");
 
@@ -320,7 +444,7 @@ export function discoverNpxCache(): CliApp[] {
 /**
  * Discover scoop installed apps
  */
-export function discoverScoop(): CliApp[] {
+function discoverScoopRaw(): CliApp[] {
   const apps: CliApp[] = [];
   const scoopDir = join(homeDir(), "scoop", "apps");
   if (!existsSync(scoopDir)) return apps;
@@ -387,17 +511,83 @@ export function discoverScoop(): CliApp[] {
 /**
  * Discover chocolatey installed apps
  */
-export function discoverChoco(): CliApp[] {
+function discoverChocoRaw(): CliApp[] {
   const apps: CliApp[] = [];
-  if (!commandExists("choco")) return apps;
+  if (!pathIndexHas("choco")) return apps;
 
-  const result = execSafe("choco list --local-only 2>nul", { shell: true });
+  // Fast path: Chocolatey records every installed package as a `.nupkg` in
+  // its lib directory. Reading the filesystem costs ~1ms, whereas
+  // `choco list --local-only` spawns PowerShell and measured ~2.7s — and on
+  // a machine with no Chocolatey packages the old code paid that price for
+  // nothing on every cold scan.
+  const chocoLibCandidates = [
+    process.env.ChocolateyInstall ? join(process.env.ChocolateyInstall, "lib") : "",
+    process.env.ChocolateyToolsLocation
+      ? join(process.env.ChocolateyToolsLocation, "..", "lib")
+      : "",
+    join(appDataDir(), "..", "..", "..", "ProgramData", "chocolatey", "lib"),
+    "C:\\ProgramData\\chocolatey\\lib",
+  ].filter(Boolean);
+
+  const libDir = chocoLibCandidates.find((d) => existsSync(d));
+  if (libDir) {
+    let entries: string[] = [];
+    try {
+      entries = readdirSync(libDir);
+    } catch {
+      entries = [];
+    }
+    if (entries.length === 0) return apps;
+
+    for (const entry of entries) {
+      const versionFile = join(libDir, entry, `${entry}.nuspec`);
+      let version = "";
+      try {
+        const nuspec = readFileSync(versionFile, "utf8");
+        version = nuspec.match(/<version>([^<]+)<\/version>/)?.[1] ?? "";
+      } catch {
+        // fall through — report the package without a version
+      }
+      // Chocolatey appends `.install` / `.portable` to the package directory.
+      const name = entry.replace(/\.(install|portable)$/, "");
+      if (!name) continue;
+      // The `chocolatey` package itself provides the `choco` command; for all
+      // other packages the command matches the package name.
+      const command = name.toLowerCase() === "chocolatey" ? "choco" : name.toLowerCase();
+      apps.push({
+        name,
+        version,
+        commands: [command],
+        category: "other",
+        description: "",
+        source: "choco",
+        path: join(libDir, entry),
+        hasUpdate: false,
+        latestVersion: null,
+        managed: true,
+        installKind: "managed",
+      });
+    }
+    return apps;
+  }
+
+  // Fallback: the lib directory wasn't where we expected. Shell out, but this
+  // only happens on unusual installs.
+  //
+  // Version note: Chocolatey **removed** `--local-only` from `list` in v2
+  // (`Invalid argument --local-only`), and older v1 builds defaulted to remote
+  // results without it. `--local-only` is therefore avoided entirely — the
+  // bare `list` prints local packages on both lines of history.
+  const result = execSafe("choco list 2>nul", { shell: true, timeout: 15000 });
   if (!result.success) return apps;
 
   const lines = result.output.split("\n");
   for (const line of lines) {
+    // Skip the banner ("Chocolatey v2.7.4") and the trailing count line.
+    if (/^Chocolatey v/i.test(line)) continue;
+    if (/packages? installed/i.test(line)) continue;
     const match = line.match(/^(\S+)\s+(\S+)/);
-    if (match && !line.includes("packages installed")) {
+    if (match) {
       apps.push({
         name: match[1],
         version: match[2],
@@ -420,9 +610,9 @@ export function discoverChoco(): CliApp[] {
 /**
  * Discover cargo installed apps
  */
-export function discoverCargo(): CliApp[] {
+function discoverCargoRaw(): CliApp[] {
   const apps: CliApp[] = [];
-  if (!commandExists("cargo")) return apps;
+  if (!pathIndexHas("cargo")) return apps;
 
   const result = execSafe("cargo install --list 2>nul", { shell: true });
   if (!result.success) return apps;
@@ -465,9 +655,9 @@ export function discoverCargo(): CliApp[] {
 /**
  * Discover pipx installed apps
  */
-export function discoverPipx(): CliApp[] {
+function discoverPipxRaw(): CliApp[] {
   const apps: CliApp[] = [];
-  if (!commandExists("pipx")) return apps;
+  if (!pathIndexHas("pipx")) return apps;
 
   const result = execSafe("pipx list --json 2>nul", { shell: true });
   if (!result.success) return apps;
@@ -512,11 +702,11 @@ export function discoverPipx(): CliApp[] {
  * Discover pip globally installed packages (distinct from pipx).
  * Reads the `pip list --format=json` output of the active interpreter.
  */
-export function discoverPipGlobal(): CliApp[] {
+function discoverPipGlobalRaw(): CliApp[] {
   const apps: CliApp[] = [];
-  if (!commandExists("pip") && !commandExists("pip3")) return apps;
+  if (!pathIndexHas("pip") && !pathIndexHas("pip3")) return apps;
 
-  const cmd = commandExists("pip") ? "pip" : "pip3";
+  const cmd = pathIndexHas("pip") ? "pip" : "pip3";
   const result = execSafe(`${cmd} list --format=json 2>nul`, { shell: true, timeout: 15000 });
   if (!result.success || !result.output) return apps;
 
@@ -554,9 +744,19 @@ export function discoverPipGlobal(): CliApp[] {
  * Discover tools installed by `uv` (uv tool install / uv-managed Pythons).
  * uv places shims in the uv tool bin directory (typically ~/.local/bin).
  */
-export function discoverUvTools(): CliApp[] {
+function discoverUvToolsRaw(): CliApp[] {
   const apps: CliApp[] = [];
-  if (!commandExists("uv")) return apps;
+  if (!pathIndexHas("uv")) return apps;
+
+  // Fast path: `uv tool list` spawns a Python interpreter and measured 4-7s.
+  // uv records installed tools as directories under its tool dir; if that dir
+  // is absent there is nothing to list, so skip the subprocess entirely.
+  const uvToolDirs = [
+    process.env.UV_TOOL_DIR,
+    join(homeDir(), ".local", "share", "uv", "tools"),
+    join(localAppDataDir(), "uv", "tools"),
+  ].filter((d): d is string => Boolean(d));
+  if (!uvToolDirs.some((d) => existsSync(d))) return apps;
 
   const result = execSafe("uv tool list 2>nul", { shell: true, timeout: 15000 });
   if (!result.success || !result.output) return apps;
@@ -592,7 +792,7 @@ export function discoverUvTools(): CliApp[] {
  * binaries, and shims that no package manager knows about. System/Runtime
  * directories are filtered out to keep the result meaningful.
  */
-export function discoverFromPath(): CliApp[] {
+function discoverFromPathRaw(): CliApp[] {
   const exes = enumPathExecutables();
   const apps: CliApp[] = [];
 
@@ -864,6 +1064,8 @@ export function discoverAll(options: { baseline?: ManagedApp[] } = {}): CliApp[]
     return allCache.apps;
   }
 
+  // Each discoverer is already memoised (see the `memoized()` wrappers), so
+  // ordering here is the only thing that matters.
   const sources: Array<{ name: string; fn: () => CliApp[] }> = [
     { name: "npm", fn: discoverNpmGlobal },
     { name: "pnpm", fn: discoverPnpmGlobal },
@@ -965,7 +1167,7 @@ const SOURCE_METHODS: Array<{
     source: "pnpm",
     label: "pnpm global packages",
     method: "exec:pnpm list -g --json",
-    probe: () => commandExists("pnpm"),
+    probe: () => pathIndexHas("pnpm"),
   },
   {
     source: "npx-cache",
@@ -983,31 +1185,31 @@ const SOURCE_METHODS: Array<{
     source: "choco",
     label: "Chocolatey packages",
     method: "exec:choco list --local-only",
-    probe: () => commandExists("choco"),
+    probe: () => pathIndexHas("choco"),
   },
   {
     source: "cargo",
     label: "Cargo packages",
     method: "exec:cargo install --list",
-    probe: () => commandExists("cargo"),
+    probe: () => pathIndexHas("cargo"),
   },
   {
     source: "pipx",
     label: "pipx environments",
     method: "exec:pipx list --json",
-    probe: () => commandExists("pipx"),
+    probe: () => pathIndexHas("pipx"),
   },
   {
     source: "pip",
     label: "pip global packages",
     method: "exec:pip list --format=json",
-    probe: () => commandExists("pip") || commandExists("pip3"),
+    probe: () => pathIndexHas("pip") || pathIndexHas("pip3"),
   },
   {
     source: "uv",
     label: "uv tools",
     method: "exec:uv tool list",
-    probe: () => commandExists("uv"),
+    probe: () => pathIndexHas("uv"),
   },
   {
     source: "path",

@@ -99,6 +99,10 @@
 **合计**：A 组 18 · B 组 16 · C 组 5 · D 组 5 · E 组 7 = **51 条**
 （其中 ◆ 网络扩展 2 条，`--quick` 模式跳过）
 
+**独立行为/性能组**（不在 `run-tests.mjs` 计数内，各自单独运行）：
+- G 组 13 条 · 拖拽交互行为（`node tests/drag-behavior.test.mjs`）
+- H 组 7 条 · 性能守卫（`node tests/perf-guard.test.mjs`）
+
 ---
 
 ## G 组 — 拖拽交互行为（`drag-behavior.test.mjs`，jsdom 真实事件）
@@ -125,3 +129,33 @@
 
 **回归能力**：旧实现（原生 DnD + pointerdown preventDefault）对本组得
 7 PASS / 6 FAIL，新实现 13/13 PASS —— 该组能真正拦住「标记齐全但拖不动」。
+
+---
+
+## H 组 — 性能守卫（`perf-guard.test.mjs`）
+
+> 性能退化**不会**让任何功能断言失败——页面照样渲染正确，只是慢。
+> 所以耗时必须有独立的守卫，且守卫本身要能挡住「改回慢实现」。
+>
+> 背景：`/app-manager` 曾出现热渲染 **9.6 秒**。根因不是 `discoverAll`（缓存后
+> 0ms），而是每个 `discoverXxx()` 里的包管理器子进程**每次请求都重跑**
+> （`pnpm list -g` 2.2s、`pip list` 3.4s、`uv tool list` 0.8s…），因为
+> `buildScanReport()` / `doctor` 直接调用各 discoverer，绕过了 `allCache`。
+
+| ID | 用例 | 预算 | 断言 |
+|----|------|------|------|
+| TC-H01 | `pathIndexHas` 批量检查 66+ 命令 | < 500ms | 走缓存 PATH 索引，不 spawn `where` |
+| TC-H02 | `pathIndexHas` 与 `commandExists` 结论一致（抽样 12） | — | 缓存索引**不遗漏**权威检查能找到的命令 |
+| TC-H03 | `discoverAll` 冷扫描 | < 20s | 总量级回归（正常 ~4.5s，旧版 35s+） |
+| TC-H04 | `discoverAll` 二次调用 | < 50ms | `allCache` 生效 |
+| TC-H05 | 生成 `/app-manager` 页面（缓存已热） | < 300ms | 渲染路径不得有未缓存的子进程；必须先 `discoverAll()` 模拟真实服务的预热态 |
+| TC-H06 | 二次调用各 `discoverXxx()` | < 50ms | 10 个源全部命中 per-source memo |
+| TC-H07 | `buildScanReport` 二次调用 | < 300ms | 直接调用路径同样受益于 memo |
+
+**回归能力（已实测）**：把 `SCAN_TTL_MS` 置 0 后本组得 3 PASS / 4 FAIL，
+页面渲染断言实测 **7547ms**（预算 300ms）；恢复后 7/7 PASS。
+
+**为何 TC-H05 要先调 `discoverAll()`**：首次渲染确实要付冷扫描成本，那是
+TC-H03 的职责。真实 dsh 服务在插件 `apply()` 时有后台预热（`setTimeout(...,0)`
+调用 `discoverAll()` + `buildScanReport()`），所以用户看到的第一次请求
+本就应该命中缓存。TC-H05 测的是这个稳态，TC-H03 测的是最坏情况。

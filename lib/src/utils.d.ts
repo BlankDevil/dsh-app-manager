@@ -40,6 +40,9 @@ export declare function commandExists(command: string): boolean;
 export declare function pathIndexHas(command: string): boolean;
 /** Clear the cached PATH index (useful for tests). */
 export declare function resetPathIndex(): void;
+export declare function getLastSpawnError(): string;
+/** Record a spawn failure reason (best effort — truncates very long text). */
+export declare function noteSpawnError(message: string): void;
 /**
  * Read package.json from a directory
  */

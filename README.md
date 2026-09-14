@@ -215,6 +215,8 @@ of truth changes.
 
 ## 🏗️ Architecture / 架构
 
+### Repository layout / 仓库结构
+
 ```
 dsh-app-manager/
 ├── package.json          # Package config + DSH bundle declaration
@@ -223,18 +225,38 @@ dsh-app-manager/
 ├── LICENSE               # MIT License
 ├── CHANGELOG.md          # Version history
 ├── README.md             # This document
-├── PRD.md                # Product Requirements Document
-├── PUBLISH.md            # Marketplace publishing guide
-├── DESIGN.md             # Future feature design
+├── src/                  # TypeScript sources
+│   ├── index.ts          # DSH plugin entry (apply + inject)
+│   ├── discovery.ts      # App discovery + managed/unmanaged cross-reference
+│   ├── commands.ts       # CLI command handlers
+│   ├── utils.ts          # Utilities (exec, PATH enumeration, global roots, ARP)
+│   └── types.ts          # Shared TypeScript types
 ├── bin/
 │   └── cli-app-manager.ts    # CLI entry point
-└── src/
-    ├── index.ts          # DSH plugin entry (apply + inject)
-    ├── discovery.ts      # App discovery + managed/unmanaged cross-reference
-    ├── commands.ts       # CLI command handlers
-    ├── utils.ts          # Utilities (exec, PATH enumeration, ARP registry)
-    └── types.ts          # Shared TypeScript types
+├── lib/                  # ✨ build output — committed, so local installs work
+├── tests/                # Test suite + specs (not published)
+├── .github/workflows/    # CI
+├── PRD.md                # Product Requirements Document (not published)
+├── DESIGN.md             # Future feature design (not published)
+└── PUBLISH.md            # Release guide (not published)
 ```
+
+### What the npm package contains / 发布包内容
+
+Only these ship (the `files` whitelist in `package.json`) — everything else in
+the tree above exists for development:
+
+```
+lib/            # compiled JS + .d.ts (including lib/bin/cli-app-manager.js)
+patch.yml       # DSH bundle patch
+README.md
+CHANGELOG.md
+LICENSE
+package.json    # always included by npm
+```
+
+There are **no runtime dependencies** — the plugin uses only Node built-ins and
+receives `tools` / `webServer` / `approval` from the DSH host at runtime.
 
 ### DSH Integration / DSH 集成
 
@@ -302,6 +324,12 @@ npm run smoke         # 特性冒烟（22）
 
 `test:approval` **stubs `child_process.spawn`, so it never installs anything** —
 but please read the safety note at the top of the file before editing it.
+
+`test:drag` needs **jsdom >= 27** (a devDependency; jsdom 26 and earlier have no
+`PointerEvent`, which the drag handling is built on).
+
+CI (`.github/workflows/ci.yml`) runs a Linux build + smoke job and the full suite
+on Windows. Both use Node 22.
 
 ---
 

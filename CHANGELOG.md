@@ -5,6 +5,75 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.1] - 2026-09-14
+
+Release-readiness pass on the packaging and tooling around the plugin. No
+runtime behaviour changes — the published artifact only differs in one metadata
+field.
+
+### Fixed
+- **`peerDependencies` was tighter than the host's own declaration.** The plugin
+  asked for `@deepseek-ai/dsh-tools: ^0.1.5-rc.2` while `dsh` itself declares
+  `^0.1.5-rc.1`, so any 0.1.5 build resolving dsh-tools to `rc.1` would produce a
+  spurious peer warning. Now `^0.1.5-rc.1`, matching the host. The floor is
+  correct on the merits too: the plugin's contract (`output.render` required,
+  returning `ContentBlock[]`) arrived in the 0.1.5 line.
+
+- **The lockfile contradicted `package.json`.** `pnpm-lock.yaml` still pinned
+  `specifier: ^0.1.2-rc.1` / `version: 0.1.2-rc.1`, so a fresh `pnpm install`
+  vendored dsh-tools 0.1.2-rc.1 — a version the declared range does not even
+  allow. Regenerated; `pnpm install --frozen-lockfile` now passes.
+  (Diagnosis note: reading the *vendored* copy is not the same as reading the
+  runtime. The `dsh` CLI here is 0.1.5-rc.1 and bundles dsh-tools **0.1.5-rc.2**,
+  which the declared range *did* satisfy — the real defect was the stale lock,
+  not the range.)
+
+- **The drag test resolved jsdom from a developer's absolute path.** An earlier
+  revision hardcoded `C:/Users/<name>/.workbuddy/.../jsdom`, which both leaked a
+  local directory layout into a public repo and made CI **silently skip all 13
+  checks** (the skip exits 0, so green CI with zero drag coverage). Resolution
+  is now normal `node_modules` first, then an optional `DSH_TEST_JSDOM_DIR`
+  override, with no hardcoded path anywhere.
+
+### Added
+- **CI** (`.github/workflows/ci.yml`):
+  - *build* on ubuntu — install, compile, assert the artifacts exist, then run
+    `help` / `list` / `method` to prove the CLI loads and the platform-aware
+    discovery path runs off Windows;
+  - *test* on windows — the full suite plus every standalone script, and a guard
+    that the committed `lib/` matches `src/`. The guard uses `git diff -w`, not
+    `--ignore-cr-at-eol`: a plain diff reports CRLF-only noise as a change, and
+    the latter flag does not exist in older git (2.9 errors on it and *still
+    exits 0*, which is a silent false pass — verified the hard way).
+  - CI runs Node 22: `jsdom >= 27` requires Node >= 20.
+- **`jsdom` is now a devDependency.** It was previously only present in an
+  isolated workspace outside the repo, so nothing guaranteed the behavioural
+  drag tests could run. Pinned to `^27.0.0` — **jsdom 26 and earlier have no
+  `PointerEvent` constructor** (added in 27), and the drag handling under test is
+  driven entirely by pointer events. The test now detects a too-old jsdom and
+  fails with that reason instead of a confusing constructor error.
+- `test:paths` / `test:approval` npm scripts (they existed as files but were not
+  wired up).
+
+### Changed
+- **README**: the architecture section listed files that are *not* published
+  (`src/`, `PRD.md`, `DESIGN.md`, `PUBLISH.md`, `bin/*.ts`), which is misleading
+  on the npm page. It now separates "repository layout" from "what the npm
+  package contains", and states that the package has no runtime dependencies.
+- **`PUBLISH.md`** rewritten. The old copy still described version 0.2.0 and a
+  three-entry `files` list. It now records only verified facts: the package name
+  is free on npm, the packed tarball is 29 files / 88K with no stray content,
+  the packed artifact runs and registers 7 tools + 4 routes, and the
+  `--force-with-lease` / sandbox pitfalls hit during this work.
+- **LICENSE** copyright year 2025 → 2026.
+
+### Notes
+- `dsh.client` is deliberately **not** declared. It is a client-runtime
+  integration (client packages plus a bundled UI module), not a metadata field;
+  declaring it without shipping the matching client artifact would make DSH fail
+  to load the plugin — worse than having no in-UI entry point. Deferred and
+  documented rather than guessed at.
+
 ## [0.5.0] - 2026-09-14
 
 Release-readiness pass: fixes the cross-platform discovery bug and puts a

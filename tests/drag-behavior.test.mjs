@@ -14,7 +14,8 @@
  *
  * 运行：
  *   node tests/drag-behavior.test.mjs
- * 依赖：jsdom（隔离工作区安装）
+ * 依赖：jsdom >= 27（已列为 devDependency，`pnpm install` 即得）
+ *       jsdom 26 及更早没有 PointerEvent 构造器，无法运行本测试。
  */
 
 import { readFileSync } from "node:fs";
@@ -25,28 +26,67 @@ import { createRequire } from "node:module";
 const TESTS_DIR = path.dirname(fileURLToPath(import.meta.url));
 const PLUGIN_DIR = path.resolve(TESTS_DIR, "..");
 
-// jsdom lives in the managed isolated workspace, not in the plugin's own deps.
-const JSDOM_CANDIDATES = [
-  "C:/Users/Blank/.workbuddy/binaries/node/workspace/node_modules/jsdom",
-];
-let JSDOM_PATH = null;
-for (const c of JSDOM_CANDIDATES) {
-  try {
-    const req = createRequire(pathToFileURL(path.join(c, "package.json")).href);
-    req.resolve(".");
-    JSDOM_PATH = c;
-    break;
-  } catch { /* keep looking */ }
+/**
+ * Locate jsdom.
+ *
+ * Order matters: normal module resolution first, so a plain `pnpm install`
+ * (which now includes jsdom as a devDependency) is enough — that is what CI
+ * relies on. `DSH_TEST_JSDOM_DIR` is an escape hatch for keeping jsdom outside
+ * the repo, which is how this project was originally developed.
+ *
+ * Note: this deliberately contains NO hardcoded absolute path. An earlier
+ * revision pointed at a specific developer's `~/.workbuddy/...` directory,
+ * which both leaked that layout into a public repo and made CI silently SKIP
+ * all 13 checks (the skip exits 0, so green CI with zero drag coverage).
+ */
+function resolveJsdom() {
+  // Resolve EAGERLY inside the try — a lazy `() => req("jsdom")` closure would
+  // not throw here, so the fallback would never be reached.
+  const attempt = (req, label) => {
+    try {
+      return { mod: req("jsdom"), from: label };
+    } catch {
+      return null;
+    }
+  };
+
+  const primary = attempt(createRequire(import.meta.url), "node_modules");
+  if (primary) return primary;
+
+  const dir = process.env.DSH_TEST_JSDOM_DIR;
+  if (dir) {
+    const fallback = attempt(
+      createRequire(pathToFileURL(path.join(dir, "package.json")).href),
+      dir
+    );
+    if (fallback) return fallback;
+  }
+  return null;
 }
-if (!JSDOM_PATH) {
+
+const JSDOM_SOURCE = resolveJsdom();
+if (!JSDOM_SOURCE) {
   console.log("SKIP: jsdom not installed; cannot run behavioural drag tests.");
-  console.log("      install with: cd <isolated-node-workspace> && npm install jsdom");
+  console.log("      install with: pnpm add -D jsdom");
+  console.log("      (or set DSH_TEST_JSDOM_DIR to a directory containing jsdom)");
   process.exit(0);
 }
 
-const { JSDOM, VirtualConsole } = await import(
-  pathToFileURL(path.join(JSDOM_PATH, "lib/api.js")).href
-);
+const { JSDOM, VirtualConsole } = JSDOM_SOURCE.mod;
+
+// jsdom only gained a PointerEvent constructor in v27.0.0, and the page's drag
+// handling is driven by real pointer events — so an older jsdom would fail here
+// with a confusing "PointerEvent is not a constructor". Fail with the reason
+// instead. (jsdom >= 27 also requires Node >= 20, hence the CI Node version.)
+if (typeof new JSDOM("<p></p>").window.PointerEvent !== "function") {
+  console.error(
+    `FAIL: this jsdom build has no PointerEvent constructor (expected jsdom >= 27).\n` +
+      `      loaded from: ${JSDOM_SOURCE.from}\n` +
+      `      jsdom 26 and earlier do not implement PointerEvent, and the drag\n` +
+      `      behaviour under test is delivered entirely through pointer events.`
+  );
+  process.exit(1);
+}
 
 // ---------- tiny assertion harness ----------
 const results = [];

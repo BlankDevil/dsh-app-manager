@@ -1,0 +1,120 @@
+name: CI
+
+# Why two jobs on different operating systems:
+#
+#   build (ubuntu)  — proves the TypeScript compiles and the CLI *loads and runs*
+#                     off Windows. The plugin's discovery layer is platform-aware
+#                     (per-platform global roots, POSIX path derivation), and a
+#                     Windows-only regression there would otherwise ship unnoticed.
+#
+#   test (windows)  — runs the full behavioural suite. It is Windows-hosted on
+#                     purpose: parts of it (process monitor, Add/Remove-Programs
+#                     baseline) are Windows-specific, and that is the platform the
+#                     plugin is primarily built for. Also verifies the committed
+#                     lib/ is in sync with src/ on the same OS that produced it.
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build + Linux smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          # lockfileVersion is 9.0, which pnpm 9/10 both understand.
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          # jsdom >= 27 (a devDependency) requires Node >= 20.
+          node-version: 22
+          cache: pnpm
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        run: pnpm build
+
+      - name: Verify build artifacts
+        run: |
+          test -f lib/src/index.js
+          test -f lib/src/index.d.ts
+          test -f lib/bin/cli-app-manager.js
+
+      - name: CLI loads on Linux
+        run: node lib/bin/cli-app-manager.js help
+
+      - name: Discovery runs end-to-end on Linux
+        # Exercises the per-platform global-root resolution and POSIX PATH
+        # enumeration. Asserts only that it completes cleanly — the *contents*
+        # depend on what the runner happens to have installed.
+        run: |
+          node lib/bin/cli-app-manager.js list
+          node lib/bin/cli-app-manager.js method
+
+      - name: Cross-platform path unit tests
+        # These inject platform/execPath, so they are meaningful on any OS and
+        # are the regression guard for the macOS/Linux npm-root bug.
+        run: pnpm test:paths
+
+  test:
+    name: Test suite (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Verify committed lib/ matches src/
+        # lib/ is committed (for local installs), so it can silently drift from
+        # src/. `-w` (--ignore-all-space) keeps this from tripping over CRLF on
+        # Windows checkouts. It is used instead of `--ignore-cr-at-eol` because
+        # that flag does not exist in older git (2.9 rejects it, and it exits 0
+        # anyway — a silent false pass), while `-w` is supported everywhere.
+        shell: bash
+        run: |
+          pnpm build
+          if ! git diff -w --exit-code -- lib/; then
+            echo "::error::lib/ is out of date with src/ — run 'pnpm build' and commit the result."
+            exit 1
+          fi
+
+      - name: Full suite (skips network-only cases)
+        run: pnpm test:quick
+
+      - name: Approval gate
+        run: pnpm test:approval
+
+      - name: Performance + subprocess hygiene
+        run: pnpm test:perf
+
+      - name: Drag interaction behaviour
+        run: pnpm test:drag
+
+      - name: Feature smoke
+        run: pnpm smoke

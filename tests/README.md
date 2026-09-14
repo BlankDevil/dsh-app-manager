@@ -105,7 +105,15 @@ node tests/run-tests.mjs --group B,C,D     # UI 改动 → 必带 B,C（见下�
 `drag-behavior.test.mjs` 这类**行为测试**来验证：真实 DOM、真实事件、真实断言
 最终状态与持久化结果。
 
-- 依赖 `jsdom`（装在本机隔离工作区，非插件运行时依赖）；未安装时该测试**优雅跳过**（exit 0），不会误判为失败。
+- 依赖 `jsdom >= 27`（已列入 `devDependencies`，`pnpm install` 即得；**非**插件运行时依赖）。
+  解析顺序：先走常规 `node_modules`，再回退 `DSH_TEST_JSDOM_DIR`（用于把 jsdom 放在仓库外的
+  开发方式）。完全找不到时**优雅跳过**（exit 0），不会误判为失败。
+- ⚠️ **jsdom 必须 >= 27**：jsdom 26 及更早**没有 `PointerEvent` 构造器**，而本页面的拖拽
+  完全由 pointer 事件驱动 —— 版本过低时测试会以明确原因 FAIL，而不是报一个费解的
+  "PointerEvent is not a constructor"。这也是 CI 用 Node 22（jsdom 27+ 要求 Node >= 20）的原因。
+- 早期版本这里硬编码了某个开发者的绝对路径（`C:/Users/.../.workbuddy/...`），既把本机目录
+  结构泄漏进了公开仓库，又会让 CI **静默跳过全部 13 条**（跳过是 exit 0，于是"全绿但零覆盖"）。
+  现已移除，并已加进 CI。
 - 该测试具备**回归能力**：用旧实现跑会稳定 FAIL（已反向验证：旧代码 7 PASS / 6 FAIL，
   新代码 13/13 PASS），因此它能真正拦住「标记齐全但交互失效」的回归。
 
@@ -174,12 +182,31 @@ spawn」，结果桩没生效，**真实执行了 `npm install -g 9router@latest
 > 而断言只检查「耗时 < 8s」→ **假通过**。改成同时断言「耗时 **≥** timeout」后
 > 才暴露出来。**测超时，必须证明它真的等过。**
 
-## 环境基线（首次归档时）
+## CI
 
-- 被测插件：dsh-app-manager 0.5.0（`dsh-app-manager/`）
-- 宿主 dsh：0.1.5-rc.1（内置 @deepseek-ai/dsh-tools 0.1.5-rc.2）
+`.github/workflows/ci.yml`：
+
+| Job | Runner | 内容 |
+|-----|--------|------|
+| build + Linux smoke | ubuntu | `pnpm install --frozen-lockfile` → `build` → 断言产物存在 → 跑 `help`/`list`/`method` 证明 CLI 能在非 Windows 上加载并走完平台感知的发现流程 → `test:paths` |
+| test | windows | 全量套件 + `test:approval`/`test:perf`/`test:drag`/`smoke`，外加「已提交的 `lib/` 与 `src/` 是否同步」守卫 |
+
+两点设计取舍：
+- **测试跑在 Windows 上**：套件里 `monitor`、ARP 基准等是 Windows 专有，
+  而插件也以 Windows 为主平台。Linux 侧只做构建与冒烟，避免红灯是环境差异造成的。
+- **Node 22**：`jsdom >= 27`（devDependency）要求 Node >= 20。
+
+「lib/ 同步」守卫用 `git diff -w --exit-code -- lib/`。
+**不要改成 `--ignore-cr-at-eol`** —— 老版 git（如本机的 2.9.0）不认识它，
+且报错后**退出码仍为 0**，守卫会静默失效。`-w` 在新旧 git 上都可用且同样忽略行尾 CR。
+
+## 环境基线
+
+- 被测插件：dsh-app-manager 0.5.1（`dsh-app-manager/`）
+- 宿主 dsh：0.1.5-rc.1（内嵌 @deepseek-ai/dsh-tools 0.1.5-rc.2）
 - 运行时：Node 22.22.2（managed）
+- 本机 git：2.9.0.windows.1（**较老**，部分新选项不可用，见上）
 - 平台：Windows 10 (win32)
 - 注意：本沙箱内 `npm` 会经 `wsl.exe`，被程序黑名单拦截 → `npm view` / `npm pack`
-  无法执行；`RefreshEnv`（Chocolatey shim）会调被拦的 `reg.exe`/`WMIC.exe`，
-  在沙箱内跑长耗时 CLI 子进程会被卡住，需放开沙箱。
+  无法执行（用 `pnpm pack` 替代）；`RefreshEnv`（Chocolatey shim）会调被拦的
+  `reg.exe`/`WMIC.exe`，在沙箱内跑长耗时 CLI 子进程会被卡住，需放开沙箱。

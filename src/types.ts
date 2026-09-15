@@ -236,6 +236,23 @@ export interface ApprovalService {
   }): Promise<ApprovalOutcome>;
 }
 
+/**
+ * Runtime lifecycle of one plugin application.
+ *
+ * The host is free to unload a plugin at any time (profile edit, live reload,
+ * shutdown). Teardown has two jobs: hand every registration back to the host,
+ * and make sure nothing this plugin owns keeps answering requests in the
+ * window between "unloaded" and "process gone" — a route handler that is still
+ * reachable, or a tool that still executes, is a ghost of a plugin that is no
+ * longer installed. `disposed` is the flag those handlers check first.
+ */
+export interface PluginLifecycle {
+  /** Flipped at the very start of teardown, before any registration is removed. */
+  disposed: boolean;
+  /** Why teardown happened; surfaced in the 404 body and the unload log line. */
+  reason?: string;
+}
+
 export interface CordisContext {
   logger?: {
     info: (msg: string) => void;
@@ -247,4 +264,10 @@ export interface CordisContext {
   approval?: ApprovalService;
   service?: (name: string, instance: unknown) => void;
   inject?: (services: string[], callback: (ctx: CordisContext) => void) => (() => void);
+  /**
+   * Lifecycle hook. Cordis emits `dispose` on the fiber before its effects are
+   * torn down, so registering teardown here as well as returning it from
+   * `apply` means cleanup runs no matter which path the host takes.
+   */
+  on?: (event: "dispose", listener: () => void) => (() => void);
 }

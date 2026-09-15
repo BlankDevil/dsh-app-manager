@@ -284,11 +284,22 @@ async function main() {
   // ============ C 组（路由 + JSON，产物供 D/E/A 组使用） ============
   group("C 组 · Web 路由与 JSON API");
 
-  await test("TC-C01", "路由注册面 = 4 条 exact", async () => {
+  await test("TC-C01", "路由注册面 = 7 条 exact", async () => {
     const paths = pluginCtx.routes.map((r) => `${r.kind} ${r.path}`);
-    assert(pluginCtx.routes.length === 4, `应注册 4 条路由，实际 ${pluginCtx.routes.length}`);
+    // 0.5.3 起为 4 条只读路由 + 3 条动作路由（open/updates/update）。
+    // 动作路由的**行为**（校验、并发、失败关闭）由 tests/actions.test.mjs 覆盖，
+    // 这里只守注册面：少一条就是接口凭空消失。
+    assert(pluginCtx.routes.length === 7, `应注册 7 条路由，实际 ${pluginCtx.routes.length}`);
     assert(pluginCtx.routes.every((r) => r.kind === "exact"), "存在非 exact 路由");
-    const expected = ["/app-manager", "/app-manager/api/apps", "/app-manager/api/unmanaged", "/app-manager/api/method"];
+    const expected = [
+      "/app-manager",
+      "/app-manager/api/apps",
+      "/app-manager/api/unmanaged",
+      "/app-manager/api/method",
+      "/app-manager/api/open",
+      "/app-manager/api/updates",
+      "/app-manager/api/update",
+    ];
     for (const p of expected) assert(paths.some((x) => x.endsWith(p)), `缺少路由 ${p}`);
     return paths.join(" | ");
   });

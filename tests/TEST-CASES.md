@@ -1,12 +1,18 @@
 # dsh-app-manager 测试用例规格
 
-版本：v1（对应插件 0.4.1 · dsh 0.1.5-rc.1）
+版本：v2（对应插件 0.5.3 · dsh 0.1.5-rc.1）
 状态基线：用例先于脚本编写；执行结果见 `reports/`。
 
 **通用前置**
-- 插件已构建（`lib/` 存在），版本 0.4.1
+- 插件已构建（`lib/` 存在），版本 0.5.3
 - 托管 Node 22.22.2 可用
 - 网络扩展用例（标注 ◆）依赖 npm registry 可达，失败按 SKIP(ENV) 记录，不计 FAIL
+
+> **v2 相对 v1 的变化**：0.5.3 新增三条动作路由（`/api/open`、`/api/updates`、
+> `/api/update`）与规范化退出机制，故
+> ① TC-C01 的路由数由 4 改为 **7**；
+> ② 新增 **K 组**（`actions.test.mjs`，44 条）覆盖三个动作路由的行为与卸载语义 ——
+> 这些是「会改机器」的接口，光断言注册面不够。
 
 **判定规则**
 - PASS：全部断言命中
@@ -66,7 +72,7 @@
 
 | ID | 用例 | 步骤 | 预期 |
 |----|------|------|------|
-| TC-C01 | 路由注册面 | 遍历注册结果 | 恰好 4 条 `exact` 路由；路径集合 = 预期四路径 |
+| TC-C01 | 路由注册面 | 遍历注册结果 | 恰好 **7** 条 `exact` 路由；路径集合 = 4 只读 + 3 动作（`/app-manager`、`/api/apps`、`/api/unmanaged`、`/api/method`、`/api/open`、`/api/updates`、`/api/update`） |
 | TC-C02 | 页面响应 | GET `/app-manager` | 200；`content-type: text/html`；body 含 `<style>`、`<script>`、`<title>` |
 | TC-C03 | apps API | GET `/app-manager/api/apps` | 200；合法 JSON；`total>0`；`total===apps.length`；`managedCount+unmanagedCount===total`；每项含 `name/version/commands/source/managed/installKind/inPath` |
 | TC-C04 | unmanaged API | GET `/app-manager/api/unmanaged` | 200；合法 JSON；每项 `installKind !== "managed"` |
@@ -104,6 +110,7 @@
 - H 组 12 条 · 性能守卫（`node tests/perf-guard.test.mjs`）
 - I 组 15 条 · 跨平台全局路径（`node tests/crossplatform-paths.test.mjs`）
 - J 组 11 条 · 审批门槛（`node tests/approval-gate.test.mjs`）
+- K 组 44 条 · 页面动作与退出机制（`node tests/actions.test.mjs`）
 
 ---
 
@@ -236,4 +243,45 @@ TC-H03 的职责。真实 dsh 服务在插件 `apply()` 时有后台预热（`se
 （此坑已在开发中真实触发过一次：真实执行了 `npm install -g 9router@latest`。
 经全盘扫描确认 npm 前缀下 90 分钟内 0 个条目被改动 —— 该包本就已是最新版，
 未产生实际变更。教训已写入本节。）
+
+---
+
+## K 组 — 页面动作与退出机制（`actions.test.mjs`，44 条）
+
+> 0.5.3 让页面不再只读：点击名字开终端、查更新、单个升级。这三个动作
+> **会改动真实机器**（弹终端窗口、执行全局安装），所以本组**真实调用插件注册的
+> handler**，并断言行为而不是"代码里有没有某个函数"。
+>
+> ⚠️ **安全设计（别改坏）**：三个动作全部经 `_setActionHooks` 接缝换成桩，
+> 且启动后**先验证桩确实生效**（返回值里的哨兵字符串
+> `STUB-TERMINAL-DO-NOT-SPAWN`），不生效立即 `exit(2)` 中止整个套件 ——
+> 否则测试会真的弹窗、真的 `npm install -g`。
+
+| ID | 用例 | 断言 |
+|----|------|------|
+| TC-K01 | 路由齐全 | 7 条路由全部注册（含 3 条动作路由） |
+| TC-K02 | **桩有效性哨兵** | 终端桩返回哨兵值，否则中止套件（防止测试真开窗口/真装包） |
+| TC-K03 | 开终端·GET 拒绝 | `GET /api/open` → 405（链接、浏览器预取都是 GET） |
+| TC-K04 | 开终端·未知应用 | → 404 |
+| TC-K05 | 开终端·缺参数 | → 404 |
+| TC-K06 | 开终端·已知应用 | → 200，且**确实调用了桩** |
+| TC-K07 | 命令来自 discovery | 跑的是该应用的第一个命令（实测取到 `9router`），不是请求里塞的 |
+| TC-K08 | cwd 非空 | 应用目录或主目录 |
+| TC-K09–K11 | win32 终端形态 | 解释器 `cmd.exe`；参数含**空标题**（否则 `start` 会把命令当窗口标题）；`/k` 保持窗口；命令在末位 |
+| TC-K12–K14 | darwin 终端形态 | 走 `open`；含 `Terminal`；命令带 cwd |
+| TC-K15–K16 | linux 终端形态 | 走 `x-terminal-emulator`；命令带 cwd |
+| TC-K17–K19 | 更新检查 | 200；返回体含 `updates`；首次采集调用桩一次 |
+| TC-K20 | 缓存 | 二次请求命中缓存（不再采集） |
+| TC-K21 | 强制重查 | `?refresh=1` 触发再采集 |
+| TC-K22 | 升级·GET 拒绝 | `GET /api/update` → 405（链接/预取不能装包） |
+| TC-K23 | 升级·未知应用 | → 404 |
+| TC-K24–K26 | **并发保护** | 同一应用两个并发请求：一个 200、另一个 **409**，且实际只执行一次 |
+| TC-K27 | 锁释放 | 串行再请求又能成功（锁在 `finally` 释放） |
+| TC-K28 | 缓存重置幂等 | `_resetScanCache()` 连调两次不抛错（dispose 可能调用两次） |
+| TC-K29 | 卸载·路由清空 | dispose 后宿主路由表为 0 |
+| TC-K30–K35 | **卸载·fail closed** | 扣住卸载前的旧 handler 直调：三条动作路由全部 404 且带 `no-store` |
+| TC-K36 | 重复卸载 | 不抛错（幂等） |
+
+**为什么必须扣住旧 handler 直调**：卸载后路由已从宿主表摘除，若只对宿主路由表
+断言"404"，测的是宿主而非插件 —— 那正是"看起来通过、实际没测到"的坑。
 

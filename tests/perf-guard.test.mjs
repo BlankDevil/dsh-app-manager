@@ -22,6 +22,20 @@ import path from "node:path";
 const TESTS_DIR = path.dirname(fileURLToPath(import.meta.url));
 const PLUGIN_DIR = path.resolve(TESTS_DIR, "..");
 
+/**
+ * 本进程的解释器，**带引号**地交给 `execAsync`。
+ *
+ * 为什么必须加引号：`execAsync` 在 Windows 上走 `shell: true`，而 Node 不会
+ * 为 cmd.exe 转义 argv —— 于是当 Node 装在 `C:\Program Files\nodejs\`
+ * （Windows 的标准安装位置，路径含空格）时，命令会被空格拆开，子进程瞬间
+ * 以"'D:\Program' 不是内部或外部命令"退出。那会让下面两条用例**假失败**：
+ * 子进程根本没跑起来，超时自然也就无从验证。
+ *
+ * 实测：不加引号时，用系统 Node（`D:\Program Files\nodejs`）跑本组得 10/12，
+ * 用无空格路径的 Node 跑得 12/12 —— 差别只在这个引号。
+ */
+const NODE_BIN = `"${process.execPath}"`;
+
 const results = [];
 async function check(label, fn) {
   try {
@@ -286,7 +300,7 @@ await check("execAsync 遵守 timeout，不无限等待", async () => {
   const TIMEOUT_MS = 1500;
   const t0 = Date.now();
   const res = await utils.execAsync(
-    process.execPath,
+    NODE_BIN,
     ["-e", "setTimeout(function(){},60000)"],
     { timeout: TIMEOUT_MS }
   );
@@ -311,7 +325,7 @@ await check("execAsync 遵守 timeout，不无限等待", async () => {
 
 await check("execAsync 正常命令仍返回 stdout", async () => {
   const res = await utils.execAsync(
-    process.execPath,
+    NODE_BIN,
     ["-e", "process.stdout.write('ok-marker')"],
     { timeout: 15000 }
   );

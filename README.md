@@ -14,6 +14,8 @@
 | 🏷️ Managed vs Unmanaged | 交叉比对 Windows「添加/删除程序」注册表，标出**非托管**程序 |
 | 📊 Unified View | 在一个界面查看所有 CLI 应用的版本、来源、托管状态 |
 | ⬆️ Update Check | 一键检查所有应用是否有新版本 |
+| 🖱️ Click NAME to launch | **点击名称直接在终端里打开**：CLI 工具进入自己的交互提示（`claude`），服务类当场启动（`9router`） |
+| 🔼 Per-app Upgrade | VERSION 列显示 `⬆ 最新版` 徽章，点击（确认后）升到最新版本 |
 | 🏥 Health Check | 验证应用是否正常工作、命令是否在 PATH 中 |
 | 📈 Process Monitor | 查看哪些 CLI 工具正在运行 |
 | 🔎 Quick Search | 按名称、分类或命令搜索应用 |

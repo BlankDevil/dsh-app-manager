@@ -365,7 +365,13 @@ Issues and PRs are welcome at [GitHub Issues](https://github.com/BlankDevil/dsh-
 
 3. **Contributor identity & branches / 贡献者身份与分支**：external
    contributors always use **their own** git identity — no config change
-   required. **Do not create new branches**: only the four existing ones
-   (`feat` / `bugfix` / `docs` / `chore`), reused after their PR merges.
-   外部贡献者一律用**自己的**身份，不要求改配置；**不要随意创建新的
-   branch**，只用四个既有分支，合并后复用。
+   required. Name branches **`<type>/<topic>`** (`feat/plugin-teardown`,
+   `docs/branch-naming`, `chore/release-0.5.2`) — the slash is part of the
+   branch *name*, not a directory; one PR does one kind of change. Don't keep
+   a bare `feat` / `bugfix` / `docs` / `chore` branch around: git refs cannot
+   be both a file and a directory, so the bare branch makes `<type>/<topic>`
+   impossible to create.
+   外部贡献者一律用**自己的**身份，不要求改配置；分支名用
+   **`<类型>/<主题>`** —— 斜杠只是**分支名**的一部分，不是在磁盘上建目录；
+   一次 PR 只做一类事。不要同时保留裸 `feat`/`bugfix`/`docs`/`chore` 分支，
+   否则 `<类型>/<主题>` 建不出来。

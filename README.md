@@ -331,6 +331,7 @@ npm run test:paths    # 跨平台全局路径推导（15）
 npm run test:approval # 审批门槛（11）
 npm run test:perf     # 性能守卫 + 子进程超时健壮性（12）
 npm run test:drag     # 拖拽交互行为（13）
+npm run test:actions  # 页面动作（开终端 / 查更新 / 升级）+ 退出机制（44）
 npm run smoke         # 特性冒烟（22）
 ```
 

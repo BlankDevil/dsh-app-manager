@@ -5,6 +5,106 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.3] - 2026-09-15
+
+First release with **page actions**: the table is no longer read-only. You can
+launch a tool by clicking its name, see which apps have a newer version waiting,
+and upgrade one from the page — after confirming the exact command.
+
+### Added
+
+- **Normalised teardown — an unloaded plugin stops serving.** Previously the
+  disposer handed the registrations back and stopped there. Three gaps
+  remained, all closed here:
+
+  1. the window between "marked unloaded" and "registrations removed", during
+     which a handler still answered;
+  2. a host that still holds a handler reference (not the return-value path) —
+     the page answered anyway;
+  3. the browser cache resurrecting an uninstalled page.
+
+  `apply()` now creates a `PluginLifecycle`, and `dispose()` sets
+  `disposed` as its **first act** — fail closed, *then* unwind. All four routes
+  check it at entry and answer **404 + `no-store`**; the 200 responses carry
+  `no-store` too. The seven tools go through the same guard, so a stale tool
+  reference fails loudly instead of quietly working for a plugin that is gone.
+  Teardown is idempotent (the host may call the returned function *and* emit
+  `dispose`), unwinds in LIFO order, drops the scan caches, and logs one unload
+  line so "was it actually unloaded?" is answerable.
+
+- **Click NAME to open a terminal running that app's own command.** One
+  mechanism covers both cases the request asked for: a CLI opens its interactive
+  prompt (`@anthropic-ai/claude-code` → `claude`), and a service starts in place
+  (`9router`). Their only difference is *which* command runs — and that command
+  comes from discovery, so no "service" taxonomy had to be invented.
+
+  `POST /app-manager/api/open?name=<pkg>` → a terminal on the host (Windows via
+  the shell's `start` builtin plus `/k`, so a failure stays readable instead of
+  flashing away — and with the empty title argument that `start` would otherwise
+  consume; macOS via Terminal; Linux via `x-terminal-emulator`).
+
+- **Update detection, and a per-app upgrade from the table.**
+  `GET /app-manager/api/updates` asks the registry which apps have a newer
+  version (npm/pnpm only — those are the sources with a cheap "what is the
+  latest" answer), with a 4-wide worker pool, a 45-second overall deadline that
+  reports `truncated: true` when it cuts the sweep short, and a 5-minute cache
+  so reloading the page is not a second sweep. The page renders first and
+  decorates `VERSION` with an `⬆ <latest>` badge when the answer lands.
+
+  `POST /app-manager/api/update?name=<pkg>` upgrades one app. Both endpoints are
+  POST-only, because a GET is something a link, a prefetch or an `<img>` can
+  trigger and neither action may start that way.
+
+- **`On PATH` is now the column header** (was `Status`). The cell has always
+  rendered `✅/❌ PATH` — whether the command resolves in `PATH` — so `Status`
+  promised more than the column delivered. `Path` was already taken (that column
+  is the install location). The header now says what the column is.
+
+- **`npm run test:actions`** — 44 checks over the three new endpoints, the
+  platform-specific terminal argv, and the teardown guarantees. It calls the
+  real registered handlers (asserting behaviour, not the presence of a
+  function), and the three machine-touching actions are routed through
+  `_setActionHooks` to stubs, with a **sentinel check that aborts the suite if a
+  stub did not take effect** — otherwise the test would open real windows and
+  install real packages.
+
+### Fixed
+
+- **Two concurrent upgrades of the same app could run together.** Two clicks (or
+  a double submit) meant two `install -g` writing the same global package —
+  the classic way to end up with a half-written install. The second request now
+  gets **409 `already_running`**; the lock releases in `finally` and is cleared
+  on unload.
+
+- **The new page strings were Chinese in an otherwise English UI.** Now English
+  throughout (toasts, confirm dialog, badge tooltip, button labels). No i18n
+  framework: the page is monoglot English from title to filter, so adding one
+  for four strings would cost more than it explains.
+
+### Changed
+
+- **Upgrade commands have a single source of truth.** `updateCommandFor(app)` in
+  `commands.ts` maps each source to its command (`npm install -g <pkg>@latest`,
+  `pnpm add -g …`, `choco upgrade … -y`, `scoop update …`), and `runUpdate()`
+  reports a structured outcome. Both `app-manager update` and the page's upgrade
+  button use them, so the command the page promises cannot drift from the one
+  the CLI runs.
+
+### Notes
+
+- **Terminal windows are detached and are deliberately *not* torn down on
+  unload.** The window belongs to the user — they may sit inside `claude` for an
+  hour — so closing it on plugin unload would be the destructive behaviour, not
+  the tidy one. This is the one documented exception to "the plugin cleans up
+  its own child processes" in `DESIGN.md` §6.
+- The action endpoints accept only `?name=`; the command is re-derived
+  server-side from the discovery result and re-checked against
+  `/^[A-Za-z0-9._-]+$/`, so spaces, quotes, `&&` and redirection are all
+  rejected — `?name=` never becomes an arbitrary-command endpoint.
+- Update checks remain npm/pnpm only: `cargo`, `pip`, `pipx`, `uv`, `scoop` and
+  PATH-found executables have no equivalent cheap version API and are reported as
+  skipped rather than guessed at.
+
 ## [0.5.2] - 2026-09-14
 
 First public release to npm. Metadata and docs only — no runtime behaviour

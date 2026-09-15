@@ -25,6 +25,7 @@
     "test:perf": "node tests/perf-guard.test.mjs",
     "test:paths": "node tests/crossplatform-paths.test.mjs",
     "test:approval": "node tests/approval-gate.test.mjs",
+    "test:actions": "node tests/actions.test.mjs",
     "smoke": "node tests/smoke-features.mjs",
     "prepublishOnly": "npm run build"
   },

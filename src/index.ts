@@ -3,9 +3,39 @@
  * Registers AI-callable tools and a web management page for CLI applications.
  */
 
-import type { ApprovalOutcome, ApprovalService, CliApp, ContentBlock, CordisContext, HttpRequest, HttpResponse, ToolDefinition, ToolRunContext, WebServerService } from "./types.js";
-import { buildScanReport, discoverAll, discoverUnmanaged, findApp, readManagedBaseline } from "./discovery.js";
+import type { ApprovalOutcome, ApprovalService, CliApp, ContentBlock, CordisContext, HttpRequest, HttpResponse, PluginLifecycle, ToolDefinition, ToolRunContext, WebServerService } from "./types.js";
+import { _resetScanCache, buildScanReport, discoverAll, discoverUnmanaged, findApp, readManagedBaseline } from "./discovery.js";
 import { compareVersions, execAsync, pathIndexHas } from "./utils.js";
+
+/**
+ * Answer a request that arrived after this plugin was unloaded.
+ *
+ * Reaching a handler at all means the host still holds a registration we
+ * handed back — so the plugin is gone but its page is not. Rather than serve a
+ * page for an uninstalled plugin, fail closed with 404 and `no-store`, so the
+ * browser cannot resurrect the response from its cache either.
+ */
+function sendDisposed(res: HttpResponse, path: string): void {
+  const body = JSON.stringify(
+    {
+      error: "not_found",
+      message:
+        "dsh-app-manager is no longer loaded in this profile, so this route is gone. " +
+        "Install it again (dsh plugin --profile <name> add dsh-app-manager) and restart to bring it back.",
+      path,
+    },
+    null,
+    2
+  );
+  res.writeHead(404, {
+    "content-type": "application/json; charset=utf-8",
+    "cache-control": "no-store",
+  });
+  res.end(body);
+}
+
+/** Headers every response carries, so an uninstalled page can never be cached. */
+const NO_STORE = { "cache-control": "no-store" } as const;
 
 /**
  * Project a markdown string into DSH content blocks.
@@ -133,10 +163,31 @@ async function checkLatestVersion(app: CliApp): Promise<string | null> {
  */
 function registerTools(
   toolsService: { register: (tool: ToolDefinition) => (() => void) },
-  host: HostCapabilities = {}
+  host: HostCapabilities = {},
+  lifecycle?: PluginLifecycle
 ): Array<(() => void) | undefined> {
   const disposers: Array<(() => void) | undefined> = [];
-  const register = (tool: ToolDefinition) => disposers.push(toolsService.register(tool));
+  // Every tool registers through here, so one wrapper covers all seven: once
+  // the plugin is unloaded, a tool reference the host still holds fails loudly
+  // instead of quietly answering on behalf of an uninstalled plugin.
+  const register = (tool: ToolDefinition) => {
+    const guarded: ToolDefinition = lifecycle
+      ? {
+          ...tool,
+          execute: (args: Record<string, unknown>, exec: ToolRunContext) => {
+            if (lifecycle.disposed) {
+              return Promise.reject(
+                new Error(
+                  `${tool.name} is unavailable: dsh-app-manager has been unloaded from this profile`
+                )
+              );
+            }
+            return tool.execute(args, exec);
+          },
+        }
+      : tool;
+    disposers.push(toolsService.register(guarded));
+  };
 
   register({
     name: "app_manager_list",
@@ -1520,7 +1571,10 @@ function generateAppManagerPage(): string {
 /**
  * Register web routes for the app manager page
  */
-function registerWebRoutes(webServer: WebServerService): Array<(() => void) | undefined> {
+function registerWebRoutes(
+  webServer: WebServerService,
+  lifecycle: PluginLifecycle
+): Array<(() => void) | undefined> {
   const disposers: Array<(() => void) | undefined> = [];
 
   // Main HTML page
@@ -1529,7 +1583,8 @@ function registerWebRoutes(webServer: WebServerService): Array<(() => void) | un
       kind: "exact",
       path: "/app-manager",
       handler: (_req: HttpRequest, res: HttpResponse) => {
-        res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+        if (lifecycle.disposed) return sendDisposed(res, "/app-manager");
+        res.writeHead(200, { "content-type": "text/html; charset=utf-8", ...NO_STORE });
         res.end(generateAppManagerPage());
       },
     })
@@ -1541,6 +1596,7 @@ function registerWebRoutes(webServer: WebServerService): Array<(() => void) | un
       kind: "exact",
       path: "/app-manager/api/apps",
       handler: (_req: HttpRequest, res: HttpResponse) => {
+        if (lifecycle.disposed) return sendDisposed(res, "/app-manager/api/apps");
         const apps = discoverAll().map((app) => ({
           name: app.name,
           version: app.version,
@@ -1554,7 +1610,7 @@ function registerWebRoutes(webServer: WebServerService): Array<(() => void) | un
           inPath: app.commands.some((cmd) => pathIndexHas(cmd)),
         }));
         const managedCount = apps.filter((a) => a.managed).length;
-        res.writeHead(200, { "content-type": "application/json; charset=utf-8" });
+        res.writeHead(200, { "content-type": "application/json; charset=utf-8", ...NO_STORE });
         res.end(
           JSON.stringify(
             { total: apps.length, managedCount, unmanagedCount: apps.length - managedCount, apps },
@@ -1572,6 +1628,7 @@ function registerWebRoutes(webServer: WebServerService): Array<(() => void) | un
       kind: "exact",
       path: "/app-manager/api/unmanaged",
       handler: (_req: HttpRequest, res: HttpResponse) => {
+        if (lifecycle.disposed) return sendDisposed(res, "/app-manager/api/unmanaged");
         const apps = discoverUnmanaged().map((app) => ({
           name: app.name,
           commands: app.commands,
@@ -1579,7 +1636,7 @@ function registerWebRoutes(webServer: WebServerService): Array<(() => void) | un
           installKind: app.installKind,
           path: app.path,
         }));
-        res.writeHead(200, { "content-type": "application/json; charset=utf-8" });
+        res.writeHead(200, { "content-type": "application/json; charset=utf-8", ...NO_STORE });
         res.end(JSON.stringify({ total: apps.length, apps }, null, 2));
       },
     })
@@ -1591,8 +1648,9 @@ function registerWebRoutes(webServer: WebServerService): Array<(() => void) | un
       kind: "exact",
       path: "/app-manager/api/method",
       handler: (_req: HttpRequest, res: HttpResponse) => {
+        if (lifecycle.disposed) return sendDisposed(res, "/app-manager/api/method");
         const report = buildScanReport({ baseline: readManagedBaseline() });
-        res.writeHead(200, { "content-type": "application/json; charset=utf-8" });
+        res.writeHead(200, { "content-type": "application/json; charset=utf-8", ...NO_STORE });
         res.end(JSON.stringify(report, null, 2));
       },
     })
@@ -1606,6 +1664,12 @@ function registerWebRoutes(webServer: WebServerService): Array<(() => void) | un
  */
 export function apply(ctx: CordisContext): () => void {
   const disposers: Array<(() => void) | undefined> = [];
+
+  // Teardown state. `disposed` is flipped as the first act of `dispose()`, so
+  // every route handler and tool refuses to serve before a single registration
+  // is handed back — no window in which the page still answers for a plugin
+  // that is already gone.
+  const lifecycle: PluginLifecycle = { disposed: false };
 
   // Host capabilities the mutating tools need at call time. Populated by the
   // optional `approval` injection below; absent on hosts without an answerer.
@@ -1627,7 +1691,7 @@ export function apply(ctx: CordisContext): () => void {
     // Dynamically inject tools service to avoid Cordis inject export issues
     const injectDisposer = ctx.inject(["tools"], (toolsCtx) => {
       if (toolsCtx.tools?.register) {
-        disposers.push(...registerTools(toolsCtx.tools, host));
+        disposers.push(...registerTools(toolsCtx.tools, host, lifecycle));
       }
     });
     disposers.push(injectDisposer);
@@ -1637,7 +1701,7 @@ export function apply(ctx: CordisContext): () => void {
     // Dynamically inject webServer service for the management page
     const injectDisposer = ctx.inject(["webServer"], (serverCtx) => {
       if (serverCtx.webServer?.register) {
-        disposers.push(...registerWebRoutes(serverCtx.webServer));
+        disposers.push(...registerWebRoutes(serverCtx.webServer, lifecycle));
       }
     });
     disposers.push(injectDisposer);
@@ -1668,10 +1732,56 @@ export function apply(ctx: CordisContext): () => void {
   // Don't let the warm-up timer keep the process alive on shutdown.
   if (typeof warmTimer === "object" && "unref" in warmTimer) warmTimer.unref();
 
-  return () => {
+  let tornDown = false;
+
+  /**
+   * Hand every registration back and stop serving.
+   *
+   * Two paths can land here: the function `apply` returns (Cordis collects it
+   * as the fiber's disposer) and the `dispose` event on the fiber. Whichever
+   * fires first wins — the flag makes the other a no-op, since running this
+   * twice would hand the same registrations back twice.
+   */
+  const dispose = (): void => {
+    if (tornDown) return;
+    tornDown = true;
+
+    // Fail closed *before* unwinding, not after: for the whole duration of the
+    // walk below, no route handler and no tool may answer a request.
+    lifecycle.disposed = true;
+    lifecycle.reason = "plugin unloaded";
+
     clearTimeout(warmTimer);
-    for (const dispose of disposers) dispose?.();
+
+    // LIFO — each registration is removed before whatever it was built on, so
+    // the web routes come off before the host services they registered against.
+    for (let i = disposers.length - 1; i >= 0; i -= 1) disposers[i]?.();
+    disposers.length = 0;
+
+    // Drop the scan caches. They hold command lines, install paths and versions
+    // for the whole machine; keeping that resident after unload serves nobody.
+    try {
+      _resetScanCache();
+    } catch {
+      /* cache reset is best-effort */
+    }
+
+    ctx.logger?.info?.(
+      "dsh-app-manager: plugin unloaded — web routes and tools removed, scan cache dropped"
+    );
   };
+
+  // Belt and braces: register the same teardown on the fiber's `dispose` event
+  // in addition to returning it, so cleanup runs whichever path the host takes.
+  if (typeof ctx.on === "function") {
+    try {
+      ctx.on("dispose", dispose);
+    } catch {
+      /* this host does not expose the hook */
+    }
+  }
+
+  return dispose;
 }
 
 /**

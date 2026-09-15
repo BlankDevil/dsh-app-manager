@@ -58,6 +58,9 @@ npm install -g dsh-app-manager
 dsh plugin --profile web add dsh-app-manager
 ```
 
+> Self-contained / 自包含：安装只拉取本插件自身 —— **zero runtime
+> dependencies（`dependencies: {}`）**，不牵扯其他插件的依赖；
+> 宿主能力由 DSH 通过 peer dependency 提供。lib 只 import Node 内置模块。
 装完打开管理页面：**`http://127.0.0.1:3080/app-manager`**（`dsh web` 启动后）。
 
 ### From source / 从源码安装
@@ -349,3 +352,20 @@ MIT
 ## 🤝 Contributing / 贡献
 
 Issues and PRs are welcome at [GitHub Issues](https://github.com/BlankDevil/dsh-app-manager/issues).
+
+**Hard rules / 硬性约定**（详见 [CONTRIBUTING.md](./CONTRIBUTING.md)）：
+
+1. **Dependencies / 依赖**：only reference and download what **this plugin
+   itself** needs — never pull another plugin's dependencies. Runtime
+   `dependencies` stays empty; host capabilities come via peer dependency.
+   只引用和下载本插件自身需要的依赖，**不牵扯其他插件的依赖**。
+
+2. **Identity / 署名**：the unified `BlankDevil` identity binds **the
+   maintainer only**. 「统一署名」类规则**只约束维护者本人**。
+
+3. **Contributor identity & branches / 贡献者身份与分支**：external
+   contributors always use **their own** git identity — no config change
+   required. **Do not create new branches**: only the four existing ones
+   (`feat` / `bugfix` / `docs` / `chore`), reused after their PR merges.
+   外部贡献者一律用**自己的**身份，不要求改配置；**不要随意创建新的
+   branch**，只用四个既有分支，合并后复用。

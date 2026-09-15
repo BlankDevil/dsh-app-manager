@@ -126,6 +126,7 @@ JetBrains/DevEco 自带运行时、`node_modules/.bin`）及命令变体
 - **运行时**：Node.js >= 18（ESM）
 - **DSH 集成**：Cordis 插件（`apply` 函数 + `ctx.inject`）
 - **构建**：`tsc`（无 bundler，服务端纯 TS）
+- **依赖**：**零运行时依赖**（`dependencies: {}`）。只引用和下载本插件自身需要的依赖（当前仅 Node 内置模块），**不牵扯其他插件的依赖**；宿主能力走 `peerDependencies` 由 DSH 提供（详见「10. 工程与协作约束」）
 
 ### 4.2 目录结构
 
@@ -289,3 +290,25 @@ export function apply(ctx: CordisContext): () => void {
 ## 9. 未来路线
 
 见 `DESIGN.md`（从界面启动服务/打开 CLI、客户端侧边栏入口等）。
+
+---
+
+## 10. 工程与协作约束（硬性）
+
+以下三条是**硬性约束**，任何改动、任何贡献者都不得违反（完整规范见 `CONTRIBUTING.md`）：
+
+1. **依赖自包含** —— 只引用和下载 dsh-app-manager **自身需要的依赖**，
+   **不牵扯其他插件的依赖**。运行时 `dependencies` 保持为空，宿主能力一律走
+   `peerDependencies` 由 DSH 注入；新增任何第三方依赖必须在 PR 里说明理由，
+   并证明没有内置模块或既有依赖可替代。
+   （发布包自包含：29 个文件、0 个 `node_modules` 文件、`lib/` 只 import
+   `node:` 内置模块与相对路径。）
+
+2. **「统一署名」只约束维护者本人** —— 统一署名 `BlankDevil`
+   （LICENSE 版权人 / `package.json` author / git 提交身份）仅适用于
+   仓库维护者 `@BlankDevil`，配置为仓库级。
+
+3. **外部贡献者一律用他们自己的身份，不要求改配置**；**不要随意创建新的
+   branch** —— 分支只用 `feat` / `bugfix` / `docs` / `chore` 四个既有的，
+   不另造衍生名或斜杠名，PR 合并后复用（`git switch <branch> &&
+   git merge --ff-only main`）。

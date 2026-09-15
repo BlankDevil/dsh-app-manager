@@ -192,6 +192,11 @@ Body: { name: "claude", args?: string[] }
 
 ## 8. 依赖调研清单（待确认）
 
+> ⚠️ 本节任何一项若最终引入依赖，都必须遵守「10. 工程与协作约束」第 1 条：
+> 只引用和下载**本插件自身需要的依赖**，不牵扯其他插件的依赖。
+> 例如「参考 dsh-better-sidebar 的做法」≠ 引入它的依赖 —— 复用思路，
+> 不复用包。
+
 - [ ] `dsh-better-sidebar` 是否暴露「创建终端」的公开 API（可从其他插件调用）
 - [ ] DSH client 打包规范（Rolldown 配置、`window.__ModuleLoader__` 协议）
 - [ ] `dsh-client-ui-slots` 注册侧边栏 tab 的确切 API
@@ -208,3 +213,22 @@ Body: { name: "claude", args?: string[] }
 3. 用 `XMLHttpRequest`/`fetch` 在 HTML 里实现按钮点击
 
 这样能用最少的改动，先实现「从界面启动服务」，无需客户端插件复杂度。
+
+---
+
+## 10. 工程与协作约束（硬性）
+
+本文件描述的所有未来功能，在设计、实现、评审时都受以下三条**硬性约束**
+（完整规范见 `CONTRIBUTING.md`）：
+
+1. **依赖自包含** —— 只引用和下载 dsh-app-manager **自身需要的依赖**，
+   **不牵扯其他插件的依赖**。客户端打包（3.3 节）即使引入 bundler，
+   产物也必须自包含；宿主能力（UI slots、locale、模块注册）一律走
+   `dsh.client.inject` 由 DSH 提供，不把它们加进 `dependencies`。
+
+2. **「统一署名」只约束维护者本人** —— 统一署名 `BlankDevil` 仅适用于
+   仓库维护者 `@BlankDevil`（仓库级配置）。
+
+3. **外部贡献者一律用他们自己的身份，不要求改配置**；**不要随意创建新的
+   branch** —— 只用 `feat` / `bugfix` / `docs` / `chore` 四个既有分支，
+   不另造衍生名或斜杠名，PR 合并后复用。

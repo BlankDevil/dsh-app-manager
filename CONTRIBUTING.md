@@ -31,27 +31,51 @@
 2. **不要自行创建 `rel-*` 分支。** 只有明确要「发布新版本」时才从 `main` 拉。
 3. **不要自行打发布 tag。** 发布动作是独立步骤，由维护者发起。
 4. 按「怎么选分支」表选择分支，**不要混用**（例如别把文档改动提进 `bugfix`）。
+5. **不要另造分支名。** 只用 `feat` / `bugfix` / `docs` / `chore` 四个既有分支，
+   也不要写 `chore/<主题>` 这种斜杠形式 —— 详见下方「分支命名」。
+
+### 分支命名
+
+**直接用既有的四个分支，不要另造名字：**
+
+| 用途 | 分支 |
+|------|------|
+| 新功能 | `feat` |
+| 修 bug | `bugfix` |
+| 文档 | `docs` |
+| 杂项 / 构建 / 元信息 | `chore` |
+
+- ❌ **不要新建 `chore-<主题>` / `docs-<主题>` 这类衍生分支名。**
+  一个类型只需要一个分支，需要新工作时复用它。
+- ❌ **也不要写 `chore/<主题>`（斜杠形式）。** Git 的 ref 就是文件路径：
+  `refs/heads/chore` 已经是一个**文件**，就再也建不出 `refs/heads/chore/` 这个**目录**，
+  `git switch -c chore/xxx` 会直接报
+  `cannot lock ref ... 'refs/heads/chore' exists`。
+- ✅ 一个分支的 PR 合并后，把它**快进回 `main`** 即可继续复用：
+  ```bash
+  git switch chore && git merge --ff-only main
+  ```
 
 ### 典型流程
 
 ```
 # 新功能
-git switch -c feat/<主题> main
+git switch feat
 # ... 开发、提交 ...
-# 开 PR: feat/<主题> -> main，等 review / verify 通过后合入
+# 开 PR: feat -> main，等 review / verify 通过后合入
 
 # 修 bug
-git switch -c bugfix/<主题> main
+git switch bugfix
 # ... 修复、提交 ...
-# 开 PR: bugfix/<主题> -> main
+# 开 PR: bugfix -> main
 
 # 文档
-git switch -c docs/<主题> main
-# 开 PR: docs/<主题> -> main
+git switch docs
+# 开 PR: docs -> main
 
 # 杂项 / 构建 / 元信息
-git switch -c chore/<主题> main
-# 开 PR: chore/<主题> -> main
+git switch chore
+# 开 PR: chore -> main
 
 # 发布（仅在明确要发版时）
 git switch main && git pull
@@ -64,8 +88,18 @@ git switch -c rel-0.6.0
 
 ## 提交身份
 
-本仓库使用统一署名 **`BlankDevil`**（与 `LICENSE` 的版权人、`package.json` 的 `author` 一致）。
-配置为**仓库级**，不要改全局：
+### 其他贡献者：用你自己的身份，**不需要改任何配置**
+
+直接用你本地已有的 git 身份提交即可 —— 仓库**不会**要求你改成维护者的名字。
+GitHub 会按提交里的邮箱把这个 commit 归属到**你自己的**账号，
+你的贡献记录也留在你自己的名下。
+
+> 换句话说：「统一署名 `BlankDevil`」只约束仓库维护者，不是对贡献者的要求。
+
+### 维护者：统一署名 `BlankDevil`
+
+只有仓库所有者（`@BlankDevil`）在本仓库使用统一署名，与 `LICENSE` 的版权人、
+`package.json` 的 `author` 保持一致。配置为**仓库级**，不要改全局：
 
 ```bash
 git config user.name  "BlankDevil"

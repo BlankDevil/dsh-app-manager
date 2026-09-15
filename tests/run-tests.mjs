@@ -692,6 +692,23 @@ async function main() {
     return clip(lineOf(plain, "up to date") || lineOf(plain, "update(s)"), 80);
   });
 
+  // ============ 元断言：SKIP 不是通过 ============
+  //
+  // 为什么要有这条：本仓库吃过一次亏 —— 拖拽组在缺少 jsdom 时静默 SKIP 且
+  // 退出码为 0，CI 全绿而拖拽覆盖实际为零。「没验证」和「验证通过」必须分开：
+  // 跳过意味着这份报告不能用于放行，所以它计入失败（退出码非 0）。
+  //
+  // 代价是：离线环境跑本套件会因 ◆ 网络用例而失败 —— 这是刻意的，
+  // 请在网络可用时重跑，或看报告顶部确认哪几条没被验证。
+  await test("TC-Z01", "元断言：无 SKIP（未验证 ≠ 通过）", async () => {
+    const skips = results.filter((r) => r.status === "SKIP");
+    assert(
+      skips.length === 0,
+      `有 ${skips.length} 条被跳过（${skips.map((s) => s.id).join(", ")}）—— 跳过即视为失败，请在有网络的环境重跑`
+    );
+    return "0 skipped";
+  });
+
   // ============ 汇总与机器报告 ============
   const endedAt = new Date();
   const byStatus = (s) => results.filter((r) => r.status === s).length;
@@ -739,8 +756,12 @@ async function main() {
 
   console.log(`\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
   console.log(`结果: PASS ${pass} · FAIL ${fail} · ERROR ${err} · SKIP ${skipped} / 共 ${results.length}`);
+  if (skipped > 0) {
+    console.log(`⚠️  有 ${skipped} 条被跳过 —— 跳过即视为失败（未验证 ≠ 通过）`);
+  }
   console.log(`机器报告: ${reportPath}`);
-  process.exit(fail + err > 0 ? 1 : 0);
+  // SKIP 计入失败：见 TC-Z01 的说明。
+  process.exit(fail + err + skipped > 0 ? 1 : 0);
 }
 
 main().catch((e) => {

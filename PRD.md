@@ -327,7 +327,9 @@ export function apply(ctx: CordisContext): () => void {
    （LICENSE 版权人 / `package.json` author / git 提交身份）仅适用于
    仓库维护者 `@BlankDevil`，配置为仓库级。
 
-3. **外部贡献者一律用他们自己的身份，不要求改配置**；**不要随意创建新的
-   branch** —— 分支只用 `feat` / `bugfix` / `docs` / `chore` 四个既有的，
-   不另造衍生名或斜杠名，PR 合并后复用（`git switch <branch> &&
-   git merge --ff-only main`）。
+3. **外部贡献者一律用他们自己的身份，不要求改配置**；分支名用
+   **`<类型>/<主题>`** —— `feat/plugin-teardown`、`docs/branch-naming`、
+   `chore/release-0.5.2`，一次 PR 只做一类事。⚠️ 不要同时存在裸
+   `feat` / `bugfix` / `docs` / `chore` 分支：git 的分支名是 ref，而 ref
+   不能既是文件又是目录 —— 裸分支在，`<类型>/<主题>` 就建不出来
+   （`cannot lock ref ... 'refs/heads/chore' exists`）。

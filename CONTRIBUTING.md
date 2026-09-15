@@ -5,20 +5,24 @@
 | 分支 | 职责 | 合入 `main` 的条件 |
 |------|------|--------------------|
 | `main` | **主分支**。所有代码最终合入这里；发布版本从 main 拉出 | — |
-| `feat` | **新功能分支**。新需求先提交到这里 | 必须先 **PR + code review / verify** |
-| `bugfix` | **bug 修复分支** | 必须先 **PR + code review / verify** |
-| `docs` | **文档变更分支**（README / CHANGELOG / PUBLISH / CONTRIBUTING 等） | 必须先 **PR + code review / verify** |
-| `chore` | **杂项分支**：构建、依赖、元信息（`package.json` 字段、LICENSE、CI 配置等） | 必须先 **PR + code review / verify** |
+| `feat/<主题>` | **新功能**。新需求先提交到这里 | 必须先 **PR + code review / verify** |
+| `bugfix/<主题>` | **bug 修复** | 必须先 **PR + code review / verify** |
+| `docs/<主题>` | **文档变更**（README / CHANGELOG / PUBLISH / CONTRIBUTING 等） | 必须先 **PR + code review / verify** |
+| `chore/<主题>` | **杂项**：构建、依赖、元信息（`package.json` 字段、LICENSE、CI 配置等） | 必须先 **PR + code review / verify** |
 | `rel-{版本号}` | **发布分支**。每个版本阶段性成功后正式发布上线 | 仅在明确「发布新版本」后从 `main` 拉出；完成 code review / verify / 上线测试后才能正式发布 |
+
+**`<主题>` 用小写连字符**，一眼看出在做什么：`feat/plugin-teardown`、
+`docs/branch-naming`、`chore/release-0.5.2`。斜杠只是**分支名**的一部分，
+不是在磁盘上建目录 —— 详见下方「分支命名」。
 
 ### 怎么选分支
 
 | 改动内容 | 分支 |
 |---|---|
-| 新增/修改功能、行为 | `feat` |
-| 修 bug | `bugfix` |
-| 纯文档（含 CHANGELOG、本文件） | `docs` |
-| 构建脚本、依赖版本、CI、`package.json` 字段、LICENSE、`.gitattributes` | `chore` |
+| 新增/修改功能、行为 | `feat/<主题>` |
+| 修 bug | `bugfix/<主题>` |
+| 纯文档（含 CHANGELOG、本文件） | `docs/<主题>` |
+| 构建脚本、依赖版本、CI、`package.json` 字段、LICENSE、`.gitattributes` | `chore/<主题>` |
 | 阶段性发布上线 | `rel-{版本号}` |
 
 一句话：**一次 PR 只做一类事**。若一个改动同时包含代码和文档，代码走自己的分支，
@@ -31,55 +35,74 @@
 2. **不要自行创建 `rel-*` 分支。** 只有明确要「发布新版本」时才从 `main` 拉。
 3. **不要自行打发布 tag。** 发布动作是独立步骤，由维护者发起。
 4. 按「怎么选分支」表选择分支，**不要混用**（例如别把文档改动提进 `bugfix`）。
-5. **不要另造分支名。** 只用 `feat` / `bugfix` / `docs` / `chore` 四个既有分支，
-   也不要写 `chore/<主题>` 这种斜杠形式 —— 详见下方「分支命名」。
+5. 分支名用 **`<类型>/<主题>`**：`feat/`、`bugfix/`、`docs/`、`chore/` 后面接一个
+   小写连字符主题（例：`feat/plugin-teardown`）。一次 PR 只做一类事 —— 详见下方
+   「分支命名」。
 
 ### 分支命名
 
-**直接用既有的四个分支，不要另造名字：**
+**按类型选前缀，再接一个主题名：**
 
 | 用途 | 分支 |
 |------|------|
-| 新功能 | `feat` |
-| 修 bug | `bugfix` |
-| 文档 | `docs` |
-| 杂项 / 构建 / 元信息 | `chore` |
+| 新功能 | `feat/<主题>` |
+| 修 bug | `bugfix/<主题>` |
+| 文档 | `docs/<主题>` |
+| 杂项 / 构建 / 元信息 | `chore/<主题>` |
+| 发布 | `rel-<版本号>`（仅明确发版时） |
 
-- ❌ **不要新建 `chore-<主题>` / `docs-<主题>` 这类衍生分支名。**
-  一个类型只需要一个分支，需要新工作时复用它。
-- ❌ **也不要写 `chore/<主题>`（斜杠形式）。** Git 的 ref 就是文件路径：
-  `refs/heads/chore` 已经是一个**文件**，就再也建不出 `refs/heads/chore/` 这个**目录**，
-  `git switch -c chore/xxx` 会直接报
-  `cannot lock ref ... 'refs/heads/chore' exists`。
-- ✅ 一个分支的 PR 合并后，把它**快进回 `main`** 即可继续复用：
-  ```bash
-  git switch chore && git merge --ff-only main
+主题用小写连字符，能一眼看出在做什么：`feat/plugin-teardown`、`docs/branch-naming`、
+`chore/release-0.5.2`。
+
+- ✅ **`<类型>/<主题>` 是分支名，不是在磁盘上建目录。** 斜杠只是名字的一部分。
+- ⚠️ **不要同时存在裸 `feat` / `bugfix` / `docs` / `chore` 分支。**
+  原因：git 把分支名存成 ref，而 ref **不能既是文件又是目录** ——
+  只要 `refs/heads/chore` 这个**文件**还在，`refs/heads/chore/<主题>` 这个**目录**
+  就永远建不出来：
+
   ```
+  fatal: cannot lock ref 'refs/heads/chore/plugin-teardown':
+         'refs/heads/chore' exists; cannot create 'refs/heads/chore/plugin-teardown'
+  ```
+
+  本仓库的四个裸类型分支**已移除**（内容全部合入 `main`，未丢任何提交），
+  统一改用 `<类型>/<主题>`。若你在旧克隆里还能看到它们，删掉即可：
+  `git branch -d feat bugfix docs chore`（本地）、
+  `git push origin --delete feat bugfix docs chore`（远端）。
+- ✅ 一次 PR 只做一类事。**合并后分支即可删除**，下一个同类型的工作换个主题名
+  重新拉 —— 不需要复用同一个分支：
+  ```bash
+  git push origin --delete feat/plugin-teardown
+  ```
+
+> 命令提示：本仓库维护者的 git 是 2.9.0，没有 `switch` 子命令，示例统一用
+> `git checkout -b`。git ≥ 2.23 可用更清晰的 `git switch -c`。
 
 ### 典型流程
 
 ```
 # 新功能
-git switch feat
+git checkout -b feat/<主题> main
 # ... 开发、提交 ...
-# 开 PR: feat -> main，等 review / verify 通过后合入
+# 开 PR: feat/<主题> -> main，等 review / verify 通过后合入
+# 合并后删掉分支: git push origin --delete feat/<主题>
 
 # 修 bug
-git switch bugfix
+git checkout -b bugfix/<主题> main
 # ... 修复、提交 ...
-# 开 PR: bugfix -> main
+# 开 PR: bugfix/<主题> -> main
 
 # 文档
-git switch docs
-# 开 PR: docs -> main
+git checkout -b docs/<主题> main
+# 开 PR: docs/<主题> -> main
 
 # 杂项 / 构建 / 元信息
-git switch chore
-# 开 PR: chore -> main
+git checkout -b chore/<主题> main
+# 开 PR: chore/<主题> -> main
 
 # 发布（仅在明确要发版时）
-git switch main && git pull
-git switch -c rel-0.6.0
+git checkout main && git pull
+git checkout -b rel-0.6.0
 # ... code review / verify / 上线测试 ...
 # 通过后才正式发布
 ```

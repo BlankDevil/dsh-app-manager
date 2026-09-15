@@ -77,18 +77,37 @@ function launchCwd(app: CliApp): string {
 }
 
 /** How to open a terminal running `command`, per platform. */
-function terminalInvocation(command: string, cwd: string): { cmd: string; args: string[] } {
-  if (process.platform === "win32") {
+function terminalInvocation(
+  command: string,
+  cwd: string,
+  platform: NodeJS.Platform = process.platform
+): { cmd: string; args: string[] } {
+  if (platform === "win32") {
     // `start` treats its first argument as the window title, so the empty ""
     // is required — without it a quoted command would be eaten as the title.
     // `/k` keeps the window open after the command exits, so a failure stays
     // readable instead of flashing away.
     return { cmd: "cmd.exe", args: ["/c", "start", "", "cmd.exe", "/k", command] };
   }
-  if (process.platform === "darwin") {
+  if (platform === "darwin") {
     return { cmd: "open", args: ["-a", "Terminal", "--args", "-c", `cd ${cwd} && ${command}`] };
   }
   return { cmd: "x-terminal-emulator", args: ["-e", "sh", "-c", `cd ${cwd} && ${command}; exec sh`] };
+}
+
+/**
+ * Test seam for the platform branch above.
+ *
+ * `terminalInvocation` is pure, but the branch it takes depends on the host —
+ * so the argv shapes for all three platforms are only reachable through this
+ * export, and only one of them can ever run for real on a given machine.
+ */
+export function _terminalInvocationFor(
+  platform: NodeJS.Platform,
+  command: string,
+  cwd: string
+): { cmd: string; args: string[] } {
+  return terminalInvocation(command, cwd, platform);
 }
 
 /**
@@ -141,10 +160,32 @@ interface UpdatesPayload {
   updates: Record<string, { current: string; latest: string; command: string }>;
   /** Apps we could not check (no version API for that source, or a failed lookup). */
   skipped: number;
+  /** True when the whole sweep was cut short by the deadline, so this is partial. */
+  truncated?: boolean;
 }
 
 /** Latest-version results are cached so a page reload is not a second sweep. */
 const UPDATES_TTL_MS = 5 * 60_000;
+
+/**
+ * Wall-clock ceiling for one full sweep.
+ *
+ * Each lookup carries its own 10s timeout, but with a 4-wide window a large
+ * registry day could still stretch 40 packages into ~100s of badge-less page.
+ * Past this deadline the sweep stops taking new work and reports itself as
+ * partial — a slightly stale badge beats a spinner that never resolves.
+ */
+const UPDATES_DEADLINE_MS = 45_000;
+
+/**
+ * Apps currently being upgraded.
+ *
+ * Two clicks (or a double-submit) would otherwise run `install -g` twice for
+ * the same package concurrently, which is how you get a half-written global
+ * install. The second caller is told to wait instead.
+ */
+const upgradesInFlight = new Set<string>();
+
 let updatesCache: { at: number; data: UpdatesPayload } | null = null;
 
 /**
@@ -157,12 +198,18 @@ let updatesCache: { at: number; data: UpdatesPayload } | null = null;
 async function collectUpdates(): Promise<UpdatesPayload> {
   const apps = discoverAll().filter((app) => app.source === "npm" || app.source === "pnpm");
   const updates: UpdatesPayload["updates"] = {};
+  const startedAt = Date.now();
   let skipped = 0;
+  let truncated = false;
   let cursor = 0;
   const CONCURRENCY = 4;
 
   const worker = async (): Promise<void> => {
     while (cursor < apps.length) {
+      if (Date.now() - startedAt > UPDATES_DEADLINE_MS) {
+        truncated = true;
+        return;
+      }
       const app = apps[cursor++];
       const latest = await checkLatestVersion(app);
       if (!latest) {
@@ -181,7 +228,7 @@ async function collectUpdates(): Promise<UpdatesPayload> {
   };
 
   await Promise.all(Array.from({ length: Math.min(CONCURRENCY, apps.length) }, worker));
-  return { checkedAt: new Date().toISOString(), updates, skipped };
+  return { checkedAt: new Date().toISOString(), updates, skipped, ...(truncated ? { truncated } : {}) };
 }
 
 /** Cached view of {@link collectUpdates}. */
@@ -1823,12 +1870,12 @@ function generateAppManagerPage(): string {
             .then(function (res) {
               var body = res.body || {};
               if (body.ok) {
-                toast('打开终端：' + body.command + '\\n工作目录：' + body.cwd, 'ok');
+                toast('Terminal opened: ' + body.command + '\\nWorking directory: ' + body.cwd, 'ok');
               } else {
-                toast('无法打开终端：' + (body.message || body.detail || res.status), 'err');
+                toast('Could not open a terminal: ' + (body.message || body.detail || res.status), 'err');
               }
             })
-            .catch(function (e) { toast('请求失败：' + e.message, 'err'); })
+            .catch(function (e) { toast('Request failed: ' + e.message, 'err'); })
             .then(function () { btn.disabled = false; });
         });
 
@@ -1845,7 +1892,7 @@ function generateAppManagerPage(): string {
             b.type = 'button';
             b.className = 'upd';
             b.textContent = '⬆ ' + info.latest;
-            b.title = '可升级到 ' + info.latest + '（将执行：' + info.command + '）';
+            b.title = 'Upgrade to ' + info.latest + ' (runs: ' + info.command + ')';
             b.setAttribute('data-name', tr.getAttribute('data-app'));
             b.setAttribute('data-command', info.command);
             cell.appendChild(b);
@@ -1870,28 +1917,29 @@ function generateAppManagerPage(): string {
           var name = b.getAttribute('data-name');
           var command = b.getAttribute('data-command') || '';
           var ok = window.confirm(
-            '将在本机执行：\\n\\n' + command + '\\n\\n这会改写全局安装的包，且不可撤销。继续？'
+            'This will run on this machine:\\n\\n' + command +
+            '\\n\\nIt rewrites a globally installed package and cannot be undone. Continue?'
           );
           if (!ok) return;
           b.disabled = true;
-          b.textContent = '升级中…';
+          b.textContent = 'Upgrading…';
           post(API + '/update?name=' + encodeURIComponent(name))
             .then(function (res) {
               var body = res.body || {};
               if (body.ok) {
-                toast('✅ ' + name + ' 已更新\\n' + (body.command || ''), 'ok');
+                toast('✅ ' + name + ' upgraded\\n' + (body.command || ''), 'ok');
                 // It is on the latest version now — the badge is stale.
                 if (b.parentNode) b.parentNode.removeChild(b);
               } else {
-                toast('❌ 升级失败：' + (body.detail || body.message || res.status) + '\\n' + (body.command || ''), 'err');
+                toast('❌ Upgrade failed: ' + (body.detail || body.message || res.status) + '\\n' + (body.command || ''), 'err');
                 b.disabled = false;
-                b.textContent = '⬆ 重试';
+                b.textContent = '⬆ Retry';
               }
             })
             .catch(function (e) {
-              toast('请求失败：' + e.message, 'err');
+              toast('Request failed: ' + e.message, 'err');
               b.disabled = false;
-              b.textContent = '⬆ 重试';
+              b.textContent = '⬆ Retry';
             });
         });
 
@@ -2093,12 +2141,25 @@ function registerWebRoutes(
             message: "no discovered app with that name",
           });
         }
-        const outcome = await updateRunner(app);
-        return sendJson(res, outcome.ok ? 200 : 500, {
-          ...outcome,
-          app: app.name,
-          source: app.source,
-        });
+        // One upgrade per app at a time: a second concurrent `install -g` for the
+        // same package is how a global install ends up half-written.
+        if (upgradesInFlight.has(app.name)) {
+          return sendJson(res, 409, {
+            error: "already_running",
+            message: `${app.name} is already being upgraded — wait for the first run to finish`,
+          });
+        }
+        upgradesInFlight.add(app.name);
+        try {
+          const outcome = await updateRunner(app);
+          return sendJson(res, outcome.ok ? 200 : 500, {
+            ...outcome,
+            app: app.name,
+            source: app.source,
+          });
+        } finally {
+          upgradesInFlight.delete(app.name);
+        }
       },
     })
   );
@@ -2214,6 +2275,9 @@ export function apply(ctx: CordisContext): () => void {
     }
     // Same reasoning for the latest-version results fetched from the registry.
     updatesCache = null;
+    // In-flight upgrades finish on their own; drop the bookkeeping so a later
+    // load of this plugin starts from an empty set.
+    upgradesInFlight.clear();
 
     ctx.logger?.info?.(
       "dsh-app-manager: plugin unloaded — web routes and tools removed, scan cache dropped"

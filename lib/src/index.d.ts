@@ -4,6 +4,17 @@
  */
 import type { CliApp, CordisContext } from "./types.js";
 import { type UpdateOutcome } from "./commands.js";
+/**
+ * Test seam for the platform branch above.
+ *
+ * `terminalInvocation` is pure, but the branch it takes depends on the host —
+ * so the argv shapes for all three platforms are only reachable through this
+ * export, and only one of them can ever run for real on a given machine.
+ */
+export declare function _terminalInvocationFor(platform: NodeJS.Platform, command: string, cwd: string): {
+    cmd: string;
+    args: string[];
+};
 export declare function _setActionHooks(hooks: {
     spawnTerminal?: (command: string, cwd: string) => {
         ok: boolean;
@@ -22,6 +33,8 @@ interface UpdatesPayload {
     }>;
     /** Apps we could not check (no version API for that source, or a failed lookup). */
     skipped: number;
+    /** True when the whole sweep was cut short by the deadline, so this is partial. */
+    truncated?: boolean;
 }
 /**
  * Cordis plugin apply function

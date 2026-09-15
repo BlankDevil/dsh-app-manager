@@ -38,6 +38,32 @@ export declare function checkUpdates(options?: CommandOptions): Promise<CliApp[]
  */
 export declare function showInfo(appName: string, options?: CommandOptions): Promise<void>;
 /**
+ * The command that upgrades one app, per source.
+ *
+ * Single source of truth for both the CLI (`app-manager update`) and the web
+ * page's upgrade button — if the two kept their own copies they would drift,
+ * and the page would promise a command the CLI no longer runs. Returns `null`
+ * for sources with no unattended upgrade path (pip/pipx/uv/cargo/PATH finds).
+ */
+export declare function updateCommandFor(app: CliApp): {
+    cmd: string;
+    args: string[];
+} | null;
+/** Everything a caller needs to report an upgrade, whether it succeeded or not. */
+export interface UpdateOutcome {
+    ok: boolean;
+    /** The exact command line that ran (or would have run). */
+    command: string;
+    /** Human-readable detail: the failure reason, or a short confirmation. */
+    detail: string;
+}
+/**
+ * Run the upgrade for one app and report the result instead of printing it.
+ *
+ * The CLI wraps this in console output; the web endpoint returns it as JSON.
+ */
+export declare function runUpdate(app: CliApp): Promise<UpdateOutcome>;
+/**
  * Update a specific app
  */
 export declare function updateApp(appName: string, options?: CommandOptions): Promise<void>;

@@ -484,6 +484,59 @@ export async function showInfo(appName: string, options: CommandOptions = {}): P
 }
 
 /**
+ * The command that upgrades one app, per source.
+ *
+ * Single source of truth for both the CLI (`app-manager update`) and the web
+ * page's upgrade button — if the two kept their own copies they would drift,
+ * and the page would promise a command the CLI no longer runs. Returns `null`
+ * for sources with no unattended upgrade path (pip/pipx/uv/cargo/PATH finds).
+ */
+export function updateCommandFor(app: CliApp): { cmd: string; args: string[] } | null {
+  switch (app.source) {
+    case "npm":
+      return { cmd: "npm.cmd", args: ["install", "-g", `${app.name}@latest`] };
+    case "pnpm":
+      return { cmd: "pnpm", args: ["add", "-g", `${app.name}@latest`] };
+    case "choco":
+      return { cmd: "choco", args: ["upgrade", app.name, "-y"] };
+    case "scoop":
+      return { cmd: "scoop", args: ["update", app.name] };
+    default:
+      return null;
+  }
+}
+
+/** Everything a caller needs to report an upgrade, whether it succeeded or not. */
+export interface UpdateOutcome {
+  ok: boolean;
+  /** The exact command line that ran (or would have run). */
+  command: string;
+  /** Human-readable detail: the failure reason, or a short confirmation. */
+  detail: string;
+}
+
+/**
+ * Run the upgrade for one app and report the result instead of printing it.
+ *
+ * The CLI wraps this in console output; the web endpoint returns it as JSON.
+ */
+export async function runUpdate(app: CliApp): Promise<UpdateOutcome> {
+  const spec = updateCommandFor(app);
+  if (!spec) {
+    return {
+      ok: false,
+      command: "(none)",
+      detail: `auto-update is not supported for ${app.source} packages — update it manually`,
+    };
+  }
+  const command = [spec.cmd, ...spec.args].join(" ");
+  const result = await execAsync(spec.cmd, spec.args);
+  if (result.success) return { ok: true, command, detail: `${app.name} updated` };
+  const reason = (result.error || "").trim().split("\n")[0] || "command failed";
+  return { ok: false, command, detail: reason };
+}
+
+/**
  * Update a specific app
  */
 export async function updateApp(appName: string, options: CommandOptions = {}): Promise<void> {
@@ -497,44 +550,14 @@ export async function updateApp(appName: string, options: CommandOptions = {}): 
 
   for (const app of matches) {
     console.log(colorize(`\n⬆️  Updating ${app.name}...`, "cyan"));
-
-    if (app.source === "npm") {
-      const result = await execAsync("npm.cmd", ["install", "-g", `${app.name}@latest`]);
-      if (result.success) {
-        console.log(colorize(`✅ ${app.name} updated successfully!`, "green"));
-      } else {
-        console.log(colorize(`❌ Failed to update ${app.name}:`, "red"));
-        console.log(colorize(result.error, "red"));
-      }
-    } else if (app.source === "pnpm") {
-      const result = await execAsync("pnpm", ["add", "-g", `${app.name}@latest`]);
-      if (result.success) {
-        console.log(colorize(`✅ ${app.name} updated successfully!`, "green"));
-      } else {
-        console.log(colorize(`❌ Failed to update ${app.name}:`, "red"));
-        console.log(colorize(result.error, "red"));
-      }
-    } else if (app.source === "choco") {
-      const result = await execAsync("choco", ["upgrade", app.name, "-y"]);
-      if (result.success) {
-        console.log(colorize(`✅ ${app.name} updated successfully!`, "green"));
-      } else {
-        console.log(colorize(`❌ Failed to update ${app.name}:`, "red"));
-      }
-    } else if (app.source === "scoop") {
-      const result = await execAsync("scoop", ["update", app.name]);
-      if (result.success) {
-        console.log(colorize(`✅ ${app.name} updated successfully!`, "green"));
-      } else {
-        console.log(colorize(`❌ Failed to update ${app.name}:`, "red"));
-      }
+    const outcome = await runUpdate(app);
+    if (outcome.ok) {
+      console.log(colorize(`✅ ${app.name} updated successfully!`, "green"));
+    } else if (updateCommandFor(app)) {
+      console.log(colorize(`❌ Failed to update ${app.name}:`, "red"));
+      console.log(colorize(outcome.detail, "red"));
     } else {
-      console.log(
-        colorize(
-          `⚠️  Auto-update not supported for ${app.source} packages. Please update manually.`,
-          "yellow"
-        )
-      );
+      console.log(colorize(`⚠️  Auto-update not supported for ${app.source} packages. Please update manually.`, "yellow"));
     }
   }
 }

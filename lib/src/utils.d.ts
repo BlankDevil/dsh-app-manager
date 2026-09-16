@@ -26,6 +26,12 @@ export declare function killProcessTree(child: {
     kill: (signal?: NodeJS.Signals) => boolean;
 }): void;
 /**
+ * Test seam for the two helpers above: they are pure, but the branch they take
+ * depends on the host (existing file / platform), so the space-handling cases
+ * are only reachable through this export on a machine that has a spaced path.
+ */
+export declare function _shellQuoteFor(platform: NodeJS.Platform, token: string): string;
+/**
  * Execute a command asynchronously.
  *
  * `timeout` is enforced with an explicit timer. This matters: `child_process
@@ -36,9 +42,10 @@ export declare function killProcessTree(child: {
  * `reg.exe`/`WMIC.exe`) blocks indefinitely when those are unavailable, so the
  * health check never returned.
  *
- * Note for callers: `shell` defaults to `true` on Windows, and Node does not
- * quote arguments for `cmd.exe`, so an argument containing spaces is split.
- * Pass argv as an array of space-free tokens, or set `shell: false`.
+ * Note for callers: `shell` defaults to `true` on Windows. `execAsync` now quotes
+ * argv itself (see `quoteForShell` / `shellCommand`), so a path containing spaces
+ * — `C:\Program Files\nodejs\node.exe`, or an app discovered under `Program Files`
+ * — survives the shell instead of being split at the first space.
  */
 export declare function execAsync(command: string, args?: string[], options?: {
     shell?: boolean | string;

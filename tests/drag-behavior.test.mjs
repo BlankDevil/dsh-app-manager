@@ -66,10 +66,19 @@ function resolveJsdom() {
 
 const JSDOM_SOURCE = resolveJsdom();
 if (!JSDOM_SOURCE) {
-  console.log("SKIP: jsdom not installed; cannot run behavioural drag tests.");
-  console.log("      install with: pnpm add -D jsdom");
-  console.log("      (or set DSH_TEST_JSDOM_DIR to a directory containing jsdom)");
-  process.exit(0);
+  // 退出码非 0，**不是** 0 —— 这是刻意的。
+  //
+  // 本文件曾在这里 `exit(0)`：缺 jsdom 时打印一行 SKIP 就"成功"结束，于是
+  // 「拖拽一条都没验」和「拖拽 13 条全过」在 CI 里长得一模一样。本仓库真的
+  // 被这个坑骗过一次（见 CHANGELOG 0.5.1：硬编码 jsdom 路径使 13 条检查
+  // 静默全跳过，CI 全绿而覆盖为零）。
+  //
+  // 现在：跳过 = 失败。要让它通过，就装 jsdom，或用 DSH_TEST_JSDOM_DIR 指过去。
+  console.error("FAIL: jsdom not installed; behavioural drag tests cannot run.");
+  console.error("      install with: pnpm add -D jsdom");
+  console.error("      (or set DSH_TEST_JSDOM_DIR to a directory containing it)");
+  console.error("      未验证 ≠ 通过 —— 本组跳过一律按失败处理（退出码 3）。");
+  process.exit(3);
 }
 
 const { JSDOM, VirtualConsole } = JSDOM_SOURCE.mod;

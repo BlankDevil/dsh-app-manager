@@ -70,6 +70,57 @@ export function killProcessTree(child: { pid?: number; kill: (signal?: NodeJS.Si
 }
 
 /**
+ * Quote one argv token so a shell keeps it intact.
+ *
+ * Node does not quote argv for `cmd.exe` (or for `sh -c`), so a single token
+ * containing a space was previously split in two — which is how a Node installed
+ * under `C:\Program Files\` failed with `'D:\Program' is not recognized…`, and how
+ * `-e "process.stdout.write('a b')"` became a syntax error.
+ *
+ * Only tokens that need it are touched: anything without whitespace is returned
+ * unchanged, and an already-quoted token is left alone so callers that quote
+ * deliberately (or tests that assert the old behaviour) keep working.
+ */
+function quoteForShell(token: string, isWin: boolean): string {
+  if (!/\s/.test(token)) return token;
+  if (/^".*"$/.test(token)) return token;
+  if (isWin) return `"${token}"`;
+  return `'${token.replace(/'/g, `'\\''`)}'`;
+}
+
+/**
+ * Prepare a `command` for a shell invocation.
+ *
+ * Deliberately conservative, because callers pass two different kinds of string:
+ *   1. an executable — possibly a full path with spaces
+ *      (`probeVersion(appCommand)` can hand us `C:\Program Files\…\tool.exe`);
+ *   2. a whole command *line* the shell is meant to parse
+ *      (`monitorProcesses` passes `pwsh -Command "… | …"`).
+ *
+ * Quoting case 2 would try to execute a file literally named
+ * `pwsh -Command "…"`, so the discriminator is `existsSync`: only a string that
+ * actually names an existing file is treated as a path and quoted. Anything else
+ * is handed to the shell untouched.
+ */
+function shellCommand(command: string, isWin: boolean): string {
+  if (!/\s/.test(command)) return command;
+  if (!existsSync(command)) return command;
+  return quoteForShell(command, isWin);
+}
+
+/**
+ * Test seam for the two helpers above: they are pure, but the branch they take
+ * depends on the host (existing file / platform), so the space-handling cases
+ * are only reachable through this export on a machine that has a spaced path.
+ */
+export function _shellQuoteFor(
+  platform: NodeJS.Platform,
+  token: string
+): string {
+  return quoteForShell(token, platform === "win32");
+}
+
+/**
  * Execute a command asynchronously.
  *
  * `timeout` is enforced with an explicit timer. This matters: `child_process
@@ -80,9 +131,10 @@ export function killProcessTree(child: { pid?: number; kill: (signal?: NodeJS.Si
  * `reg.exe`/`WMIC.exe`) blocks indefinitely when those are unavailable, so the
  * health check never returned.
  *
- * Note for callers: `shell` defaults to `true` on Windows, and Node does not
- * quote arguments for `cmd.exe`, so an argument containing spaces is split.
- * Pass argv as an array of space-free tokens, or set `shell: false`.
+ * Note for callers: `shell` defaults to `true` on Windows. `execAsync` now quotes
+ * argv itself (see `quoteForShell` / `shellCommand`), so a path containing spaces
+ * — `C:\Program Files\nodejs\node.exe`, or an app discovered under `Program Files`
+ * — survives the shell instead of being split at the first space.
  */
 export function execAsync(
   command: string,
@@ -91,11 +143,18 @@ export function execAsync(
 ): Promise<ExecResult> {
   return new Promise((resolve) => {
     const { timeout, ...spawnOptions } = options;
-    const child = spawn(command, args, {
-      stdio: ["pipe", "pipe", "pipe"],
-      shell: process.platform === "win32",
-      ...spawnOptions,
-    });
+    const useShell =
+      spawnOptions.shell === undefined ? process.platform === "win32" : Boolean(spawnOptions.shell);
+    const isWin = process.platform === "win32";
+    const child = spawn(
+      useShell ? shellCommand(command, isWin) : command,
+      useShell ? args.map((arg) => quoteForShell(arg, isWin)) : args,
+      {
+        stdio: ["pipe", "pipe", "pipe"],
+        shell: process.platform === "win32",
+        ...spawnOptions,
+      }
+    );
 
     let stdout = "";
     let stderr = "";

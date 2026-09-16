@@ -284,11 +284,22 @@ async function main() {
   // ============ C 组（路由 + JSON，产物供 D/E/A 组使用） ============
   group("C 组 · Web 路由与 JSON API");
 
-  await test("TC-C01", "路由注册面 = 4 条 exact", async () => {
+  await test("TC-C01", "路由注册面 = 7 条 exact", async () => {
     const paths = pluginCtx.routes.map((r) => `${r.kind} ${r.path}`);
-    assert(pluginCtx.routes.length === 4, `应注册 4 条路由，实际 ${pluginCtx.routes.length}`);
+    // 0.5.3 起为 4 条只读路由 + 3 条动作路由（open/updates/update）。
+    // 动作路由的**行为**（校验、并发、失败关闭）由 tests/actions.test.mjs 覆盖，
+    // 这里只守注册面：少一条就是接口凭空消失。
+    assert(pluginCtx.routes.length === 7, `应注册 7 条路由，实际 ${pluginCtx.routes.length}`);
     assert(pluginCtx.routes.every((r) => r.kind === "exact"), "存在非 exact 路由");
-    const expected = ["/app-manager", "/app-manager/api/apps", "/app-manager/api/unmanaged", "/app-manager/api/method"];
+    const expected = [
+      "/app-manager",
+      "/app-manager/api/apps",
+      "/app-manager/api/unmanaged",
+      "/app-manager/api/method",
+      "/app-manager/api/open",
+      "/app-manager/api/updates",
+      "/app-manager/api/update",
+    ];
     for (const p of expected) assert(paths.some((x) => x.endsWith(p)), `缺少路由 ${p}`);
     return paths.join(" | ");
   });
@@ -681,6 +692,23 @@ async function main() {
     return clip(lineOf(plain, "up to date") || lineOf(plain, "update(s)"), 80);
   });
 
+  // ============ 元断言：SKIP 不是通过 ============
+  //
+  // 为什么要有这条：本仓库吃过一次亏 —— 拖拽组在缺少 jsdom 时静默 SKIP 且
+  // 退出码为 0，CI 全绿而拖拽覆盖实际为零。「没验证」和「验证通过」必须分开：
+  // 跳过意味着这份报告不能用于放行，所以它计入失败（退出码非 0）。
+  //
+  // 代价是：离线环境跑本套件会因 ◆ 网络用例而失败 —— 这是刻意的，
+  // 请在网络可用时重跑，或看报告顶部确认哪几条没被验证。
+  await test("TC-Z01", "元断言：无 SKIP（未验证 ≠ 通过）", async () => {
+    const skips = results.filter((r) => r.status === "SKIP");
+    assert(
+      skips.length === 0,
+      `有 ${skips.length} 条被跳过（${skips.map((s) => s.id).join(", ")}）—— 跳过即视为失败，请在有网络的环境重跑`
+    );
+    return "0 skipped";
+  });
+
   // ============ 汇总与机器报告 ============
   const endedAt = new Date();
   const byStatus = (s) => results.filter((r) => r.status === s).length;
@@ -728,8 +756,12 @@ async function main() {
 
   console.log(`\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
   console.log(`结果: PASS ${pass} · FAIL ${fail} · ERROR ${err} · SKIP ${skipped} / 共 ${results.length}`);
+  if (skipped > 0) {
+    console.log(`⚠️  有 ${skipped} 条被跳过 —— 跳过即视为失败（未验证 ≠ 通过）`);
+  }
   console.log(`机器报告: ${reportPath}`);
-  process.exit(fail + err > 0 ? 1 : 0);
+  // SKIP 计入失败：见 TC-Z01 的说明。
+  process.exit(fail + err + skipped > 0 ? 1 : 0);
 }
 
 main().catch((e) => {

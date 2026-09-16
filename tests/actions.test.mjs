@@ -52,6 +52,18 @@ function abort(message) {
   process.exit(2);
 }
 
+/**
+ * 跳过 = 失败。
+ *
+ * 本仓库在拖拽组上吃过亏：缺 jsdom 时静默 SKIP 且退出码 0，CI 全绿而覆盖为零。
+ * 所以这里没有"SKIP 但不影响结果"的选项 —— 没验证就是没通过。
+ */
+function skipAsFailure(label, reason) {
+  checks += 1;
+  failures += 1;
+  console.log(`  FAIL  ${label} — 跳过即失败：${reason}`);
+}
+
 /* ------------------------------------------------------- 桩（绝不碰真机器） */
 
 const SENTINEL_TERMINAL = "STUB-TERMINAL-DO-NOT-SPAWN";
@@ -152,7 +164,7 @@ const npmApp = apps.find((a) => a.source === "npm");
 
 console.log("\n=== 2. 桩是否真的生效（不生效就中止，否则会真开窗口/真装包）===");
 if (!launchable) {
-  console.log("  SKIP  本机没有带命令的应用，无法验证桩");
+  skipAsFailure("终端桩有效性", "本机没有带命令的应用，无法验证 —— 跳过即失败");
 } else {
   const probe = await call(`${API}/api/open`, {
     method: "POST",
@@ -231,7 +243,7 @@ if (npmApp) {
   const again = await call(`${API}/api/update`, { method: "POST", url });
   check("释放后可再次执行", again.status, 200);
 } else {
-  console.log("  SKIP  本机没有 npm 来源的应用");
+  skipAsFailure("升级·并发保护", "本机没有 npm 来源的应用 —— 跳过即失败");
 }
 
 /* -------------------------------------------------------------------- 7 */

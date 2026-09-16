@@ -1,6 +1,6 @@
 # DSH App Manager — 产品需求文档 (PRD)
 
-> 版本：v0.4.0 · 状态：已实现 · 用途：作为后续更新/重建的完整功能基线
+> 版本：v0.5.3 · 状态：已实现并发布到 npm · 用途：作为后续更新/重建的完整功能基线
 
 ---
 
@@ -286,10 +286,16 @@ export function apply(ctx: CordisContext): () => void {
 
 ## 7. 已知限制
 
-- Windows 进程监控依赖 PowerShell 或 tasklist
-- `npm view` 查更新可能超时（私有包/scoped 包）
-- scoop/cargo/pipx 仅发现，自动更新覆盖不全
-- 页面无客户端交互（纯服务端渲染），暂无「点击启动」按钮
+- Windows 进程监控依赖 PowerShell 或 tasklist；非 Windows 未实现
+- `npm view` 查更新可能超时（私有包/scoped 包）；**更新检查只覆盖 npm / pnpm 来源** ——
+  cargo / pip / pipx / uv / scoop 与 PATH 发现的可执行文件没有等价的廉价版本查询接口，
+  会在结果里计为 `skipped` 而不是猜一个版本号
+- **页面动作（点击 NAME 开终端）依赖宿主机能弹出终端窗口**：无桌面会话（纯远程 / 容器）下
+  接口仍会成功返回，但终端不会出现在用户眼前；这类场景应改用 CLI
+- **终端窗口是 `detached` 的，不随插件卸载关闭** —— 它属于用户（可能正坐在 `claude` 里），
+  这是 `DESIGN.md` §6「dispose 清理子进程」的**唯一例外**
+- 升级动作会改写全局安装的包且不可撤销，因此页面必须先弹确认框（展示确切命令行）；
+  同一应用的并发升级会被拒（409），但**跨应用并发不做限制**
 - PATH 枚举为非递归：仅扫描 PATH 目录直接子文件，不递归子目录
 - ARP 判定依赖 `DisplayName`/`InstallLocation`，字段缺失的安装可能误判为非托管
 
@@ -303,6 +309,17 @@ export function apply(ctx: CordisContext): () => void {
 | 0.2.0 | TypeScript 重写 + DSH tools + 页面 |
 | 0.3.0 | Web Dashboard + 双语 README + 发布文档 |
 | 0.4.0 | PATH 枚举 + ARP 交叉比对 + 托管判定 + `unmanaged`/`method` 命令/tools/API |
+| 0.4.1 | 分类折叠 + 统计可点击 + 统一排版/列宽 + 适配 dsh 0.1.5-rc.1 工具契约（`output` 必填、`render` 返回 `ContentBlock[]`） |
+| 0.4.3 | 列宽可拖拽 + 溢出提示 + 分类拖拽换序 + 跨分类移行（本地持久化）+ 亮/暗主题 token |
+| 0.4.4 | 拖拽改用 Pointer Events（原生 DnD 完全不可用）+ 行为级拖拽测试（13 条） |
+| 0.4.5 | 行内 `commandExists` 逐命令 spawn 改为缓存的 PATH 索引（35.3s → 0ms）+ 加载期后台预热 |
+| 0.4.6 | 各来源 memo 化（页面热渲染 9.6s → 9ms）+ `doctor` 假问题修正（113 → 56 命令）+ `execAsync` 真正遵守 timeout |
+| 0.5.0 | 修复 macOS/Linux 的 npm/pnpm 全局发现（静默返回 0 条）+ `app_manager_update` 加审批门槛（fail closed） |
+| 0.5.1 | 发布就绪整改：peer 范围对齐宿主、锁文件纠正、拖拽测试不再硬编码路径（曾致 13 条静默跳过）、新增 CI |
+| 0.5.2 | 首个公开 npm 版本：描述与文档补上页面地址（`http://127.0.0.1:3080/app-manager`）、署名与关键词 |
+| 0.5.3 | **页面动作**：点击 NAME 开终端、更新检测、单个升级（确认后执行）；**规范化退出机制**（卸载后页面与工具立即失效）；`Status` 列改名 `On PATH`；新增 `test:actions`（44 条） |
+
+> 0.4.2 未单独发版（并入 0.4.3）；各版本的完整变更与理由见 `CHANGELOG.md`。
 
 ---
 

@@ -22,6 +22,24 @@ import path from "node:path";
 const TESTS_DIR = path.dirname(fileURLToPath(import.meta.url));
 const PLUGIN_DIR = path.resolve(TESTS_DIR, "..");
 
+/**
+ * 本进程的解释器 —— **原样**交给 `execAsync`，不加引号。
+ *
+ * 这正是回归点：先前 `execAsync` 把 command/argv 直接丢给 shell（Windows 上
+ * `shell: true`），而 Node 不为 cmd.exe 转义 argv，于是当 Node 装在
+ * `C:\Program Files\nodejs\`（路径含空格）时，命令被空格拆开，子进程以
+ * `'D:\Program' 不是内部或外部命令` 秒退 —— 下面两条用例会「假失败」：
+ * 子进程压根没起来，超时也就无从验证。
+ *
+ * 现在 `execAsync` 自己加引号（`quoteForShell` / `shellCommand`），所以这里
+ * 故意传原始路径：一旦有人把引用逻辑改回去，本组会立刻失败。
+ * 实测：修复前系统 Node 下 10/12、托管 Node 下 12/12；修复后两种都 12/12。
+ */
+const NODE_BIN = process.execPath;
+
+/** 宿主路径是否含空格 —— 决定下面哪条断言真正起作用。 */
+const HOST_PATH_HAS_SPACE = /\s/.test(process.execPath);
+
 const results = [];
 async function check(label, fn) {
   try {
@@ -286,7 +304,7 @@ await check("execAsync 遵守 timeout，不无限等待", async () => {
   const TIMEOUT_MS = 1500;
   const t0 = Date.now();
   const res = await utils.execAsync(
-    process.execPath,
+    NODE_BIN,
     ["-e", "setTimeout(function(){},60000)"],
     { timeout: TIMEOUT_MS }
   );
@@ -311,7 +329,7 @@ await check("execAsync 遵守 timeout，不无限等待", async () => {
 
 await check("execAsync 正常命令仍返回 stdout", async () => {
   const res = await utils.execAsync(
-    process.execPath,
+    NODE_BIN,
     ["-e", "process.stdout.write('ok-marker')"],
     { timeout: 15000 }
   );
@@ -321,6 +339,66 @@ await check("execAsync 正常命令仍返回 stdout", async () => {
     `stdout not captured: ${JSON.stringify(res.output)}`
   );
   return "stdout captured";
+});
+
+// ---------------------------------------------------------------------------
+// 含空格 argv 的引用回归（0.5.3 后补）
+//
+// 这三条锁住 `execAsync` 的引用行为。先前它把 command/argv 原样交给 shell，
+// Node 又不为 cmd.exe 转义，于是「路径含空格」与「参数含空格」都会被拆开。
+// ---------------------------------------------------------------------------
+
+await check("execAsync 引用含空格的命令路径", async () => {
+  if (!HOST_PATH_HAS_SPACE) {
+    // 无空格宿主：这条分支在这台机器上跑不到，但纯函数用例仍覆盖引用逻辑，
+    // 且 CI 的 Windows 作业通常装在 Program Files —— 那里会真正走到。
+    return "host execPath has no space; quoting logic covered by the pure-function case below";
+  }
+  const res = await utils.execAsync(
+    NODE_BIN,
+    ["-e", "process.stdout.write('spaced-path-ok')"],
+    { timeout: 15000 }
+  );
+  assert(res.success, `spaced command path failed: ${res.error}`);
+  assert(
+    res.output.includes("spaced-path-ok"),
+    `stdout missing: ${JSON.stringify(res.output)}`
+  );
+  return "spaced path ran as a single token";
+});
+
+await check("execAsync 引用含空格的参数", async () => {
+  // 这条在任何机器上都成立：脚本参数里带空格，必须原样传给子进程。
+  const res = await utils.execAsync(
+    process.execPath,
+    ["-e", "process.stdout.write('arg with spaces')"],
+    { timeout: 15000 }
+  );
+  assert(res.success, `expected success, got error="${res.error}"`);
+  assert(
+    res.output.includes("arg with spaces"),
+    `spaced argument was split or lost: ${JSON.stringify(res.output)}`
+  );
+  return "spaced argument preserved";
+});
+
+await check("引用函数：该加才加、已加不动", async () => {
+  const q = utils._shellQuoteFor;
+  assert(typeof q === "function", "_shellQuoteFor 未导出");
+  assert(
+    q("win32", "C:\\Program Files\\nodejs\\node.exe") === '"C:\\Program Files\\nodejs\\node.exe"',
+    "win32 下的含空格路径应加双引号"
+  );
+  assert(
+    q("linux", "/opt/my app/node") === "'/opt/my app/node'",
+    "POSIX 下的含空格路径应加单引号"
+  );
+  assert(q("win32", "npm.cmd") === "npm.cmd", "无空格 token 不应被改动");
+  assert(
+    q("win32", '"C:\\already quoted\\x.exe"') === '"C:\\already quoted\\x.exe"',
+    "已加引号的 token 不应被二次包裹"
+  );
+  return "4 条引用规则均符合预期";
 });
 
 // The page-render check is async; the sequential `await check(...)` calls

@@ -1,7 +1,20 @@
 # dsh-app-manager 测试用例规格
 
-版本：v5（对应插件 0.7.0 · dsh 0.1.5-rc.1 / 0.2.0-rc.2）
+版本：v7（对应插件 0.8.0 · dsh 0.1.5-rc.1 / 0.2.0-rc.2）
 状态基线：用例先于脚本编写；执行结果见 `reports/`。
+
+> **v7 相对 v6 的变化**：**报告必须写明本轮测的是哪些 app**。
+> 抽样随机化之后，「这份报告全绿」离开了样本就没有意义 —— 换一批样本可能就红，
+> 而报告里没写样本等于无法复现。故 ① `run-tests.mjs` 生成的 `reports/run-*.md`
+> 新增「本次测试用到的应用」表（用途 / 应用 / 来源 / 首命令 / 抽样方式）+ 禁用名单；
+> ② `actions.test.mjs` 新增落盘报告 `reports/actions-*.md`，含独立抽样表与收尾结论；
+> ③ 新增 `describeApp()` / `excludedPatterns()` 两个导出供两份报告共用。
+
+> **v6 相对 v5 的变化**：新增「已卸载清除 + 残留检测与可逆修复」，
+> 故 ① TC-C01 路由数 9 → **11**（新增 `/api/health`、`/api/leftover/fix`）；
+> ② K 组新增 6e（健康：已卸载与残留）一节；
+> ③ **被测应用改为每次运行随机抽样 4~6 个**（原来是 `apps.find()` 永远钉死第一个），
+>    K 组断言数因此随抽样结果浮动。
 
 > **v5 相对 v4 的变化**：页面新增「版本补齐 / 刷新 / 自动刷新 / PowerShell 默认」，
 > 故 ① TC-C01 路由数 7 → **9**（新增 `/api/versions`、`/api/refresh`）；
@@ -89,7 +102,7 @@
 
 | ID | 用例 | 步骤 | 预期 |
 |----|------|------|------|
-| TC-C01 | 路由注册面 | 遍历注册结果 | 恰好 **9** 条 `exact` 路由；路径集合 = 4 只读 + 3 动作 + 2 刷新（`/app-manager`、`/api/apps`、`/api/unmanaged`、`/api/method`、`/api/open`、`/api/updates`、`/api/update`、`/api/versions`、`/api/refresh`） |
+| TC-C01 | 路由注册面 | 遍历注册结果 | 恰好 **11** 条 `exact` 路由；路径集合 = 4 只读 + 3 动作 + 2 刷新 + 2 健康（`/app-manager`、`/api/apps`、`/api/unmanaged`、`/api/method`、`/api/open`、`/api/updates`、`/api/update`、`/api/versions`、`/api/refresh`、`/api/health`、`/api/leftover/fix`） |
 | TC-C02 | 页面响应 | GET `/app-manager` | 200；`content-type: text/html`；body 含 `<style>`、`<script>`、`<title>` |
 | TC-C03 | apps API | GET `/app-manager/api/apps` | 200；合法 JSON；`total>0`；`total===apps.length`；`managedCount+unmanagedCount===total`；每项含 `name/version/commands/source/managed/installKind/inPath` |
 | TC-C04 | unmanaged API | GET `/app-manager/api/unmanaged` | 200；合法 JSON；每项 `installKind !== "managed"` |
@@ -127,7 +140,7 @@
 - H 组 15 条 · 性能守卫（`node tests/perf-guard.test.mjs`）
 - I 组 15 条 · 跨平台全局路径（`node tests/crossplatform-paths.test.mjs`）
 - J 组 11 条 · 审批门槛（`node tests/approval-gate.test.mjs`）
-- K 组 65 条 · 页面动作与退出机制（`node tests/actions.test.mjs`）
+- K 组 · 页面动作与退出机制（`node tests/actions.test.mjs`）—— 断言数随随机抽样（4~6 个 app）浮动
 - L 组 16 条 · 宿主兼容性声明（`node tests/dsh-compat.test.mjs`）
 
 ---
@@ -267,7 +280,7 @@ TC-H03 的职责。真实 dsh 服务在插件 `apply()` 时有后台预热（`se
 
 ---
 
-## K 组 — 页面动作与退出机制（`actions.test.mjs`，44 条）
+## K 组 — 页面动作与退出机制（`actions.test.mjs`，断言数随抽样浮动）
 
 > 0.5.3 让页面不再只读：点击名字开终端、查更新、单个升级。这三个动作
 > **会改动真实机器**（弹终端窗口、执行全局安装），所以本组**真实调用插件注册的
@@ -306,6 +319,38 @@ TC-H03 的职责。真实 dsh 服务在插件 `apply()` 时有后台预热（`se
 | TC-K37–K41 | **版本补齐** | 200；返回体含 `resolved`/`unresolved`；确实探测过且 resolved 非空；二次请求命中缓存（不再探测）；`?refresh=1` 重新探测且带 `refresh` 标记 |
 | TC-K42–K48 | **刷新接口** | `GET` → 405（刷新必须 POST）；`POST` → 200 且返回 `apps` + `refreshedAt`；**确实重置了扫描缓存**（否则读到旧数据）；未指定 `versions` 时**不**做版本探测（自动刷新要便宜）；`versions=1` 时探测结果并入 app 清单 |
 | TC-K49–K51 | **shell 白名单** | `shell=cmd` 透传到终端；未指定时默认 `powershell`；`shell=evil;rm -rf` 这类非法值**回退默认**（白名单，不可能是任意 shell） |
+| TC-K52–K56 | **健康扫描** | `GET /api/health` → 200 且返回 `generatedAt` + `uninstalled` + `leftovers`；已卸载项**不出现在** `/api/apps` 里；`hiddenUninstalled` 计数已返回；`?refresh=1` 触发重新探测；二次请求命中缓存 |
+| TC-K57–K58 | **残留判定** | 命令跑不起来**且** PATH 上有 shim → 报为残留并带上文件清单；跑不起来但**无 shim**（是没有 bin 的库 / bin 名与包名不同，如 `ripgrep` 的可执行文件叫 `rg`）→ **不算**残留 |
+| TC-K59–K65 | **可逆修复** | `GET` → 405（移动文件必须 POST）；未知应用 404；`POST` → 200 且 `ok=true`，移动方式是**改名**（`.MOVED-STUB`）而非删除；磁盘未被真动（改名走桩）；修复后重置扫描缓存；复检发现已修好 → **409 `not_broken`**（拒绝动手）；无 shim 可移 → **409 `no_files`** |
+| TC-K66–K68 | **收尾·关闭打开的应用** | 启动动作全部走桩（无需要登记关闭的进程）；测试期间打开的应用**全部关闭成功**；收尾后**无遗留**应用进程（进程快照差集，只比对本次抽样接触过的命令，避免把用户自己开的程序算进去） |
+
+### 随机抽样：被测应用不再是固定的那几个
+
+`tests/sample-apps.mjs` 提供 `sampleApps(pool, {min:4, max:6})` 与 `pickOne(pool)`。
+
+- **K 组**：从「带命令的应用」里随机抽 4~6 个跑终端 / shell 白名单 / 残留修复断言；
+  从「npm 来源应用」里随机抽 4~6 个跑升级并发保护。
+- **主套件**：`info` / `search` 的目标应用（`TC-B08`、`TC-A04`、`TC-A12`）每次随机抽 1 个。
+- 抽到的名字会打印出来（`· 随机抽样 …`），便于复现失败的那一次。
+- **为什么**：`apps.find()` 永远返回同一个应用，而那个应用往往恰好是名字干净、命令规范、
+  路径正常的那个 —— 名字带空格、命令名与包名不同、路径特殊的应用可能一次都没被测过。
+- **副作用**：断言总数随抽样规模（4~6）浮动，不再是固定值。
+- **黑名单**：Fiddler 全家永不被抽中（`tests/sample-apps.mjs` 的 `EXCLUDED`，按
+  名称 / 安装路径 / 命令匹配）。实测排除项：`ExecAction`、`Fiddler`、`EnableLoopback`、
+  `TrustCert`、`ForceCPU`、`SFXWiz32`、`SFXWiz32-gcc`、`uninst`。
+  原因：跑 `ExecAction` 会**启动 Fiddler**，而 Fiddler 启动即把 Windows 系统代理开关
+  打到 `127.0.0.1:8888` —— 一个会偷偷改机器网络的"测试"不是测试。
+
+### 收尾：关闭测试打开的应用（`tests/close-apps.mjs`）
+
+- `snapshot()` 取进程快照（`tasklist /FO CSV`），`discoverLeaks(before, after, commands)`
+  做差集，只认**本次抽样接触过的命令**对应的进程。
+- `closeAll()` 先关登记的 PID（`registerOpened`），再关差集发现的遗留。
+- ⚠️ **必须用异步 `spawn`，不能用 `spawnSync`**：本机 `spawnSync` 对**任何**目标都返回
+  EBUSY，用了它快照就是空的、差集永远为 0，整个检查会退化成**永远通过的空检查**。
+  因此 `available()` 显式校验 `tasklist` 可用，不可用则按"跳过即失败"处理。
+- 关闭路径本身**实测过**：起一个无害的 `PING.EXE` → `killPid` → 进程表中确认消失。
+  否则"关闭"只是一段从没被执行过的代码 —— 空集合通过和坏掉的关闭长得一模一样。
 
 **为什么必须扣住旧 handler 直调**：卸载后路由已从宿主表摘除，若只对宿主路由表
 断言"404"，测的是宿主而非插件 —— 那正是"看起来通过、实际没测到"的坑。

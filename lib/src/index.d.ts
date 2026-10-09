@@ -36,6 +36,14 @@ export declare function _setActionHooks(hooks: {
         refresh?: boolean;
     }) => Promise<string | null>;
     resetScanCache?: () => void;
+    probeCommandHealth?: (app: CliApp, options?: {
+        refresh?: boolean;
+    }) => Promise<{
+        broken: boolean;
+        reason: string;
+    }>;
+    renameOrphanShim?: (file: string) => string;
+    findOrphanShims?: (command: string) => string[];
 }): void;
 interface UpdatesPayload {
     checkedAt: string;

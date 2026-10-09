@@ -18,6 +18,7 @@ import path from "node:path";
 // ---------- 环境常量 ----------
 const NODE = process.execPath;
 const TESTS_DIR = path.dirname(fileURLToPath(import.meta.url));
+import { pickOne, describeApp, excludedPatterns } from "./sample-apps.mjs";
 // The plugin root is the parent of this tests/ directory.
 const PLUGIN_DIR = path.resolve(TESTS_DIR, "..");
 const CLI = path.join(PLUGIN_DIR, "lib/bin/cli-app-manager.js");
@@ -212,6 +213,16 @@ function countOccurrences(haystack, needle) {
   return haystack.split(needle).length - 1;
 }
 
+// ---------- 本轮测试用到的应用（随机抽样，必须写进报告） ----------
+//
+// 抽样是随机的，所以「这份报告全绿」这句话离开了「打的是哪几个应用」就没有
+// 意义：同一份用例换个样本可能就红了。把样本写进报告，失败才可复现。
+const sampledApps = [];
+function recordSample(role, app, how) {
+  if (app) sampledApps.push({ role, app, how });
+  return app;
+}
+
 // ---------- 主流程 ----------
 async function main() {
   const startedAt = new Date();
@@ -237,6 +248,19 @@ async function main() {
     assert(JSON.stringify(plugin.inject) === JSON.stringify(["tools", "webServer"]), `inject 应为 [tools,webServer]，实际 ${JSON.stringify(plugin.inject)}`);
     return `name=${plugin.name} inject=${JSON.stringify(plugin.inject)}`;
   });
+
+  // info / search 的目标应用：随机抽，不再写死 "dsh"。
+  // 写死一个应用等于只测那一个 —— 名字、命令、路径都恰好"干净"的那一个。
+  const appsRoute = pluginCtx.routes.find((r) => r.path === "/app-manager/api/apps");
+  const appsProbe = await callRoute(appsRoute, "/app-manager/api/apps");
+  const discovered = (JSON.parse(appsProbe.body).apps || []).filter((a) => a.commands && a.commands.length > 0);
+  const infoTarget = recordSample(
+    "info / search 目标应用",
+    pickOne(discovered, "info/search 目标应用"),
+    `随机 1 / 池 ${discovered.length}`
+  );
+  assert(infoTarget, "本机没有带命令的应用，无法随机选目标");
+  console.log(`  本次抽样目标: ${describeApp(infoTarget)}`);
 
   await test("TC-B02", "apply 注册工具数 = 7", async () => {
     assert(pluginCtx.tools.length === 7, `应注册 7 个工具，实际 ${pluginCtx.tools.length}`);
@@ -289,10 +313,10 @@ async function main() {
     return `全量 ${nFull} → npm 过滤 ${nFiltered}`;
   });
 
-  await test("TC-B08", "工具·info 命中 dsh", async () => {
-    const out = String(await getTool("app_manager_info").execute({ name: "dsh" }, execSignal));
+  await test("TC-B08", `工具·info 命中 ${infoTarget.name}`, async () => {
+    const out = String(await getTool("app_manager_info").execute({ name: infoTarget.name }, execSignal));
     assert(out.includes("Version:"), "缺少 Version 字段");
-    assert(out.toLowerCase().includes("dsh"), "输出未包含 dsh");
+    assert(out.toLowerCase().includes(infoTarget.name.toLowerCase()), `输出未包含 ${infoTarget.name}`);
     return clip(out, 120);
   });
 
@@ -330,12 +354,13 @@ async function main() {
   // ============ C 组（路由 + JSON，产物供 D/E/A 组使用） ============
   group("C 组 · Web 路由与 JSON API");
 
-  await test("TC-C01", "路由注册面 = 9 条 exact", async () => {
+  await test("TC-C01", "路由注册面 = 11 条 exact", async () => {
     const paths = pluginCtx.routes.map((r) => `${r.kind} ${r.path}`);
-    // 4 条只读 + 3 条动作（open/updates/update）+ 2 条刷新（versions/refresh）。
-    // 动作与刷新路由的**行为**由 tests/actions.test.mjs 覆盖，这里只守注册面：
+    // 4 条只读 + 3 条动作（open/updates/update）+ 2 条刷新（versions/refresh）
+    // + 2 条健康（health/leftover/fix）。
+    // 动作、刷新与健康路由的**行为**由 tests/actions.test.mjs 覆盖，这里只守注册面：
     // 少一条就是接口凭空消失。
-    assert(pluginCtx.routes.length === 9, `应注册 9 条路由，实际 ${pluginCtx.routes.length}`);
+    assert(pluginCtx.routes.length === 11, `应注册 11 条路由，实际 ${pluginCtx.routes.length}`);
     assert(pluginCtx.routes.every((r) => r.kind === "exact"), "存在非 exact 路由");
     const expected = [
       "/app-manager",
@@ -347,6 +372,8 @@ async function main() {
       "/app-manager/api/update",
       "/app-manager/api/versions",
       "/app-manager/api/refresh",
+      "/app-manager/api/health",
+      "/app-manager/api/leftover/fix",
     ];
     for (const p of expected) assert(paths.some((x) => x.endsWith(p)), `缺少路由 ${p}`);
     return paths.join(" | ");
@@ -404,6 +431,9 @@ async function main() {
   // 为 update 守卫用例动态选取 path 来源应用（安全：非 npm/pnpm/choco/scoop 不会触发真实安装）
   const pathApp = appsJson?.apps.find((a) => a.source === "path");
   pathAppName = pathApp?.name ?? null;
+  if (pathApp) {
+    recordSample("update 守卫目标（必须被拒绝）", pathApp, "首个 path 来源（确定性）");
+  }
 
   // ============ D 组（UI 需求断言） ============
   group("D 组 · UI 需求断言");
@@ -603,8 +633,8 @@ async function main() {
     return clip(lineOf(bySource, "path:"), 60);
   });
 
-  await test("TC-A04", "info dsh", async () => {
-    const r = await runCli(["info", "dsh"]);
+  await test("TC-A04", `info ${infoTarget.name}`, async () => {
+    const r = await runCli(["info", infoTarget.name]);
     assert(r.code === 0, `退出码 ${r.code}`);
     const plain = r.stdout.replace(/\x1b\[[0-9;]*m/g, "");
     assert(plain.includes("Version:"), "缺少 Version 字段");
@@ -677,12 +707,14 @@ async function main() {
     return clip(lineOf(r.stdout, "instance") || lineOf(r.stdout, "not running") || "无运行实例", 80);
   });
 
-  await test("TC-A12", "search 搜索", async () => {
-    const r = await runCli(["search", "dsh"]);
+  await test("TC-A12", `search 搜索 ${infoTarget.name}`, async () => {
+    const r = await runCli(["search", infoTarget.name]);
     assert(r.code === 0, `退出码 ${r.code}`);
     const plain = r.stdout.replace(/\x1b\[[0-9;]*m/g, "");
     assert(plain.includes("Found") || plain.includes("No apps found"), "缺少结果行");
-    if (plain.includes("Found")) assert(plain.toLowerCase().includes("dsh"), "结果未包含 dsh");
+    if (plain.includes("Found")) {
+      assert(plain.toLowerCase().includes(infoTarget.name.toLowerCase()), `结果未包含 ${infoTarget.name}`);
+    }
     return clip(lineOf(plain, "Found") || "No apps found", 80);
   });
 
@@ -778,7 +810,22 @@ async function main() {
   md += `- 开始: ${startedAt.toLocaleString("zh-CN")} · 结束: ${endedAt.toLocaleString("zh-CN")} · 耗时: ${Math.round((endedAt - startedAt) / 1000)}s\n`;
   md += `- 结果: **PASS ${pass} · FAIL ${fail} · ERROR ${err} · SKIP ${skipped}**（共 ${results.length} 条）\n\n`;
 
-  md += `## 分组汇总\n\n| 组 | PASS | FAIL | ERROR | SKIP | 合计 |\n|---|---|---|---|---|---|\n`;
+  // ---------- 本轮打的是哪些应用 ----------
+  md += `## 本次测试用到的应用\n\n`;
+  md += `应用是**每次运行随机抽取**的（本套件：info/search 随机 1 个；动作组另抽 4~6 个）。\n`;
+  md += `脱离样本谈「全绿」没有意义 —— 换个样本可能就红，所以样本必须写进报告，失败才可复现。\n\n`;
+  md += `| 用途 | 应用 | 来源 | 首命令 | 抽样方式 |\n|---|---|---|---|---|\n`;
+  if (sampledApps.length === 0) {
+    md += `| — | — | — | — | 本轮未选中任何应用 |\n`;
+  }
+  for (const s of sampledApps) {
+    md += `| ${s.role} | \`${s.app.name}\` | ${s.app.source ?? "?"} | \`${s.app.commands?.[0] ?? "—"}\` | ${s.how} |\n`;
+  }
+  md += `\n禁用名单（永远不会成为测试对象，命中即剔除）：\n\n`;
+  md += excludedPatterns().map((p) => `- \`${p}\``).join("\n") + `\n`;
+  md += `\n> 动作组（\`tests/actions.test.mjs\`）另有一份独立抽样，写在该套件自己的 \`tests/reports/actions-*.md\` 里。\n`;
+
+  md += `\n## 分组汇总\n\n| 组 | PASS | FAIL | ERROR | SKIP | 合计 |\n|---|---|---|---|---|---|\n`;
   for (const g of groups) {
     const rs = results.filter((r) => r.group === g);
     md += `| ${g} | ${rs.filter((r) => r.status === "PASS").length} | ${rs.filter((r) => r.status === "FAIL").length} | ${rs.filter((r) => r.status === "ERROR").length} | ${rs.filter((r) => r.status === "SKIP").length} | ${rs.length} |\n`;
@@ -807,6 +854,7 @@ async function main() {
   if (skipped > 0) {
     console.log(`⚠️  有 ${skipped} 条被跳过 —— 跳过即视为失败（未验证 ≠ 通过）`);
   }
+  console.log(`本次抽中的应用: ${sampledApps.length ? sampledApps.map((s) => describeApp(s.app)).join(" / ") : "（无）"}`);
   console.log(`机器报告: ${reportPath}`);
   // SKIP 计入失败：见 TC-Z01 的说明。
   process.exit(fail + err + skipped > 0 ? 1 : 0);

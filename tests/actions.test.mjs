@@ -22,8 +22,17 @@
  * 运行：node tests/actions.test.mjs
  */
 
+import { mkdirSync, writeFileSync } from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { apply, _setActionHooks, _terminalInvocationFor } from "../lib/src/index.js";
 import { _resetScanCache } from "../lib/src/discovery.js";
+import { sampleApps, describeApp, excludedPatterns } from "./sample-apps.mjs";
+import { snapshot, available, discoverLeaks, closeAll, openedCount } from "./close-apps.mjs";
+
+const STARTED_AT = new Date();
+const TESTS_DIR = path.dirname(fileURLToPath(import.meta.url));
+const REPORTS_DIR = path.join(TESTS_DIR, "reports");
 
 /* ------------------------------------------------------------------ 断言 */
 
@@ -67,7 +76,14 @@ function skipAsFailure(label, reason) {
 /* ------------------------------------------------------- 桩（绝不碰真机器） */
 
 const SENTINEL_TERMINAL = "STUB-TERMINAL-DO-NOT-SPAWN";
-const calls = { spawn: [], update: [], collect: 0, versionProbes: [], scanResets: 0 };
+const calls = { spawn: [], update: [], collect: 0, versionProbes: [], scanResets: 0, healthProbes: [], renames: [] };
+
+/**
+ * 健康扫描的可变桩状态。
+ * 定位器（findOrphanShims）也桩掉：否则测试会读到**本机真实 PATH**，
+ * 换一台机器结果就飘。
+ */
+const healthStub = { broken: new Set(), shims: new Map() };
 
 _setActionHooks({
   spawnTerminal: (command, cwd, shell) => {
@@ -95,6 +111,19 @@ _setActionHooks({
       updates: { "stub-pkg": { current: "1.0.0", latest: "2.0.0", command: "STUB install -g stub-pkg@latest" } },
       skipped: 0,
     };
+  },
+  // 「命令还能不能跑」是子进程级的动作，桩掉：坏/好由 healthStub.broken 说了算。
+  probeCommandHealth: async (app, options) => {
+    calls.healthProbes.push({ name: app.name, refresh: Boolean(options?.refresh) });
+    const broken = healthStub.broken.has(app.name);
+    return { broken, reason: broken ? "stub: Cannot find module 'x'" : "" };
+  },
+  // 残留文件定位：桩掉，测试不碰本机 PATH。
+  findOrphanShims: (command) => healthStub.shims.get(command) ?? [],
+  // 移动文件是**改名**，桩掉：测试绝不能真的动磁盘上的任何文件。
+  renameOrphanShim: (file) => {
+    calls.renames.push(file);
+    return `${file}.MOVED-STUB`;
   },
 });
 
@@ -165,23 +194,55 @@ for (const p of [
 
 const appsRes = await call(`${API}/api/apps`);
 const apps = appsRes.body.apps || [];
-const launchable = apps.find((a) => a.commands && a.commands.length > 0);
-const npmApp = apps.find((a) => a.source === "npm");
+
+// 每次运行随机抽 4~6 个（而不是永远钉死在 find() 找到的第一个）：
+// 只测一个"干净"的应用会把整类 bug 藏起来 —— 名字带空格、命令名与包名不同、
+// 路径含特殊字符的应用可能一次都没被测过。
+console.log("=== 本次运行的 app 抽样 ===");
+const launchables = sampleApps(
+  apps.filter((a) => a.commands && a.commands.length > 0),
+  { label: "可启动应用" }
+);
+const npmApps = sampleApps(
+  apps.filter((a) => a.source === "npm"),
+  { label: "npm 应用" }
+);
+
+// 样本就是「这轮测试打的是谁」。随机抽样之后，脱离样本的结论无法复现，
+// 所以既要打在屏幕上，也要落进报告文件。
+const sampleRows = [];
+for (const a of launchables) sampleRows.push(["可启动应用", a]);
+for (const a of npmApps) if (!launchables.includes(a)) sampleRows.push(["npm 应用", a]);
+for (const [role, a] of sampleRows) {
+  console.log(`  → ${role}: ${describeApp(a)}`);
+}
+if (sampleRows.length === 0) {
+  console.log("  → 本次没有抽到任何应用（池为空）");
+}
+
+// 进程快照：收尾时用它证明"本次运行没有留下任何被打开的应用"。
+// tasklist 不可用时必须大声失败 —— 否则这个检查会退化成永远通过的空检查。
+const procBefore = await snapshot();
+if (!(await available())) {
+  skipAsFailure("进程快照可用", "tasklist 不可用 —— 收尾关闭检查会变成空检查，拒绝静默放行");
+}
 
 /* -------------------------------------------------------------------- 2 */
 
 console.log("\n=== 2. 桩是否真的生效（不生效就中止，否则会真开窗口/真装包）===");
-if (!launchable) {
+if (launchables.length === 0) {
   skipAsFailure("终端桩有效性", "本机没有带命令的应用，无法验证 —— 跳过即失败");
 } else {
-  const probe = await call(`${API}/api/open`, {
-    method: "POST",
-    url: `${API}/api/open?name=${encodeURIComponent(launchable.name)}`,
-  });
-  if (probe.body.detail !== SENTINEL_TERMINAL) {
-    abort(`终端桩未生效（detail=${JSON.stringify(probe.body.detail)}）—— 拒绝继续，可能真的开了终端`);
+  for (const app of launchables) {
+    const probe = await call(`${API}/api/open`, {
+      method: "POST",
+      url: `${API}/api/open?name=${encodeURIComponent(app.name)}`,
+    });
+    if (probe.body.detail !== SENTINEL_TERMINAL) {
+      abort(`终端桩未生效（detail=${JSON.stringify(probe.body.detail)}）—— 拒绝继续，可能真的开了终端`);
+    }
+    check(`终端桩生效（返回哨兵）· ${app.name}`, probe.body.detail, SENTINEL_TERMINAL);
   }
-  check("终端桩生效（返回哨兵）", probe.body.detail, SENTINEL_TERMINAL);
 }
 
 /* -------------------------------------------------------------------- 3 */
@@ -190,16 +251,16 @@ console.log("\n=== 3. /api/open 的校验与取数 ===");
 check("GET 被拒（链接/预取不能开终端）", (await call(`${API}/api/open`)).status, 405);
 check("未知应用 404", (await call(`${API}/api/open`, { method: "POST", url: `${API}/api/open?name=__nope__` })).status, 404);
 check("缺 name 参数 404", (await call(`${API}/api/open`, { method: "POST" })).status, 404);
-if (launchable) {
+for (const app of launchables) {
   const before = calls.spawn.length;
   const res = await call(`${API}/api/open`, {
     method: "POST",
-    url: `${API}/api/open?name=${encodeURIComponent(launchable.name)}`,
+    url: `${API}/api/open?name=${encodeURIComponent(app.name)}`,
   });
-  check("已知应用 200", res.status, 200);
-  check("确实调用了桩", calls.spawn.length, before + 1);
-  check("跑的是该应用的第一个命令（来自 discovery）", calls.spawn.at(-1).command, launchable.commands[0]);
-  assert("cwd 非空（应用目录或主目录）", typeof res.body.cwd === "string" && res.body.cwd.length > 0);
+  check(`已知应用 200 · ${app.name}`, res.status, 200);
+  check(`确实调用了桩 · ${app.name}`, calls.spawn.length, before + 1);
+  check(`跑的是该应用的第一个命令（来自 discovery）· ${app.name}`, calls.spawn.at(-1).command, app.commands[0]);
+  assert(`cwd 非空（应用目录或主目录）· ${app.name}`, typeof res.body.cwd === "string" && res.body.cwd.length > 0);
 }
 
 /* -------------------------------------------------------------------- 4 */
@@ -249,23 +310,25 @@ check("?refresh=1 强制重采", calls.collect, 2);
 console.log("\n=== 6. /api/update 的校验、执行与并发保护 ===");
 check("GET 被拒（链接/预取不能装包）", (await call(`${API}/api/update`)).status, 405);
 check("未知应用 404", (await call(`${API}/api/update`, { method: "POST", url: `${API}/api/update?name=__nope__` })).status, 404);
-if (npmApp) {
-  const url = `${API}/api/update?name=${encodeURIComponent(npmApp.name)}`;
-  // 同时发两个：桩每次 150ms，必然重叠 —— 第二个必须被挡下
-  const [a, b] = await Promise.all([
-    call(`${API}/api/update`, { method: "POST", url }),
-    call(`${API}/api/update`, { method: "POST", url }),
-  ]);
-  const statuses = [a.status, b.status].sort((x, y) => x - y);
-  check("并发同一应用：一个成功", statuses[0], 200);
-  check("并发同一应用：另一个 409", statuses[1], 409);
-  check("实际只执行了一次", calls.update.filter((n) => n === npmApp.name).length, 1);
-
-  // 串行再跑一次应该又能成功（锁已释放）
-  const again = await call(`${API}/api/update`, { method: "POST", url });
-  check("释放后可再次执行", again.status, 200);
-} else {
+if (npmApps.length === 0) {
   skipAsFailure("升级·并发保护", "本机没有 npm 来源的应用 —— 跳过即失败");
+} else {
+  for (const app of npmApps) {
+    const url = `${API}/api/update?name=${encodeURIComponent(app.name)}`;
+    // 同时发两个：桩每次 150ms，必然重叠 —— 第二个必须被挡下
+    const [a, b] = await Promise.all([
+      call(`${API}/api/update`, { method: "POST", url }),
+      call(`${API}/api/update`, { method: "POST", url }),
+    ]);
+    const statuses = [a.status, b.status].sort((x, y) => x - y);
+    check(`并发同一应用：一个成功 · ${app.name}`, statuses[0], 200);
+    check(`并发同一应用：另一个 409 · ${app.name}`, statuses[1], 409);
+    check(`实际只执行了一次 · ${app.name}`, calls.update.filter((n) => n === app.name).length, 1);
+
+    // 串行再跑一次应该又能成功（锁已释放）
+    const again = await call(`${API}/api/update`, { method: "POST", url });
+    check(`释放后可再次执行 · ${app.name}`, again.status, 200);
+  }
 }
 
 /* -------------------------------------------------------------------- 6b */
@@ -311,16 +374,117 @@ assert(
 /* -------------------------------------------------------------------- 6d */
 
 console.log("\n=== 6d. 点击启动：shell 白名单（默认 PowerShell）===");
-if (launchable) {
-  const url = `${API}/api/open?name=${encodeURIComponent(launchable.name)}`;
-  await call(`${API}/api/open`, { method: "POST", url: `${url}&shell=cmd` });
-  check("shell=cmd 透传到终端", calls.spawn.at(-1).shell, "cmd");
-  await call(`${API}/api/open`, { method: "POST", url });
-  check("未指定时默认 powershell", calls.spawn.at(-1).shell, "powershell");
-  await call(`${API}/api/open`, { method: "POST", url: `${url}&shell=evil%3Brm+-rf` });
-  check("非法值回退默认（白名单，不可能是任意 shell）", calls.spawn.at(-1).shell, "powershell");
-} else {
+if (launchables.length === 0) {
   skipAsFailure("shell 白名单", "本机没有带命令的应用 —— 跳过即失败");
+} else {
+  for (const app of launchables) {
+    const url = `${API}/api/open?name=${encodeURIComponent(app.name)}`;
+    await call(`${API}/api/open`, { method: "POST", url: `${url}&shell=cmd` });
+    check(`shell=cmd 透传到终端 · ${app.name}`, calls.spawn.at(-1).shell, "cmd");
+    await call(`${API}/api/open`, { method: "POST", url });
+    check(`未指定时默认 powershell · ${app.name}`, calls.spawn.at(-1).shell, "powershell");
+    await call(`${API}/api/open`, { method: "POST", url: `${url}&shell=evil%3Brm+-rf` });
+    check(`非法值回退默认（白名单，不可能是任意 shell）· ${app.name}`, calls.spawn.at(-1).shell, "powershell");
+  }
+}
+
+/* -------------------------------------------------------------------- 6e */
+
+console.log("\n=== 6e. 健康：已卸载与残留（只读扫描 + 可逆修复）===");
+
+const health1 = await call(`${API}/api/health`);
+check("GET /api/health 200", health1.status, 200);
+assert(
+  "返回生成时间与两个清单（已卸载 / 残留）",
+  typeof health1.body.generatedAt === "string" &&
+    Array.isArray(health1.body.uninstalled) &&
+    Array.isArray(health1.body.leftovers)
+);
+
+const appsAfterHealth = await call(`${API}/api/apps`);
+const listedNames = new Set((appsAfterHealth.body.apps || []).map((a) => a.name));
+check(
+  "已卸载项已从列表清除（不会泄漏进表格）",
+  (health1.body.uninstalled || []).filter((u) => listedNames.has(u.name)).length,
+  0
+);
+check("hiddenUninstalled 计数已返回", typeof appsAfterHealth.body.hiddenUninstalled, "number");
+
+const probesBefore = calls.healthProbes.length;
+await call(`${API}/api/health`, { url: `${API}/api/health?refresh=1` });
+assert("?refresh=1 触发重新探测", calls.healthProbes.length > probesBefore);
+const probesAfter = calls.healthProbes.length;
+await call(`${API}/api/health`);
+check("第二次命中缓存（不再探测）", calls.healthProbes.length, probesAfter);
+
+check("GET 被拒（移动文件必须 POST）", (await call(`${API}/api/leftover/fix`)).status, 405);
+check(
+  "未知应用 404",
+  (
+    await call(`${API}/api/leftover/fix`, {
+      method: "POST",
+      url: `${API}/api/leftover/fix?name=__nope__`,
+    })
+  ).status,
+  404
+);
+
+if (launchables.length === 0) {
+  skipAsFailure("残留修复", "本机没有带命令的应用 —— 跳过即失败");
+} else {
+  for (const app of launchables) {
+    const target = encodeURIComponent(app.name);
+    healthStub.broken.add(app.name);
+    healthStub.shims.set(app.commands[0], ["C:/fake/stub-shim", "C:/fake/stub-shim.cmd"]);
+
+    const health2 = await call(`${API}/api/health`, { url: `${API}/api/health?refresh=1` });
+    const leftover = (health2.body.leftovers || []).find((l) => l.name === app.name);
+    assert(`跑不起来的命令被报为残留 · ${app.name}`, Boolean(leftover));
+    check(`残留带上了 shim 文件清单 · ${app.name}`, leftover.files.length, 2);
+
+    // 命令跑不起来，但 PATH 上什么都没有 → 不是残留（是没有 bin 的库 / bin 名不同），不报
+    healthStub.shims.set(app.commands[0], []);
+    const health3 = await call(`${API}/api/health`, { url: `${API}/api/health?refresh=1` });
+    check(
+      `无 shim 的坏命令不算残留（库或 bin 名与包名不同）· ${app.name}`,
+      (health3.body.leftovers || []).filter((l) => l.name === app.name).length,
+      0
+    );
+    healthStub.shims.set(app.commands[0], ["C:/fake/stub-shim", "C:/fake/stub-shim.cmd"]);
+
+    const resetsBeforeFix = calls.scanResets;
+    const fix = await call(`${API}/api/leftover/fix`, {
+      method: "POST",
+      url: `${API}/api/leftover/fix?name=${target}`,
+    });
+    check(`POST 200 · ${app.name}`, fix.status, 200);
+    check(`ok=true · ${app.name}`, fix.body.ok, true);
+    check(`移动了两个 shim · ${app.name}`, fix.body.moved.length, 2);
+    check(`磁盘没被真动（改名用的是桩）· ${app.name}`, calls.renames.length >= 2, true);
+    assert(`移动方式是改名而非删除 · ${app.name}`, String(fix.body.moved[0].to).endsWith(".MOVED-STUB"));
+    assert(`修复后重置了扫描缓存 · ${app.name}`, calls.scanResets > resetsBeforeFix);
+
+    // 复检刚做完就要动手的工具：它已经被重装/修好 → 什么都不许动
+    healthStub.broken.delete(app.name);
+    const notBroken = await call(`${API}/api/leftover/fix`, {
+      method: "POST",
+      url: `${API}/api/leftover/fix?name=${target}`,
+    });
+    check(`复检发现已修好 → 409 · ${app.name}`, notBroken.status, 409);
+    check(`错误码 not_broken（拒绝动手）· ${app.name}`, notBroken.body.error, "not_broken");
+
+    // 还是坏的，但没有任何脚本 shim 可移（真正的 .exe 永不作为候选）
+    healthStub.broken.add(app.name);
+    healthStub.shims.set(app.commands[0], []);
+    const noFiles = await call(`${API}/api/leftover/fix`, {
+      method: "POST",
+      url: `${API}/api/leftover/fix?name=${target}`,
+    });
+    check(`没有 shim 可移 → 409 · ${app.name}`, noFiles.status, 409);
+    check(`错误码 no_files · ${app.name}`, noFiles.body.error, "no_files");
+
+    healthStub.broken.delete(app.name);
+  }
 }
 
 /* -------------------------------------------------------------------- 7 */
@@ -361,7 +525,63 @@ for (const [p, handler] of Object.entries(stale)) {
 teardown();
 check("重复卸载不抛错", "ok", "ok");
 
+/* -------------------------------------------------------------------- 9 */
+
+console.log("\n=== 9. 收尾：关闭测试期间打开的应用 ===");
+// 只有"本次运行接触过的应用"才算测试遗留：拿全体进程做差集会把用户自己开的程序也算进去。
+const touchedCommands = [...launchables, ...npmApps].flatMap((a) => a.commands || []);
+const leaked = discoverLeaks(procBefore, await snapshot(), touchedCommands);
+for (const l of leaked) console.log(`  · 发现遗留进程：${l.image} (PID ${l.pid})`);
+
+const closed = await closeAll(leaked);
+for (const l of closed.leaked) {
+  console.log(`  · 已关闭 ${l.image} (PID ${l.pid})：${l.closed ? "成功" : "失败"}`);
+}
+check("启动动作全部走桩（没有需要登记关闭的进程）", openedCount(), 0);
+check(
+  "测试期间打开的应用全部关闭成功",
+  closed.leaked.filter((l) => !l.closed).length,
+  0
+);
+check(
+  "收尾后无遗留应用进程",
+  discoverLeaks(procBefore, await snapshot(), touchedCommands).length,
+  0
+);
+
 /* -------------------------------------------------------------------- */
 
 console.log(`\n=== 结果：${checks - failures}/${checks} 通过${failures ? `，${failures} 项失败 ✗` : " ✓"} ===`);
+
+/* --------------------------------------------------------------- 报告落盘 */
+
+const pad = (n) => String(n).padStart(2, "0");
+const stamp = `${STARTED_AT.getFullYear()}-${pad(STARTED_AT.getMonth() + 1)}-${pad(STARTED_AT.getDate())}_${pad(STARTED_AT.getHours())}${pad(STARTED_AT.getMinutes())}${pad(STARTED_AT.getSeconds())}`;
+let md = "";
+md += `# 动作组报告 actions-${stamp}\n\n`;
+md += `> 由 tests/actions.test.mjs 自动生成（页面动作 / 健康残留 / 收尾关闭）\n\n`;
+md += `- 结果: **${checks - failures}/${checks} 通过${failures ? ` · ${failures} 项失败` : ""}**\n`;
+md += `- 开始: ${STARTED_AT.toLocaleString("zh-CN")} · 运行时: Node ${process.version} @ ${process.platform}\n\n`;
+md += `## 本次测试用到的应用\n\n`;
+md += `每次运行随机抽 4~6 个。样本写在这里，是为了让「通过」这句话可复现 ——\n`;
+md += `换一批样本可能就红，而报告里没有样本就等于无法定位。\n\n`;
+md += `| 用途 | 应用 | 来源 | 首命令 | 安装路径 |\n|---|---|---|---|---|\n`;
+if (sampleRows.length === 0) {
+  md += `| — | — | — | — | 本轮未抽到应用 |\n`;
+}
+for (const [role, a] of sampleRows) {
+  md += `| ${role} | \`${a.name}\` | ${a.source ?? "?"} | \`${a.commands?.[0] ?? "—"}\` | \`${a.path ?? "—"}\` |\n`;
+}
+md += `\n禁用名单（永远不会成为测试对象，命中即剔除）：\n\n`;
+md += excludedPatterns().map((p) => `- \`${p}\``).join("\n") + `\n\n`;
+md += `## 收尾\n\n`;
+md += `- 测试期间登记打开的进程数: ${openedCount()}（应为 0 —— 三个动作全部走桩）\n`;
+md += `- 遗留进程: ${leaked.length} · 已关闭: ${closed.leaked.filter((l) => l.closed).length} · 关闭失败: ${closed.leaked.filter((l) => !l.closed).length}\n`;
+md += `- 复检后仍残留: ${discoverLeaks(procBefore, await snapshot(), touchedCommands).length}\n`;
+
+mkdirSync(REPORTS_DIR, { recursive: true });
+const reportPath = path.join(REPORTS_DIR, `actions-${stamp}.md`);
+writeFileSync(reportPath, md, "utf8");
+console.log(`动作组报告: ${reportPath}`);
+
 process.exit(failures === 0 ? 0 : 1);

@@ -238,6 +238,20 @@ function detectCliFromPackageJson(pkgPath: string, pkgName: string): CliApp | nu
   const pkg = readPackageJson(pkgPath);
   if (!pkg) return null;
 
+  /**
+   * The installed directory name is NOT the package name.
+   *
+   * npm puts packages whose name starts with a digit into a hashed directory —
+   * `9router` lands in `node_modules/.9router-wssQRq4J` — while the shims it
+   * generates still point at the *logical* path `node_modules/9router/...`.
+   * Reading the name off the directory therefore shows the user a string like
+   * `.9router-wssQRq4J`, which is meaningless to them.
+   *
+   * The manifest is authoritative; the directory name is only a fallback for
+   * packages that somehow ship without a `name`.
+   */
+  const canonicalName = typeof pkg.name === "string" && pkg.name.trim() ? pkg.name.trim() : pkgName;
+
   const commands: string[] = [];
   /** Names explicitly declared in `package.json#bin` — always authoritative. */
   const declared = new Set<string>();
@@ -247,8 +261,8 @@ function detectCliFromPackageJson(pkgPath: string, pkgName: string): CliApp | nu
   // keys are taken.
   if (pkg.bin) {
     if (typeof pkg.bin === "string") {
-      commands.push(basename(pkgName));
-      declared.add(basename(pkgName).toLowerCase());
+      commands.push(basename(canonicalName));
+      declared.add(basename(canonicalName).toLowerCase());
     } else if (typeof pkg.bin === "object" && pkg.bin !== null) {
       for (const key of Object.keys(pkg.bin)) {
         commands.push(key);
@@ -294,9 +308,9 @@ function detectCliFromPackageJson(pkgPath: string, pkgName: string): CliApp | nu
 
   if (normalised.length === 0) return null;
 
-  const known = KNOWN_CLI_PACKAGES[pkgName];
+  const known = KNOWN_CLI_PACKAGES[canonicalName] ?? KNOWN_CLI_PACKAGES[pkgName];
   return {
-    name: pkgName,
+    name: canonicalName,
     version: typeof pkg.version === "string" ? pkg.version : "unknown",
     commands: [...new Set(normalised)],
     category: known?.category || "other",

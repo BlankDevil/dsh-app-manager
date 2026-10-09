@@ -11,6 +11,48 @@ interface CommandOptions {
 }
 /** Drop the version-probe cache (used by tests and after installs). */
 export declare function resetVersionCache(): void;
+/** Why this app may not be run; `null` means it may. */
+export declare function refuseToExecute(app: {
+    name?: string;
+    path?: string;
+    commands?: string[];
+}): string | null;
+/**
+ * The program files a shim asks its interpreter to run.
+ *
+ * Only **script** targets are returned, never the interpreter: a shim
+ * references its interpreter conditionally (`IF EXIST "%dp0%\node.exe" … ELSE
+ * node`), so a missing `.exe` there is normal and must not read as "broken".
+ */
+export declare function shimTargets(file: string): string[];
+/**
+ * Is this leftover really broken? **Pure** — it reads the shim and checks what
+ * the shim points at. No child process is spawned.
+ */
+export declare function brokenShimReason(files: string[]): string | null;
+/**
+ * The script shims a command leaves in PATH directories.
+ *
+ * Only `cmd` / `bat` / `ps1` and the extensionless POSIX wrapper — a real
+ * `.exe` is a program, not a leftover, and is never a candidate.
+ */
+export declare function shimFilesOnPath(command: string): string[];
+/**
+ * Is this app's command a leftover from an uninstall?
+ *
+ * Deliberately **does not run the command**. It used to (`<cmd> --version`,
+ * then pattern-match the failure), which meant one child process per app on
+ * every sweep — and on this machine that executed Fiddler's `ExecAction`,
+ * starting Fiddler and flipping the system proxy. Static analysis answers the
+ * same question: a shim whose target no longer exists *is* the leftover, and
+ * reading a file cannot start a program.
+ */
+export declare function probeCommandHealth(app: CliApp, _options?: {
+    refresh?: boolean;
+}): Promise<{
+    broken: boolean;
+    reason: string;
+}>;
 /**
  * Pull a version-looking token out of probe output.
  *

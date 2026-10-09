@@ -12,6 +12,32 @@ interface CommandOptions {
 /** Drop the version-probe cache (used by tests and after installs). */
 export declare function resetVersionCache(): void;
 /**
+ * Pull a version-looking token out of probe output.
+ *
+ * Deliberately permissive on shape and strict on "has digits and dots": the
+ * outputs in the wild are `v22.22.2`, `2.1.293 (Claude Code)`,
+ * `Docker version 28.4.0, build d8eb465`, `Docker Compose version v2.39.2-desktop.1`,
+ * `0.34.0` … A strict parser would reject half of them, and the token is shown
+ * as-is next to the app, not compared unless a numeric version is needed.
+ */
+export declare function extractVersionToken(text: string): string | null;
+/**
+ * Resolve an app's displayed version.
+ *
+ * Package-manager sources already carry a version from their manifest, so they
+ * are answered without spawning anything. Everything else — the ~2/3 of a real
+ * machine that is discovered by **PATH enumeration** (portable tools, and shims
+ * whose package directory is gone) — has no metadata at all, which is why the
+ * table used to show `unknown` for most rows. For those we probe the tool
+ * itself: `<cmd> --version`, falling back to `-v` (some tools only accept the
+ * short form).
+ *
+ * Returns `null` when the tool does not answer or answers without a version.
+ */
+export declare function resolveAppVersion(app: CliApp, options?: {
+    refresh?: boolean;
+}): Promise<string | null>;
+/**
  * List all discovered CLI applications
  */
 export declare function listApps(options?: CommandOptions): Promise<void>;

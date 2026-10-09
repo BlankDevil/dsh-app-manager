@@ -1,7 +1,12 @@
 # dsh-app-manager 测试用例规格
 
-版本：v4（对应插件 0.6.0 · dsh 0.1.5-rc.1 / 0.2.0-rc.2）
+版本：v5（对应插件 0.7.0 · dsh 0.1.5-rc.1 / 0.2.0-rc.2）
 状态基线：用例先于脚本编写；执行结果见 `reports/`。
+
+> **v5 相对 v4 的变化**：页面新增「版本补齐 / 刷新 / 自动刷新 / PowerShell 默认」，
+> 故 ① TC-C01 路由数 7 → **9**（新增 `/api/versions`、`/api/refresh`）；
+> ② K 组新增 6b（版本补齐）、6c（刷新）、6d（shell 白名单）三节，共 +21 条断言；
+> ③ win32 终端形态断言由 cmd 改为 **PowerShell 默认 + cmd 可选**。
 
 > **v4 相对 v3 的变化**：新增 **L 组**（`dsh-compat.test.mjs`，16 条）守住宿主兼容性声明。
 > 背景：插件能否在某个 dsh 上**加载**，取决于 `package.json` 的 peer 范围 ——
@@ -84,7 +89,7 @@
 
 | ID | 用例 | 步骤 | 预期 |
 |----|------|------|------|
-| TC-C01 | 路由注册面 | 遍历注册结果 | 恰好 **7** 条 `exact` 路由；路径集合 = 4 只读 + 3 动作（`/app-manager`、`/api/apps`、`/api/unmanaged`、`/api/method`、`/api/open`、`/api/updates`、`/api/update`） |
+| TC-C01 | 路由注册面 | 遍历注册结果 | 恰好 **9** 条 `exact` 路由；路径集合 = 4 只读 + 3 动作 + 2 刷新（`/app-manager`、`/api/apps`、`/api/unmanaged`、`/api/method`、`/api/open`、`/api/updates`、`/api/update`、`/api/versions`、`/api/refresh`） |
 | TC-C02 | 页面响应 | GET `/app-manager` | 200；`content-type: text/html`；body 含 `<style>`、`<script>`、`<title>` |
 | TC-C03 | apps API | GET `/app-manager/api/apps` | 200；合法 JSON；`total>0`；`total===apps.length`；`managedCount+unmanagedCount===total`；每项含 `name/version/commands/source/managed/installKind/inPath` |
 | TC-C04 | unmanaged API | GET `/app-manager/api/unmanaged` | 200；合法 JSON；每项 `installKind !== "managed"` |
@@ -122,7 +127,7 @@
 - H 组 15 条 · 性能守卫（`node tests/perf-guard.test.mjs`）
 - I 组 15 条 · 跨平台全局路径（`node tests/crossplatform-paths.test.mjs`）
 - J 组 11 条 · 审批门槛（`node tests/approval-gate.test.mjs`）
-- K 组 44 条 · 页面动作与退出机制（`node tests/actions.test.mjs`）
+- K 组 65 条 · 页面动作与退出机制（`node tests/actions.test.mjs`）
 - L 组 16 条 · 宿主兼容性声明（`node tests/dsh-compat.test.mjs`）
 
 ---
@@ -283,7 +288,8 @@ TC-H03 的职责。真实 dsh 服务在插件 `apply()` 时有后台预热（`se
 | TC-K06 | 开终端·已知应用 | → 200，且**确实调用了桩** |
 | TC-K07 | 命令来自 discovery | 跑的是该应用的第一个命令（实测取到 `9router`），不是请求里塞的 |
 | TC-K08 | cwd 非空 | 应用目录或主目录 |
-| TC-K09–K11 | win32 终端形态 | 解释器 `cmd.exe`；参数含**空标题**（否则 `start` 会把命令当窗口标题）；`/k` 保持窗口；命令在末位 |
+| TC-K09–K11 | win32 终端形态（**默认 PowerShell**） | 解释器 `cmd.exe`（借 `start` 开新窗口）；参数含**空标题**（否则命令会被当成窗口标题）；第三个参数为 `pwsh.exe` 或 `powershell.exe`；含 `-NoExit`（保持窗口）与 `-Command`；命令在末位 |
+| TC-K11b–K11d | win32 · cmd 模式 | 显式 `shell=cmd` 时回落到旧形态：`cmd.exe` + `/k` |
 | TC-K12–K14 | darwin 终端形态 | 走 `open`；含 `Terminal`；命令带 cwd |
 | TC-K15–K16 | linux 终端形态 | 走 `x-terminal-emulator`；命令带 cwd |
 | TC-K17–K19 | 更新检查 | 200；返回体含 `updates`；首次采集调用桩一次 |
@@ -297,6 +303,9 @@ TC-H03 的职责。真实 dsh 服务在插件 `apply()` 时有后台预热（`se
 | TC-K29 | 卸载·路由清空 | dispose 后宿主路由表为 0 |
 | TC-K30–K35 | **卸载·fail closed** | 扣住卸载前的旧 handler 直调：三条动作路由全部 404 且带 `no-store` |
 | TC-K36 | 重复卸载 | 不抛错（幂等） |
+| TC-K37–K41 | **版本补齐** | 200；返回体含 `resolved`/`unresolved`；确实探测过且 resolved 非空；二次请求命中缓存（不再探测）；`?refresh=1` 重新探测且带 `refresh` 标记 |
+| TC-K42–K48 | **刷新接口** | `GET` → 405（刷新必须 POST）；`POST` → 200 且返回 `apps` + `refreshedAt`；**确实重置了扫描缓存**（否则读到旧数据）；未指定 `versions` 时**不**做版本探测（自动刷新要便宜）；`versions=1` 时探测结果并入 app 清单 |
+| TC-K49–K51 | **shell 白名单** | `shell=cmd` 透传到终端；未指定时默认 `powershell`；`shell=evil;rm -rf` 这类非法值**回退默认**（白名单，不可能是任意 shell） |
 
 **为什么必须扣住旧 handler 直调**：卸载后路由已从宿主表摘除，若只对宿主路由表
 断言"404"，测的是宿主而非插件 —— 那正是"看起来通过、实际没测到"的坑。

@@ -1,7 +1,7 @@
 # DSH App Manager — 发布上线指南
 
 > 本文档只写**当前真实状态**与**已验证过的事实**。每条命令都在本机执行过。
-> 最后核对：2026-10-09，插件版本 **0.6.0**，宿主 dsh **0.1.5-rc.1 / 0.2.0-rc.2**
+> 最后核对：2026-10-09，插件版本 **0.7.0**，宿主 dsh **0.1.5-rc.1 / 0.2.0-rc.2**
 > （两条线都支持；契约逐项对照见 `COMPATIBILITY.md`）。
 
 ---
@@ -42,7 +42,7 @@ DSH 会：用 pnpm 把包装进 profile → 读 `package.json` 的 `dsh.bundle.p
 | LICENSE | ✅ MIT | |
 | CHANGELOG | ✅ | Keep a Changelog + semver |
 | README | ✅ 双语 | 含平台支持矩阵、扫描方法论、已知限制 |
-| 测试 | ✅ | 196 项全过：套件 52 + 页面动作 44 + 宿主兼容 16 + 性能 15 + 跨平台 15 + 拖拽 13 + 审批 11 + 冒烟 22 + 修复回归 8 |
+| 测试 | ✅ | 217 项全过：套件 52 + 页面动作 65 + 宿主兼容 16 + 性能 15 + 跨平台 15 + 拖拽 13 + 审批 11 + 冒烟 22 + 修复回归 8 |
 | CI | ✅ | `.github/workflows/ci.yml`（ubuntu 构建 + Windows 全量测试） |
 | `peerDependencies` | ✅ | `@deepseek-ai/dsh-tools: ^0.1.5-rc.1 \|\| ^0.2.0-rc.2`（覆盖两条宿主线；**范围会被宿主校验，写窄=装不上**） |
 | lockfile | ✅ | 与 package.json 一致；`pnpm install --frozen-lockfile` 通过 |

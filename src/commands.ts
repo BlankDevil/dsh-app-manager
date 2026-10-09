@@ -82,18 +82,96 @@ export function resetVersionCache(): void {
  * Probe `cmd --version`, memoised. Returns `{ ok, output }` where `ok` means
  * the process exited 0. Uses the async spawn path so concurrent probes really
  * do overlap (see `execAsync`).
+ *
+ * `refresh` bypasses the memo (the page's refresh button/re-resolve path needs
+ * a genuinely fresh answer, not the cached failure from a tool that has since
+ * been repaired).
  */
-async function probeVersion(cmd: string): Promise<{ ok: boolean; output: string }> {
+async function probeVersion(
+  cmd: string,
+  options: { refresh?: boolean } = {}
+): Promise<{ ok: boolean; output: string }> {
   const hit = versionProbeCache.get(cmd);
-  if (hit && Date.now() - hit.at < VERSION_CACHE_TTL_MS) {
+  if (!options.refresh && hit && Date.now() - hit.at < VERSION_CACHE_TTL_MS) {
     return { ok: hit.ok, output: hit.output };
   }
+  if (options.refresh) versionProbeCache.delete(cmd);
   const res = await execAsync(cmd, ["--version"], {
     shell: process.platform === "win32",
     timeout: VERSION_PROBE_TIMEOUT_MS,
   });
   const entry = { ok: res.success, output: res.output.trim(), at: Date.now() };
   versionProbeCache.set(cmd, entry);
+  return { ok: entry.ok, output: entry.output };
+}
+
+/**
+ * Pull a version-looking token out of probe output.
+ *
+ * Deliberately permissive on shape and strict on "has digits and dots": the
+ * outputs in the wild are `v22.22.2`, `2.1.293 (Claude Code)`,
+ * `Docker version 28.4.0, build d8eb465`, `Docker Compose version v2.39.2-desktop.1`,
+ * `0.34.0` … A strict parser would reject half of them, and the token is shown
+ * as-is next to the app, not compared unless a numeric version is needed.
+ */
+export function extractVersionToken(text: string): string | null {
+  const m = String(text).match(/\d+\.\d+(?:\.\d+)?(?:[-.+][0-9A-Za-z.-]+)?/);
+  return m ? m[0] : null;
+}
+
+/**
+ * Resolve an app's displayed version.
+ *
+ * Package-manager sources already carry a version from their manifest, so they
+ * are answered without spawning anything. Everything else — the ~2/3 of a real
+ * machine that is discovered by **PATH enumeration** (portable tools, and shims
+ * whose package directory is gone) — has no metadata at all, which is why the
+ * table used to show `unknown` for most rows. For those we probe the tool
+ * itself: `<cmd> --version`, falling back to `-v` (some tools only accept the
+ * short form).
+ *
+ * Returns `null` when the tool does not answer or answers without a version.
+ */
+export async function resolveAppVersion(
+  app: CliApp,
+  options: { refresh?: boolean } = {}
+): Promise<string | null> {
+  const declared = (app.version ?? "").trim();
+  if (declared && declared !== "unknown") return declared;
+  const cmd = app.commands?.[0];
+  if (!cmd) return null;
+
+  for (const flag of ["--version", "-v"]) {
+    const res = await probeVersionFlag(cmd, flag, options);
+    if (!res.ok) continue;
+    const token = extractVersionToken(res.output);
+    if (token) return token;
+  }
+  return null;
+}
+
+/**
+ * Probe one command with an explicit flag, through the same memo as
+ * `probeVersion` (keyed by `cmd + flag`, so `--version` and `-v` do not
+ * overwrite each other's answers).
+ */
+async function probeVersionFlag(
+  cmd: string,
+  flag: string,
+  options: { refresh?: boolean } = {}
+): Promise<{ ok: boolean; output: string }> {
+  if (flag === "--version") return await probeVersion(cmd, options);
+  const key = `${cmd} ${flag}`;
+  const hit = versionProbeCache.get(key);
+  if (!options.refresh && hit && Date.now() - hit.at < VERSION_CACHE_TTL_MS) {
+    return { ok: hit.ok, output: hit.output };
+  }
+  const res = await execAsync(cmd, [flag], {
+    shell: process.platform === "win32",
+    timeout: VERSION_PROBE_TIMEOUT_MS,
+  });
+  const entry = { ok: res.success, output: res.output.trim(), at: Date.now() };
+  versionProbeCache.set(key, entry);
   return { ok: entry.ok, output: entry.output };
 }
 

@@ -67,11 +67,11 @@ function skipAsFailure(label, reason) {
 /* ------------------------------------------------------- 桩（绝不碰真机器） */
 
 const SENTINEL_TERMINAL = "STUB-TERMINAL-DO-NOT-SPAWN";
-const calls = { spawn: [], update: [], collect: 0 };
+const calls = { spawn: [], update: [], collect: 0, versionProbes: [], scanResets: 0 };
 
 _setActionHooks({
-  spawnTerminal: (command, cwd) => {
-    calls.spawn.push({ command, cwd });
+  spawnTerminal: (command, cwd, shell) => {
+    calls.spawn.push({ command, cwd, shell });
     return { ok: true, detail: SENTINEL_TERMINAL };
   },
   runUpdate: async (app) => {
@@ -79,6 +79,14 @@ _setActionHooks({
     // 故意慢一点：并发保护只有在真正重叠时才看得出来
     await new Promise((r) => setTimeout(r, 150));
     return { ok: true, command: `STUB install -g ${app.name}@latest`, detail: "stubbed" };
+  },
+  // 版本探测是子进程级的动作，桩掉：测试不去真的问本机工具。
+  resolveAppVersion: async (app, options) => {
+    calls.versionProbes.push({ name: app.name, refresh: Boolean(options?.refresh) });
+    return app.name.startsWith("__none__") ? null : "9.9.9-stub";
+  },
+  resetScanCache: () => {
+    calls.scanResets += 1;
   },
   collectUpdates: async () => {
     calls.collect += 1;
@@ -197,11 +205,25 @@ if (launchable) {
 /* -------------------------------------------------------------------- 4 */
 
 console.log("\n=== 4. 三平台终端调用形态（纯函数，逐平台断言）===");
+// Windows 默认改为 PowerShell（用户要求）：pwsh 优先、否则 Windows PowerShell 5.1。
 const win = _terminalInvocationFor("win32", "9router", "C:\\work");
 check("win32 解释器", win.cmd, "cmd.exe");
-assert("win32 参数含空标题（否则命令会被 start 当成窗口标题）", win.args[2] === "" && win.args[3] === "cmd.exe");
-check("win32 /k 保持窗口", win.args[4], "/k");
-check("win32 命令在末位", win.args[5], "9router");
+assert("win32 参数含空标题（否则命令会被 start 当成窗口标题）", win.args[2] === "" && win.args[3] !== "");
+assert(
+  "win32 默认用 PowerShell",
+  /^(pwsh|powershell)\.exe$/.test(String(win.args[3])),
+  `实际 ${JSON.stringify(win.args[3])}`
+);
+assert("PowerShell 用 -NoExit 保持窗口", win.args.includes("-NoExit"));
+assert("PowerShell 用 -Command 传命令", win.args.includes("-Command"));
+check("win32 命令在末位", win.args.at(-1), "9router");
+
+// cmd 仍可选（白名单里的另一个值），形态与旧版一致。
+const winCmd = _terminalInvocationFor("win32", "9router", "C:\\work", "cmd");
+check("cmd 模式用 cmd.exe", winCmd.args[3], "cmd.exe");
+check("cmd 模式 /k 保持窗口", winCmd.args[4], "/k");
+check("cmd 模式命令在末位", winCmd.args[5], "9router");
+
 const mac = _terminalInvocationFor("darwin", "9router", "/tmp/x");
 check("darwin 走 open", mac.cmd, "open");
 assert("darwin 参数含 Terminal", mac.args.includes("Terminal"));
@@ -244,6 +266,61 @@ if (npmApp) {
   check("释放后可再次执行", again.status, 200);
 } else {
   skipAsFailure("升级·并发保护", "本机没有 npm 来源的应用 —— 跳过即失败");
+}
+
+/* -------------------------------------------------------------------- 6b */
+
+console.log("\n=== 6b. 版本补齐（PATH 应用无包元数据 → 逐个探测）===");
+const v1 = await call(`${API}/api/versions`);
+check("状态 200", v1.status, 200);
+assert(
+  "返回体含 resolved 与 unresolved",
+  typeof v1.body.resolved === "object" && Array.isArray(v1.body.unresolved)
+);
+assert(
+  "确实探测过且有结果",
+  calls.versionProbes.length > 0 && Object.keys(v1.body.resolved).length > 0,
+  `探测 ${calls.versionProbes.length} 次，resolved ${Object.keys(v1.body.resolved).length} 个`
+);
+const probesAfterFirst = calls.versionProbes.length;
+await call(`${API}/api/versions`);
+check("第二次命中缓存（不再探测）", calls.versionProbes.length, probesAfterFirst);
+await call(`${API}/api/versions`, { url: `${API}/api/versions?refresh=1` });
+assert("?refresh=1 触发重新探测", calls.versionProbes.length > probesAfterFirst);
+check("重新探测带上了 refresh 标记", calls.versionProbes.at(-1).refresh, true);
+
+/* -------------------------------------------------------------------- 6c */
+
+console.log("\n=== 6c. 刷新（手动与自动共用同一接口）===");
+check("GET 被拒（刷新必须 POST）", (await call(`${API}/api/refresh`)).status, 405);
+const resetsBefore = calls.scanResets;
+const r1 = await call(`${API}/api/refresh`, { method: "POST", url: `${API}/api/refresh` });
+check("POST 200", r1.status, 200);
+assert("返回 app 清单与 refreshedAt", Array.isArray(r1.body.apps) && typeof r1.body.refreshedAt === "string");
+check("确实重置了扫描缓存（否则读到的是旧数据）", calls.scanResets, resetsBefore + 1);
+check("未指定 versions 时不做版本探测（自动刷新要便宜）", r1.body.versions, undefined);
+
+const r2 = await call(`${API}/api/refresh`, { method: "POST", url: `${API}/api/refresh?versions=1` });
+assert("versions=1 时返回探测结果", typeof r2.body.versions?.resolved === "object");
+assert(
+  "探测到的版本已并入 app 清单",
+  r2.body.apps.filter((a) => a.version === "9.9.9-stub").length > 0,
+  "清单里没有 9.9.9-stub"
+);
+
+/* -------------------------------------------------------------------- 6d */
+
+console.log("\n=== 6d. 点击启动：shell 白名单（默认 PowerShell）===");
+if (launchable) {
+  const url = `${API}/api/open?name=${encodeURIComponent(launchable.name)}`;
+  await call(`${API}/api/open`, { method: "POST", url: `${url}&shell=cmd` });
+  check("shell=cmd 透传到终端", calls.spawn.at(-1).shell, "cmd");
+  await call(`${API}/api/open`, { method: "POST", url });
+  check("未指定时默认 powershell", calls.spawn.at(-1).shell, "powershell");
+  await call(`${API}/api/open`, { method: "POST", url: `${url}&shell=evil%3Brm+-rf` });
+  check("非法值回退默认（白名单，不可能是任意 shell）", calls.spawn.at(-1).shell, "powershell");
+} else {
+  skipAsFailure("shell 白名单", "本机没有带命令的应用 —— 跳过即失败");
 }
 
 /* -------------------------------------------------------------------- 7 */

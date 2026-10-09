@@ -5,6 +5,66 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] - 2026-10-09
+
+The page can now show **real versions** for the tools it discovers, refresh
+itself on demand or on a timer, and launch apps in PowerShell.
+
+### Fixed
+
+- **Most rows showed `unknown` as the version.** The table rendered whatever
+  discovery had, and only package-manager sources *have* a version — everything
+  found by **PATH enumeration** (portable tools, and any shim whose package
+  directory is gone) has no manifest to read. On this machine that was **43 of
+  62 apps (69%)**: `codex`, `kimi`, `rg`, the Docker helpers, …
+
+  Those apps are now probed directly (`<cmd> --version`, falling back to `-v`)
+  and the extracted version replaces `unknown` in the table. Measured before
+  the change: **25 of 43** PATH apps answer with a version; the rest genuinely
+  do not expose one, and now say so in the cell tooltip instead of looking
+  broken.
+
+  Probing spawns a child process per app, so it runs **after** first paint
+  (never inside the render loop — that is what made the page slow in 0.4.5),
+  with a 6-wide worker pool, a 30-second deadline that reports `truncated`, and
+  a 10-minute server-side cache.
+
+  Note this also surfaces *broken installs* rather than hiding them: `codex`
+  does not answer because its package directory is missing from the global
+  tree (`Cannot find module …@openai\codex\bin\codex.js`) — the cell now shows
+  the probe failed, which is the honest answer.
+
+### Added
+
+- **Refresh button** (`⟳ 刷新`) — drops the scan caches, re-reads discovery and
+  re-probes versions, then updates the table in place (versions, `On PATH`
+  status, the four counters) without losing scroll position or filters. It also
+  asks the registry for updates, since an explicit click is worth the extra
+  seconds. `POST /app-manager/api/refresh`; the app-set is compared first — if
+  apps appeared or disappeared, the page reloads rather than pretending the old
+  rows are still valid.
+- **Auto-refresh** — a picker (off / 30s / 60s / 5min, persisted) that refreshes
+  on that interval, **pauses while the tab is hidden**, and refreshes once
+  immediately when the tab becomes visible again. The toolbar shows how long
+  ago the last refresh happened and which interval is active.
+- **`GET /app-manager/api/versions`** — resolves the apps that have no declared
+  version (`?refresh=1` bypasses the cache) and reports `resolved` /
+  `unresolved`.
+- **PowerShell is now the default shell when clicking an app name** (was
+  `cmd`), with a picker between `PowerShell` and `cmd` persisted per browser.
+  `pwsh` (PowerShell 7) is preferred when installed, else Windows PowerShell
+  5.1; both via `start "" <shell> -NoExit -Command <cmd>`, so the window stays
+  open exactly like `/k` did. The shell travels as `?shell=` and is validated
+  against a **whitelist** — the browser chooses between two known values and
+  can never select an arbitrary shell.
+
+### Notes
+
+- The version probe and the update check are deliberately separate: the first
+  answers "what is installed" (local, cheap-ish, always useful) and the second
+  answers "is something newer published" (network, npm/pnpm only). A refresh
+  does both because a human asked; the auto-refresh timer does only the first.
+
 ## [0.6.0] - 2026-10-09
 
 Support for **dsh 0.2.0-rc.2** (the new host line). No runtime code changed —

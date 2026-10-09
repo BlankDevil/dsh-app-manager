@@ -10,7 +10,7 @@
  *   - 退出码 0 = 无 FAIL；1 = 存在 FAIL
  */
 
-import { spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import path from "node:path";
@@ -91,17 +91,63 @@ async function test(id, title, fn) {
 }
 
 // ---------- 工具函数 ----------
-function runCli(args, timeoutMs = 180000) {
-  const r = spawnSync(NODE, [CLI, ...args], {
-    encoding: "utf8",
-    timeout: timeoutMs,
-    maxBuffer: 64 * 1024 * 1024,
-    env: process.env,
+/**
+ * 跑一次 CLI，返回 { code, stdout, stderr, timedOut }。
+ *
+ * **刻意用异步 `spawn` 而不是 `spawnSync`**：本机运行环境下 `spawnSync` 对**任何**
+ * 目标都返回 `EBUSY`（连 `spawnSync("cmd.exe", ["/c","echo","hi"])` 都是 EBUSY），
+ * 而异步 `spawn` 完全正常 —— 实测同一个 node 二进制：sync 8ms 报 EBUSY、
+ * async 247ms 正常返回 code=0。这是宿主环境的限制，与插件代码无关，但会让
+ * A 组 18 条全部"失败"，且报出来只是光秃秃的「退出码 null」，极易误判成被测程序的问题。
+ *
+ * 异步版还顺带避开了同步阻塞：全量套件里 A 组最长要等 300s（doctor）。
+ */
+async function runCli(args, timeoutMs = 180000) {
+  return await new Promise((resolve) => {
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(result);
+    };
+    const child = spawn(NODE, [CLI, ...args], {
+      stdio: ["ignore", "pipe", "pipe"],
+      env: process.env,
+      windowsHide: true,
+    });
+    const timer = setTimeout(() => {
+      try {
+        child.kill();
+      } catch {
+        /* already gone */
+      }
+      finish({ code: null, stdout, stderr: `TIMEOUT after ${timeoutMs}ms`, timedOut: true });
+    }, timeoutMs);
+    child.stdout?.on("data", (d) => {
+      stdout += d;
+    });
+    child.stderr?.on("data", (d) => {
+      stderr += d;
+    });
+    // 子进程压根没起来时，把原因带出来 —— 否则只看到「退出码 null」。
+    child.on("error", (e) => {
+      finish({ code: null, stdout, stderr: `SPAWN FAILED ${e.code ?? ""}: ${e.message}`, timedOut: false });
+    });
+    // ⚠️ 结算以 **exit**（进程已结束）为准，而不是 close（stdio EOF）。
+    // 原因：被测 CLI 会派生子进程，若某个孙进程在被超时清理后**仍持有继承来的
+    // stdout 管道**，close 永远不会触发 —— 于是测试卡满整个 timeout（实测
+    // TC-A10 doctor 就是这样挂到 300s 的，而 CLI 其实早已跑完并打印了汇总）。
+    // 进程退出后再给一小段时间冲刷剩余输出即可。
+    child.on("exit", (code, signal) => {
+      setTimeout(() => finish({ code, stdout, stderr, timedOut: false, signal }), 250);
+    });
+    child.on("close", (code, signal) => {
+      finish({ code, stdout, stderr, timedOut: false, signal });
+    });
   });
-  if (r.error && r.error.code === "ETIMEDOUT") {
-    return { code: null, stdout: "", stderr: `TIMEOUT after ${timeoutMs}ms`, timedOut: true };
-  }
-  return { code: r.status, stdout: r.stdout ?? "", stderr: r.stderr ?? "", timedOut: false };
 }
 
 function clip(text, max = 200) {
@@ -525,7 +571,7 @@ async function main() {
   group("A 组 · CLI 命令（子进程）");
 
   await test("TC-A01", "list 基本输出", async () => {
-    const r = runCli(["list"]);
+    const r = await runCli(["list"]);
     assert(r.code === 0, `退出码 ${r.code} · stderr: ${clip(r.stderr, 80)}`);
     const plain = r.stdout.replace(/\x1b\[[0-9;]*m/g, "");
     assert(plain.includes("Managed:"), "缺少 Managed: 统计行");
@@ -536,7 +582,7 @@ async function main() {
   });
 
   await test("TC-A02", "list -s npm 过滤", async () => {
-    const r = runCli(["list", "-s", "npm"]);
+    const r = await runCli(["list", "-s", "npm"]);
     assert(r.code === 0, `退出码 ${r.code}`);
     const plain = r.stdout.replace(/\x1b\[[0-9;]*m/g, "");
     const bySource = plain.slice(plain.indexOf("By source:"));
@@ -546,7 +592,7 @@ async function main() {
   });
 
   await test("TC-A03", "list -s path 过滤", async () => {
-    const r = runCli(["list", "-s", "path"]);
+    const r = await runCli(["list", "-s", "path"]);
     assert(r.code === 0, `退出码 ${r.code}`);
     const plain = r.stdout.replace(/\x1b\[[0-9;]*m/g, "");
     const bySource = plain.slice(plain.indexOf("By source:"));
@@ -556,7 +602,7 @@ async function main() {
   });
 
   await test("TC-A04", "info dsh", async () => {
-    const r = runCli(["info", "dsh"]);
+    const r = await runCli(["info", "dsh"]);
     assert(r.code === 0, `退出码 ${r.code}`);
     const plain = r.stdout.replace(/\x1b\[[0-9;]*m/g, "");
     assert(plain.includes("Version:"), "缺少 Version 字段");
@@ -566,14 +612,14 @@ async function main() {
   });
 
   await test("TC-A05", "info 未装应用", async () => {
-    const r = runCli(["info", "not-exist-xyz"]);
+    const r = await runCli(["info", "not-exist-xyz"]);
     assert(r.code === 0, `退出码应为 0（友好提示），实际 ${r.code}`);
     assert(r.stdout.includes("No application found matching"), `提示不符: ${clip(r.stdout, 80)}`);
     return clip(r.stdout, 80);
   });
 
   await test("TC-A06", "unmanaged 输出", async () => {
-    const r = runCli(["unmanaged"]);
+    const r = await runCli(["unmanaged"]);
     assert(r.code === 0, `退出码 ${r.code}`);
     const plain = r.stdout.replace(/\x1b\[[0-9;]*m/g, "");
     assert(plain.includes("Add/Remove-Programs baseline"), "缺少 ARP 基线行");
@@ -582,14 +628,14 @@ async function main() {
   });
 
   await test("TC-A07", "portable 别名等价", async () => {
-    const r = runCli(["portable"]);
+    const r = await runCli(["portable"]);
     assert(r.code === 0, `退出码 ${r.code}`);
     assert(r.stdout.replace(/\x1b\[[0-9;]*m/g, "").includes("unmanaged program(s)"), "别名输出与 unmanaged 不一致");
     return "别名输出同构";
   });
 
   await test("TC-A08", "method 方法论", async () => {
-    const r = runCli(["method"]);
+    const r = await runCli(["method"]);
     assert(r.code === 0, `退出码 ${r.code}`);
     const plain = r.stdout.replace(/\x1b\[[0-9;]*m/g, "");
     assert(plain.includes("Techniques used"), "缺少 Techniques used");
@@ -598,7 +644,7 @@ async function main() {
   });
 
   await test("TC-A09", "export 注册表 JSON", async () => {
-    const r = runCli(["export"]);
+    const r = await runCli(["export"]);
     assert(r.code === 0, `退出码 ${r.code}`);
     let reg;
     try {
@@ -614,7 +660,7 @@ async function main() {
   });
 
   await test("TC-A10", "doctor 健康检查", async () => {
-    const r = runCli(["doctor"], 300000);
+    const r = await runCli(["doctor"], 300000);
     assert(r.code === 0, `退出码 ${r.code}`);
     const plain = r.stdout.replace(/\x1b\[[0-9;]*m/g, "");
     assert(plain.includes("Running health check"), "缺少标题");
@@ -623,14 +669,14 @@ async function main() {
   });
 
   await test("TC-A11", "monitor 进程监视", async () => {
-    const r = runCli(["monitor"], 120000);
+    const r = await runCli(["monitor"], 120000);
     assert(r.code === 0, `退出码 ${r.code}`);
     assert(r.stdout.replace(/\x1b\[[0-9;]*m/g, "").includes("Monitoring running processes"), "缺少标题");
     return clip(lineOf(r.stdout, "instance") || lineOf(r.stdout, "not running") || "无运行实例", 80);
   });
 
   await test("TC-A12", "search 搜索", async () => {
-    const r = runCli(["search", "dsh"]);
+    const r = await runCli(["search", "dsh"]);
     assert(r.code === 0, `退出码 ${r.code}`);
     const plain = r.stdout.replace(/\x1b\[[0-9;]*m/g, "");
     assert(plain.includes("Found") || plain.includes("No apps found"), "缺少结果行");
@@ -639,7 +685,7 @@ async function main() {
   });
 
   await test("TC-A13", "help 帮助", async () => {
-    const r = runCli(["help"]);
+    const r = await runCli(["help"]);
     assert(r.code === 0, `退出码 ${r.code}`);
     const plain = r.stdout.replace(/\x1b\[[0-9;]*m/g, "");
     assert(plain.includes("Commands:"), "缺少命令列表");
@@ -648,7 +694,7 @@ async function main() {
   });
 
   await test("TC-A14", "update 守卫·不存在名", async () => {
-    const r = runCli(["update", "not-exist-xyz"]);
+    const r = await runCli(["update", "not-exist-xyz"]);
     assert(r.code === 0, `退出码 ${r.code}`);
     const plain = r.stdout.replace(/\x1b\[[0-9;]*m/g, "");
     assert(plain.includes("No application found matching"), "守卫提示缺失");
@@ -658,7 +704,7 @@ async function main() {
 
   await test("TC-A15", "update 守卫·不支持来源", async () => {
     if (!pathAppName) skip("当前扫描无 path 来源应用");
-    const r = runCli(["update", pathAppName]);
+    const r = await runCli(["update", pathAppName]);
     assert(r.code === 0, `退出码 ${r.code}`);
     const plain = r.stdout.replace(/\x1b\[[0-9;]*m/g, "");
     assert(plain.includes("Auto-update not supported"), `守卫提示缺失: ${clip(plain, 100)}`);
@@ -667,7 +713,7 @@ async function main() {
   });
 
   await test("TC-A16", "未知命令回退帮助", async () => {
-    const r = runCli(["foobar"]);
+    const r = await runCli(["foobar"]);
     assert(plain0(r.stderr).includes("Unknown command: foobar"), "stderr 缺少 Unknown command 提示");
     assert(plain0(r.stdout).includes("Commands:"), "未回退到帮助");
     function plain0(s) {
@@ -677,14 +723,14 @@ async function main() {
   });
 
   await test("TC-A17", "info 缺参数报错", async () => {
-    const r = runCli(["info"]);
+    const r = await runCli(["info"]);
     assert(r.code === 1, `缺参数应退出码 1，实际 ${r.code}`);
     assert(r.stderr.includes("App name required"), `stderr 提示不符: ${clip(r.stderr, 80)}`);
     return "退出码 1 + 明确报错";
   });
 
   await test("TC-A18", "◆ check 更新检查", async () => {
-    const r = runCli(["check"], 300000);
+    const r = await runCli(["check"], 300000);
     if (r.timedOut) skip(`网络检查超时（>${300000 / 1000}s）`);
     assert(r.code === 0, `退出码 ${r.code}`);
     const plain = r.stdout.replace(/\x1b\[[0-9;]*m/g, "");

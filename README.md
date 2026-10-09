@@ -84,6 +84,26 @@ npm link
 dsh plugin --profile web add .
 ```
 
+### dsh host compatibility / dsh 宿主兼容性
+
+| Host line / 宿主线 | Status |
+|---|---|
+| **dsh 0.2.0-rc.2** | ✅ supported（0.6.0 起） |
+| **dsh 0.1.5-rc.x** | ✅ supported |
+
+One artifact serves both lines: the host contracts this plugin uses are
+additive across them (`peerDependencies` is `^0.1.5-rc.1 || ^0.2.0-rc.2`).
+逐项契约对照见 **[COMPATIBILITY.md](./COMPATIBILITY.md)**。
+
+⚠️ **dsh 会先校验 peer 范围，再加载插件**：0.2.0 的 `dsh-app-boot` 对每个
+`@deepseek-ai/dsh*` peer 做 `semver.satisfies(runtime, range, {includePrerelease:true})`，
+不满足就**抛错并跳过该 bundle**（报错里会建议 `dsh plugin allow-version` 做精确版本豁免）。
+所以插件版本与宿主版本不匹配时，表现为**装不上**而不是运行时报错 —— 升级插件即可解决。
+
+> 💡 在 dsh 0.2.0 上，`app_manager_update` 的**审批闸门会真正生效**（该宿主自带
+> `@deepseek-ai/dsh-user-approval` 与 UI 应答器）；在 0.1.5 线上没有该服务，
+> 闸门按 fail-closed 一律拒绝。这是既有设计的自然结果，无需配置。
+
 ---
 
 ## 🚀 Usage / 使用方法

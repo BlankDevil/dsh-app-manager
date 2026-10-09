@@ -1,7 +1,12 @@
 # dsh-app-manager 测试用例规格
 
-版本：v3（对应插件 0.5.3 · dsh 0.1.5-rc.1）
+版本：v4（对应插件 0.6.0 · dsh 0.1.5-rc.1 / 0.2.0-rc.2）
 状态基线：用例先于脚本编写；执行结果见 `reports/`。
+
+> **v4 相对 v3 的变化**：新增 **L 组**（`dsh-compat.test.mjs`，16 条）守住宿主兼容性声明。
+> 背景：插件能否在某个 dsh 上**加载**，取决于 `package.json` 的 peer 范围 ——
+> dsh 0.2.0 的 app-boot 会做 `semver.satisfies(runtime, range, {includePrerelease:true})`
+> 校验，不满足即抛错跳过该 bundle。0.5.3 的 `^0.1.5-rc.1` 因此**无法在 0.2.0-rc.2 上加载**。
 
 **通用前置**
 - 插件已构建（`lib/` 存在），版本 0.5.3
@@ -114,10 +119,11 @@
 
 **独立行为/性能组**（不在 `run-tests.mjs` 计数内，各自单独运行）：
 - G 组 13 条 · 拖拽交互行为（`node tests/drag-behavior.test.mjs`）
-- H 组 12 条 · 性能守卫（`node tests/perf-guard.test.mjs`）
+- H 组 15 条 · 性能守卫（`node tests/perf-guard.test.mjs`）
 - I 组 15 条 · 跨平台全局路径（`node tests/crossplatform-paths.test.mjs`）
 - J 组 11 条 · 审批门槛（`node tests/approval-gate.test.mjs`）
 - K 组 44 条 · 页面动作与退出机制（`node tests/actions.test.mjs`）
+- L 组 16 条 · 宿主兼容性声明（`node tests/dsh-compat.test.mjs`）
 
 ---
 
@@ -339,4 +345,42 @@ TC-H11/H12 用 `process.execPath` 起子进程验证超时，而它**只在 Node
   名叫 `pwsh -Command "…"` 的文件；
 - 测试侧 TC-H13 直接传**原始含空格路径**（不再由测试自己加引号）——
   一旦有人把引用逻辑改回去，本组立刻失败。
+
+---
+
+## L 组 — 宿主兼容性声明（`dsh-compat.test.mjs`，16 条）
+
+> 插件**能否在某个 dsh 上加载**，不取决于代码，而取决于 `package.json` 的 peer 范围。
+> dsh 0.2.0 的 `dsh-app-boot` 在加载 bundle 前执行
+> `semver.satisfies(runtimeVersion, range, { includePrerelease: true })`，
+> **不满足即抛错并跳过该 bundle**（报错建议用 `dsh plugin allow-version` 做精确版本豁免）。
+>
+> 0.5.3 就是这样被挡住的：`^0.1.5-rc.1` 不匹配 `0.2.0-rc.2`（实测，用 dsh 依赖树里的
+> `semver`）。代码全对、声明写窄了，插件照样装不上。
+
+| ID | 用例 | 断言 |
+|----|------|------|
+| TC-L01–L05 | peer 覆盖每条声称支持的线 | 每条线各有一条子句；子句数 === 声称的线数；多线必须 `\|\|` 并列 |
+| TC-L06–L07 | 范围书写整洁 | 无前后空白、无空子句 |
+| TC-L08–L12 | bundle 声明可用 | 声明了 `dsh.bundle.patch`；文件真实存在；含 `insert` 段；插入的是本包 |
+| TC-L13–L16 | 包身份 | version 是合法 semver；包名正确；运行时依赖保持为空 |
+
+**回归能力（已实测）**：把 peer 改回单线 `^0.1.5-rc.1` → 本组 3 项失败、退出码 1。
+
+⚠️ **本组的边界（不要误读）**：它**不重实现 semver**，只防「声明与自称支持范围不一致」。
+范围与运行时版本之间的**语义判定**由宿主在加载时执行 —— 手写一个评估器，
+风险是把错的规则固化成"守卫"，比没有守卫更糟。
+实测参考（`includePrerelease: true`）：
+
+```
+satisfies("0.2.0-rc.2",  "^0.1.5-rc.1")                  = false   ← 0.5.3 被拒的原因
+satisfies("0.2.0-rc.2",  "^0.2.0-rc.2")                  = true
+satisfies("0.1.5-rc.3",  "^0.1.5-rc.1 || ^0.2.0-rc.2")    = true
+satisfies("0.2.0-rc.2",  "^0.1.5-rc.1 || ^0.2.0-rc.2")    = true
+satisfies("0.3.0",       "^0.1.5-rc.1 || ^0.2.0-rc.2")    = false
+satisfies("0.1.7-rc.2",  "^0.1.5-rc.1")                  = true    ← 注意：与 0.2.0-rc.2 不同
+```
+
+最后一行正是「不能手写评估器」的证据：同为预发布版本，`0.1.7-rc.2` 落在
+`^0.1.5-rc.1` 的范围内，而 `0.2.0-rc.2` 不落 —— 规则比"同 tuple 才允许预发布"更微妙。
 

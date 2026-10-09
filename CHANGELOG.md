@@ -5,6 +5,102 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-10-09
+
+Support for **dsh 0.2.0-rc.2** (the new host line). No runtime code changed —
+the break was in the manifest's peer declaration, and that is what this release
+fixes. Every host contract the plugin touches was compared against the real
+0.2.0-rc.2 packages; the findings are in `COMPATIBILITY.md`.
+
+### Fixed
+
+- **The plugin would have been refused outright on dsh 0.2.0-rc.2.** dsh 0.2.0
+  enforces plugin compatibility at bundle load: `@deepseek-ai/dsh-app-boot`
+  checks every `@deepseek-ai/dsh*` peer with
+  `semver.satisfies(runtimeVersion, range, { includePrerelease: true })` and
+  **throws** on a mismatch, skipping the bundle:
+
+  ```
+  Plugin dsh-app-manager@0.5.3 is incompatible with dsh 0.2.0-rc.2:
+  peerDependencies {"@deepseek-ai/dsh-tools":"^0.1.5-rc.1"}. Running it may
+  cause crashes or data loss. … grant the exact-version exemption for
+  dsh-app-manager@0.5.3 on dsh 0.2.0-rc.2 with `dsh plugin allow-version` …
+  ```
+
+  Measured with the runtime's own `semver`: `^0.1.5-rc.1` does **not** satisfy
+  `0.2.0-rc.2`, so 0.5.3 cannot load as a profile bundle there. The peer range
+  is now `^0.1.5-rc.1 || ^0.2.0-rc.2`.
+
+  Dual-line support is a deliberate choice, not caution: the host contracts are
+  additive across the two lines (see `COMPATIBILITY.md`), so one artifact can
+  serve both. A single-line range would force users on the older host to stay
+  behind for no technical reason.
+
+- **A timed-out child could keep the whole process alive.** `execAsync`'s
+  timeout path killed the process tree but never released the `ChildProcess`'s
+  handles. When `close` did not arrive — the usual reason being grandchildren
+  that inherited the stdio pipes — that handle stayed active, node never
+  exited, and the caller saw "the work finished long ago, but the process just
+  sits there". Measured on `doctor`: it printed its full summary and then hung
+  until the caller's 300s ceiling; after the fix it exits in **19.5s, code 0**.
+
+  Invisible on a healthy host (children exit promptly, so `close` always
+  arrives) — but true for any host that does not clean up process trees
+  completely, which is why it is worth fixing rather than papering over in the
+  test harness.
+
+### Added
+
+- **`COMPATIBILITY.md`** — the contract-by-contract comparison against
+  0.2.0-rc.2: `tools.register` / `ToolDefinition` / `ToolOutputDefinition` /
+  `ToolSchema` / `ToolExecution`, `webServer.register` + `WebRoute` (same
+  package, `dsh-host-webserver`, same signature), the `approval` service
+  (same method and outcome vocabulary), the bundle-patch resolver, the default
+  web port, and the cordis version delta. It records which items are
+  byte-identical, which are additive, and which one was breaking.
+- **`npm run test:compat`** — guards the **declaration**: every dsh runtime line
+  the plugin claims to support must appear as a clause in the peer range (and
+  the claimed-line list is checked both ways, so adding a line to the docs
+  without the manifest fails), plus the bundle declaration must stay loadable
+  (patch file exists, contains an `insert`, inserts this package).
+
+  It deliberately does **not** re-implement SemVer: the semantics of a range
+  against a runtime version are enforced by the host's own check at load time,
+  and a hand-rolled evaluator risks freezing a wrong rule into a "guard". The
+  measured table it documents includes `satisfies("0.1.7-rc.2", "^0.1.5-rc.1")
+  = true` but `satisfies("0.2.0-rc.2", "^0.1.5-rc.1") = false` — subtle enough
+  that guessing would be worse than not testing.
+
+### Tests
+
+- **`runCli` now uses asynchronous `spawn`, not `spawnSync`.** In this host
+  environment `spawnSync` returns `EBUSY` for *every* target — including
+  `spawnSync("cmd.exe", ["/c", "echo", "hi"])` — while async `spawn` is fine
+  (same node binary: sync fails in 8ms, async returns code 0 in 247ms). The
+  effect was 18 A-group tests "failing" with a bare `退出码 null`, which reads
+  like a defect in the plugin rather than a limitation of the host. Async is
+  also the honest choice: a 300s synchronous wait blocks the event loop.
+- **Outcome settlement is keyed on `exit`, not `close`.** `close` waits for
+  stdio EOF, which a surviving grandchild can hold open indefinitely.
+- **The escape-hatch test no longer hardcodes `dsh`.** It picks an npm-sourced
+  app from discovery — `dsh` had degraded to a `path` shim on this machine
+  (its global install is broken), which sent `update dsh` down the
+  "source not supported" branch and failed the test for reasons unrelated to
+  the code under test.
+
+### Notes
+
+- The peer check reads the **runtime** dsh version, so a plugin that declares a
+  range it cannot actually satisfy is refused — the failure is loud and
+  immediate, not a silent crash later. That is also why this release does not
+  add peers for `dsh-host-webserver` / `dsh-user-approval`: they are consumed
+  through optional injection, and a peer there would turn an optional service
+  into a load-blocking requirement.
+- If a user is already on 0.2.0-rc.2 with 0.5.3 installed, the short-term
+  unblock is `dsh plugin allow-version` (an exact-version exemption stored in
+  the profile's `compatibility.json`) — but upgrading to this release is the
+  correct fix.
+
 ## [0.5.3] - 2026-09-15
 
 First release with **page actions**: the table is no longer read-only. You can

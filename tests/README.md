@@ -202,11 +202,21 @@ spawn」，结果桩没生效，**真实执行了 `npm install -g 9router@latest
 
 ## 环境基线
 
-- 被测插件：dsh-app-manager 0.5.1（`dsh-app-manager/`）
-- 宿主 dsh：0.1.5-rc.1（内嵌 @deepseek-ai/dsh-tools 0.1.5-rc.2）
+- 被测插件：dsh-app-manager 0.6.0（`dsh-app-manager/`）
+- 宿主 dsh：**0.1.5-rc.1 与 0.2.0-rc.2 两条线都支持**（契约逐项对照见
+  `COMPATIBILITY.md`；peer 声明为 `^0.1.5-rc.1 || ^0.2.0-rc.2`）
 - 运行时：Node 22.22.2（managed）
 - 本机 git：2.9.0.windows.1（**较老**，部分新选项不可用，见上）
 - 平台：Windows 10 (win32)
+- ⚠️ **本机 `spawnSync` 对任何目标都返回 `EBUSY`**（连 `cmd.exe /c echo` 都不行），
+  而**异步 `spawn` 完全正常** —— 同一个 node 二进制：sync 8ms 报 EBUSY、
+  async 247ms 正常返回 code 0。因此 `run-tests.mjs` 的 `runCli`、以及
+  `approval-gate.test.mjs` 的逃生口用例都用异步 spawn。
+  **失败模式很骗人**：只取 `spawnSync` 的 `status` 会得到光秃秃的「退出码 null」，
+  看起来像被测程序坏了。若在此环境看到这种失败，先怀疑 spawn 方式，而不是插件。
+- ⚠️ **子进程结算要用 `exit` 而非 `close`**：`close` 等的是 stdio EOF，而**孙进程**
+  可能继承管道并一直持有它 → `close` 永不触发 → 测试卡满整个 timeout。
+  （实测：`TC-A10 doctor` 曾因此挂满 300s，而 CLI 其实早已打印完汇总。）
 - 注意：本沙箱内 `npm` 会经 `wsl.exe`，被程序黑名单拦截 → `npm view` / `npm pack`
   无法执行（用 `pnpm pack` 替代）；`RefreshEnv`（Chocolatey shim）会调被拦的
   `reg.exe`/`WMIC.exe`，在沙箱内跑长耗时 CLI 子进程会被卡住，需放开沙箱。

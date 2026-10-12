@@ -32,6 +32,25 @@ uninstallers leave behind are reported and offered for cleanup.
 
 ### Fixed
 
+- **Windows/WSL internals were listed as apps — and probing them popped a
+  GUI window.** `C:\Program Files\WSL\` holds the WSL stack's own components
+  (`wslg`, `wslhost`, `wslrelay`, `wslservice`, `wslc`, `container`, `msrdc`).
+  None is a user-facing tool; the entry point users actually call is `wsl.exe`
+  in System32, which was already filtered. Listing them was not merely noise:
+  a version sweep asks each command for `--version`, and
+  `msrdc` — the Remote Desktop client — answers by opening a **modal error
+  dialog**. A modal dialog outlives the child process it came from, so the
+  refresh that triggered it never returns. `wslg` answers by dumping its help
+  text into the log. The whole directory is now filtered out of PATH scanning,
+  and `msrdc` / `wslg` are additionally on the never-execute list in case they
+  arrive through another source (choco, scoop, a stray shim).
+- **"Uninstalled" was concluded from a path that can legitimately be absent.**
+  The hashed-directory fallback now covers **scoped** packages too. npm puts
+  `@anthropic-ai/claude-code` in `@anthropic-ai/.claude-code-MPHaZ0ov`, so the
+  hashed sibling sits one level below the *scope* rather than below
+  `node_modules`; the previous pattern only looked under `node_modules`. An app
+  whose recorded path went missing during such a layout was dropped from the
+  table as "uninstalled" — which the user sees as an app simply disappearing.
 - **App names were read from the install directory instead of the package.**
   Discovery used the directory name as the app name and never looked at
   `package.json`'s own `name`. For most packages the two agree, which is why

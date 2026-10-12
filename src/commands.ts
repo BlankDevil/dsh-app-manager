@@ -144,6 +144,19 @@ const DO_NOT_EXECUTE: RegExp[] = [
   // happened — and unlike `ExecAction` it never touches the proxy, which is
   // why the proxy stayed off while Fiddler's uninstaller still opened.
   /^uninst/i,
+  // Windows components that answer `--version` with a **window**.
+  //
+  // `C:\Program Files\WSL\msrdc.exe` is the Remote Desktop client: it does not
+  // print a version, it opens a modal "远程桌面使用情况" error dialog. A modal
+  // dialog cannot be killed with the child process, so the version scan it
+  // belonged to never returns — a refresh that hangs forever rather than
+  // failing. `wslg` answers by dumping its help text.
+  //
+  // Discovery already drops the whole `Program Files\WSL` directory; this is
+  // the second line, for the day one of them arrives through another source
+  // (choco, scoop, a PATH shim).
+  /\bmsrdc\b/i,
+  /\bwslg\b/i,
 ];
 
 /**
@@ -234,8 +247,13 @@ export function shimTargets(file: string): string[] {
  *
  * @returns the hashed path that does exist, or `null` when there is none.
  */
-function viaHashedPackageDir(target: string): string | null {
-  const m = /(.*[\\/]node_modules)[\\/]([^\\/]+)[\\/](.+)$/.exec(target);
+export function viaHashedPackageDir(target: string): string | null {
+  // The optional group is what makes this work for scoped packages: npm puts
+  // `@anthropic-ai/claude-code` in `@anthropic-ai/.claude-code-MPHaZ0ov`, so
+  // the hashed sibling lives one level below the *scope*, not below
+  // `node_modules`. Without it, `@anthropic-ai/claude-code` looked gone and
+  // the app was hidden from the table as "uninstalled".
+  const m = /(.*[\\/]node_modules(?:[\\/]@[^\\/]+)?)[\\/]([^\\/]+)[\\/](.+)$/.exec(target);
   if (!m) return null;
   const [, nmRoot, pkgName, rest] = m;
   // No "the directory exists, so this is the normal layout" short-circuit:

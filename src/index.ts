@@ -16,6 +16,7 @@ import {
   resolveAppVersion,
   probeCommandHealth,
   shimFilesOnPath,
+  viaHashedPackageDir,
   type UpdateOutcome,
 } from "./commands.js";
 import { compareVersions, execAsync, pathIndexHas } from "./utils.js";
@@ -340,7 +341,17 @@ function findUninstalled(): Array<{ name: string; source: string; path: string }
     // reports packages without a directory, so reading "" as "gone" hid every
     // pip package on the machine. Only a path that is recorded *and* missing
     // on disk means the app was uninstalled.
-    .filter((app) => PACKAGE_SOURCES.has(app.source) && Boolean(app.path) && !existsSync(app.path))
+    .filter((app) => {
+      if (!PACKAGE_SOURCES.has(app.source) || !app.path) return false;
+      if (existsSync(app.path)) return false;
+      // ...and a missing path is not the last word either. npm stores packages
+      // whose name starts with a digit — and, on some layouts, scoped packages
+      // too — in a hashed directory (`@anthropic-ai/.claude-code-MPHaZ0ov`)
+      // while the record points at the logical path. Checking for the hashed
+      // sibling before concluding "uninstalled" keeps a working app in the
+      // table; hiding it is what the user sees as an app disappearing.
+      return !viaHashedPackageDir(app.path);
+    })
     .map((app) => ({ name: app.name, source: app.source, path: app.path || "" }));
 }
 

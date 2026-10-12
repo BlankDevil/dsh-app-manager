@@ -26,6 +26,26 @@ export declare function refuseToExecute(app: {
  */
 export declare function shimTargets(file: string): string[];
 /**
+ * Resolve a shim target through npm's **hashed** package directory.
+ *
+ * npm installs any package whose name starts with a digit into a hashed
+ * directory — `9router` lands in `node_modules/.9router-wssQRq4J` — but the
+ * shims it generates still reference the *logical* path
+ * `node_modules/9router/cli.js`. That logical path is normally a link to the
+ * hashed one; when a manifest-less directory from an older layout is sitting
+ * at `node_modules/9router` instead, the link is never created and the logical
+ * path does not exist.
+ *
+ * A plain "does the target exist?" check then reports a perfectly installed,
+ * perfectly working package as an orphan, and offers to "clean up the
+ * leftover" — which moves the user's working shims away. That is worse than
+ * the problem it claims to fix. So: if the logical path is missing but the
+ * hashed equivalent exists, the package is present and the shim is fine.
+ *
+ * @returns the hashed path that does exist, or `null` when there is none.
+ */
+export declare function viaHashedPackageDir(target: string): string | null;
+/**
  * Is this leftover really broken? **Pure** — it reads the shim and checks what
  * the shim points at. No child process is spawned.
  */

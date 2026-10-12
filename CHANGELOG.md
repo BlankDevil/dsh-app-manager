@@ -29,6 +29,15 @@ uninstallers leave behind are reported and offered for cleanup.
 - **`GET /app-manager/api/health`** — `uninstalled` + `leftovers` +
   `generatedAt` (`?refresh=1` bypasses the 60-second cache).
 - **`POST /app-manager/api/leftover/fix`** — cleans one leftover.
+- **Clicking an app starts it the way its own kind demands.** A command-line
+  tool needs a terminal to hold its output — without one it flashes and the
+  error is unreadable — while a program with a window *is* its own interface,
+  and wrapping it in a shell leaves an empty console that only goes away when
+  the app exits. The two are now told apart by reading the executable's **PE
+  header subsystem** (`IMAGE_SUBSYSTEM_WINDOWS_GUI`): CLI commands keep the
+  `PowerShell` / `cmd` window as before, GUI programs are started with
+  `start "" <app>` and no console at all. `hasGui` is resolved once during
+  discovery and carried on the app record.
 
 ### Fixed
 
@@ -89,6 +98,20 @@ uninstallers leave behind are reported and offered for cleanup.
   probe still has to run `<cmd> --version` to learn a version for a PATH app,
   but it now refuses a blocklist (Fiddler and its helpers). Asking a program
   for its version is not worth reconfiguring the machine.
+- **Clicking an app could launch an uninstaller.** The never-execute list was
+  consulted by the version probe and the health scan but **not** by the launch
+  route, so a click reached whatever the row pointed at. `uninst.exe` — which
+  is Fiddler's uninstaller, and whose name is the command — was one row among
+  many, and starting it begins an uninstall. `POST /app-manager/api/open` now
+  applies the same gate and answers **`403 refused`** with the reason.
+- **Fiddler's install directory was listed as if it held tools.** Every `.exe`
+  in `C:\Program Files\Programs\Fiddler\` is an internal step of the product —
+  the GUI, its certificate helper, the loopback enabler, and the uninstaller.
+  They sat on PATH as ordinary rows, and each is a hazard to start:
+  `uninst` uninstalls on launch, while `EnableLoopback` and `TrustCert` mutate
+  machine-wide network and certificate state. The directory is now filtered out
+  of PATH scanning; the never-execute list stays as the second layer, for
+  copies that arrive through scoop, choco or a hand-placed shim.
 
 ### Notes
 

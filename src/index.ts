@@ -6,7 +6,7 @@
 import { spawn } from "node:child_process";
 import { existsSync, renameSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import path from "node:path";
+import { join } from "node:path";
 
 import type { ApprovalOutcome, ApprovalService, CliApp, ContentBlock, CordisContext, HttpRequest, HttpResponse, PluginLifecycle, ToolDefinition, ToolRunContext, WebServerService } from "./types.js";
 import { _resetScanCache, buildScanReport, discoverAll, discoverUnmanaged, findApp, readManagedBaseline } from "./discovery.js";
@@ -15,11 +15,12 @@ import {
   updateCommandFor,
   resolveAppVersion,
   probeCommandHealth,
+  refuseToExecute,
   shimFilesOnPath,
   viaHashedPackageDir,
   type UpdateOutcome,
 } from "./commands.js";
-import { compareVersions, execAsync, pathIndexHas } from "./utils.js";
+import { EXECUTABLE_EXTS, compareVersions, execAsync, getPathDirs, pathIndexHas } from "./utils.js";
 
 /**
  * Answer a request that arrived after this plugin was unloaded.
@@ -73,7 +74,9 @@ function sendJson(res: HttpResponse, status: number, payload: unknown): void {
  */
 const COMMAND_TOKEN = /^[A-Za-z0-9._-]+$/;
 
-/** Where a launched terminal starts: the app's own directory when we know it. */
+/**
+ * Where a launched terminal starts: the app's own directory when we know it.
+ */
 function launchCwd(app: CliApp): string {
   if (app.path && existsSync(app.path)) {
     try {
@@ -104,30 +107,69 @@ function asWindowsShell(value: string | null): WindowsShell {
   return (WINDOWS_SHELLS as readonly string[]).includes(v) ? (v as WindowsShell) : "powershell";
 }
 
-/** How to open a terminal running `command`, per platform. */
+/**
+ * How to start `command`, per platform and per app kind.
+ *
+ * The app's kind decides whether a terminal is involved at all:
+ *
+ *   - **GUI app** → start the program itself, no shell. A windowed program
+ *     owns its own window and never reads a console, so wrapping it in one
+ *     leaves an empty terminal sitting next to it that the user has to close
+ *     by hand — and because `-NoExit`/`/k` keep that shell alive forever, the
+ *     empty window never goes away on its own.
+ *
+ *   - **CLI app** → open a terminal that stays open (`-NoExit` on PowerShell,
+ *     `/k` on cmd). A bare command like `claude` would otherwise flash a
+ *     window and vanish the moment it exits, taking the error message with it
+ *     — which is exactly when the user needs to read it.
+ *
+ * @param command A bare command name (already validated by `COMMAND_TOKEN`).
+ * @param cwd Directory the terminal (or program) starts in.
+ * @param platform Host platform; injectable so every branch is testable.
+ * @param shell Which whitelisted Windows shell to use for the CLI case.
+ * @param hasGui Whether the target program is a windowed application.
+ */
 function terminalInvocation(
   command: string,
   cwd: string,
   platform: NodeJS.Platform = process.platform,
-  shell: WindowsShell = "powershell"
-): { cmd: string; args: string[] } {
+  shell: WindowsShell = "powershell",
+  hasGui = false
+): { cmd: string; args: string[]; kind: "direct" | "terminal" } {
+  // A windowed program is launched on its own — there is no terminal to keep,
+  // so the shell choice does not apply. `start` is still used on Windows so
+  // the child is not attached to our own console.
+  if (hasGui) {
+    if (platform === "win32") {
+      return { cmd: "cmd.exe", args: ["/c", "start", "", command], kind: "direct" };
+    }
+    if (platform === "darwin") {
+      return { cmd: "open", args: ["-a", command], kind: "direct" };
+    }
+    return { cmd: command, args: [], kind: "direct" };
+  }
+
   if (platform === "win32") {
     // `start` treats its first argument as the window title, so the empty ""
     // is required — without it a quoted command would be eaten as the title.
     // `-NoExit` (PowerShell) / `/k` (cmd) keep the window open after the
     // command exits, so a failure stays readable instead of flashing away.
     if (shell === "cmd") {
-      return { cmd: "cmd.exe", args: ["/c", "start", "", "cmd.exe", "/k", command] };
+      return { cmd: "cmd.exe", args: ["/c", "start", "", "cmd.exe", "/k", command], kind: "terminal" };
     }
     // Prefer PowerShell 7 (`pwsh`) when it is installed, else Windows
     // PowerShell 5.1 — same flags, so one code path covers both.
     const ps = pathIndexHas("pwsh") ? "pwsh.exe" : "powershell.exe";
-    return { cmd: "cmd.exe", args: ["/c", "start", "", ps, "-NoExit", "-Command", command] };
+    return { cmd: "cmd.exe", args: ["/c", "start", "", ps, "-NoExit", "-Command", command], kind: "terminal" };
   }
   if (platform === "darwin") {
-    return { cmd: "open", args: ["-a", "Terminal", "--args", "-c", `cd ${cwd} && ${command}`] };
+    return { cmd: "open", args: ["-a", "Terminal", "--args", "-c", `cd ${cwd} && ${command}`], kind: "terminal" };
   }
-  return { cmd: "x-terminal-emulator", args: ["-e", "sh", "-c", `cd ${cwd} && ${command}; exec sh`] };
+  return {
+    cmd: "x-terminal-emulator",
+    args: ["-e", "sh", "-c", `cd ${cwd} && ${command}; exec sh`],
+    kind: "terminal",
+  };
 }
 
 /**
@@ -141,25 +183,28 @@ export function _terminalInvocationFor(
   platform: NodeJS.Platform,
   command: string,
   cwd: string,
-  shell: WindowsShell = "powershell"
-): { cmd: string; args: string[] } {
-  return terminalInvocation(command, cwd, platform, shell);
+  shell: WindowsShell = "powershell",
+  hasGui = false
+): { cmd: string; args: string[]; kind: "direct" | "terminal" } {
+  return terminalInvocation(command, cwd, platform, shell, hasGui);
 }
 
 /**
- * Open a terminal window running one command.
+ * Launch one discovered app.
  *
- * Detached on purpose: the window belongs to the user (they may sit inside
- * `claude` for an hour), so it has to outlive the request *and* the plugin.
- * That is the inverse of DESIGN §6's "clean up child processes on dispose",
- * which is about background services we own — not terminals we hand over.
+ * Detached on purpose: whatever starts — a terminal the user may sit inside
+ * for an hour, or a GUI window — belongs to them, so it has to outlive the
+ * request *and* the plugin. That is the inverse of DESIGN §6's "clean up child
+ * processes on dispose", which is about background services we own — not
+ * windows we hand over.
  */
 function spawnTerminal(
   command: string,
   cwd: string,
-  shell: WindowsShell = "powershell"
+  shell: WindowsShell = "powershell",
+  hasGui = false
 ): { ok: boolean; detail: string } {
-  const spec = terminalInvocation(command, cwd, process.platform, shell);
+  const spec = terminalInvocation(command, cwd, process.platform, shell, hasGui);
   try {
     const child = spawn(spec.cmd, spec.args, {
       cwd,
@@ -168,7 +213,10 @@ function spawnTerminal(
       windowsHide: false,
     });
     child.unref();
-    return { ok: true, detail: `opened ${spec.cmd}` };
+    return {
+      ok: true,
+      detail: spec.kind === "direct" ? `started ${command}` : `opened ${spec.cmd} (${shell})`,
+    };
   } catch (error) {
     return { ok: false, detail: (error as { message?: string })?.message ?? String(error) };
   }
@@ -180,7 +228,12 @@ function spawnTerminal(
  * The probe swaps these so it can assert the exact command line without
  * opening a real window, and so no test can ever install a global package.
  */
-let terminalSpawner = spawnTerminal;
+let terminalSpawner: (
+  command: string,
+  cwd: string,
+  shell?: WindowsShell,
+  hasGui?: boolean
+) => { ok: boolean; detail: string } = spawnTerminal;
 let updateRunner: (app: CliApp) => Promise<UpdateOutcome> = runUpdate;
 let updatesCollector: () => Promise<UpdatesPayload> = collectUpdates;
 let versionResolver: (app: CliApp, options?: { refresh?: boolean }) => Promise<string | null> =
@@ -188,7 +241,12 @@ let versionResolver: (app: CliApp, options?: { refresh?: boolean }) => Promise<s
 let scanResetter: () => void = _resetScanCache;
 
 export function _setActionHooks(hooks: {
-  spawnTerminal?: (command: string, cwd: string, shell?: WindowsShell) => { ok: boolean; detail: string };
+  spawnTerminal?: (
+    command: string,
+    cwd: string,
+    shell?: WindowsShell,
+    hasGui?: boolean
+  ) => { ok: boolean; detail: string };
   runUpdate?: (app: CliApp) => Promise<UpdateOutcome>;
   collectUpdates?: () => Promise<UpdatesPayload>;
   resolveAppVersion?: (app: CliApp, options?: { refresh?: boolean }) => Promise<string | null>;
@@ -2783,6 +2841,19 @@ function registerWebRoutes(
             message: `${app.name} exposes no command to run`,
           });
         }
+        // Same gate the version probe and health scan already go through, and
+        // for the same reason: some entries on this list are parts of a
+        // product we must never start. Fiddler ships `uninst.exe`, and its
+        // very name is the command — launching it begins an uninstall. That
+        // happened while probing for a version; a click must not be able to
+        // reach it either.
+        const refused = refuseToExecute(app);
+        if (refused) {
+          return sendJson(res, 403, {
+            error: "refused",
+            message: refused,
+          });
+        }
         if (!COMMAND_TOKEN.test(command)) {
           return sendJson(res, 400, {
             error: "bad_command",
@@ -2792,14 +2863,17 @@ function registerWebRoutes(
         const cwd = launchCwd(app);
         // `?shell=` picks between the two whitelisted Windows shells; anything
         // else (including a missing value) falls back to the PowerShell default.
+        // It only matters for CLI apps — a GUI app is started directly, with
+        // no shell involved at all.
         const shell = asWindowsShell(
           new URL(req.url ?? "/", "http://localhost").searchParams.get("shell")
         );
-        const result = terminalSpawner(command, cwd, shell);
+        const result = terminalSpawner(command, cwd, shell, app.hasGui === true);
         return sendJson(res, result.ok ? 200 : 500, {
           ok: result.ok,
           app: app.name,
           command,
+          hasGui: app.hasGui === true,
           cwd,
           shell: process.platform === "win32" ? shell : process.platform,
           detail: result.detail,

@@ -293,6 +293,44 @@ const lin = _terminalInvocationFor("linux", "9router", "/tmp/x");
 check("linux 走 x-terminal-emulator", lin.cmd, "x-terminal-emulator");
 assert("linux 命令带 cwd", String(lin.args.at(-1)).includes("/tmp/x"));
 
+/* -------------------------------------------------------------------- 4b */
+
+// GUI 感知：有前端界面的程序不该再套一层终端 —— 窗口本身已经是它的界面，
+// 多开一个 PowerShell 只会留下一个空壳窗口，且要在 GUI 退出后才回收。
+// CLI 则相反：它必须有个终端接住输出，否则一闪而过、错误无从阅读。
+console.log("\n=== 4b. GUI 感知分派（CLI 保留终端 / GUI 不建终端）===");
+
+const guiWin = _terminalInvocationFor("win32", "Fiddler", "C:\\work", "powershell", true);
+check("GUI·win32 不套 shell，直接 start", guiWin.kind, "direct");
+check("GUI·win32 仍是 cmd.exe 转交", guiWin.cmd, "cmd.exe");
+assert("GUI·win32 参数含空标题", guiWin.args[2] === "");
+check("GUI·win32 命令直接跟在 start 后", guiWin.args.at(-1), "Fiddler");
+assert("GUI·win32 不带 -NoExit（不留终端）", !guiWin.args.includes("-NoExit"));
+assert("GUI·win32 不出现 cmd.exe /k", !guiWin.args.includes("/k"));
+
+const cliWin = _terminalInvocationFor("win32", "claude", "C:\\work", "powershell", false);
+check("CLI·win32 kind 为 terminal", cliWin.kind, "terminal");
+assert("CLI·win32 带 -NoExit", cliWin.args.includes("-NoExit"));
+check("CLI·win32 命令在末位", cliWin.args.at(-1), "claude");
+
+// hasGui 缺省必须等价于 false（旧调用点不传第 5 参时行为不变）。
+check(
+  "hasGui 缺省 = false（与显式 false 一致）",
+  JSON.stringify(_terminalInvocationFor("win32", "claude", "C:\\work")),
+  JSON.stringify(cliWin)
+);
+
+const guiMac = _terminalInvocationFor("darwin", "Cursor", "/tmp/x", "powershell", true);
+check("GUI·darwin 走 open", guiMac.cmd, "open");
+check("GUI·darwin kind 为 direct", guiMac.kind, "direct");
+check("GUI·darwin 用 -a 指定应用（不拉起 Terminal）", guiMac.args[0], "-a");
+assert("GUI·darwin 参数不含 Terminal", !guiMac.args.includes("Terminal"));
+
+const guiLin = _terminalInvocationFor("linux", "cursor", "/tmp/x", "powershell", true);
+check("GUI·linux 直接执行命令", guiLin.cmd, "cursor");
+check("GUI·linux kind 为 direct", guiLin.kind, "direct");
+check("GUI·linux 不附加终端参数", guiLin.args.length, 0);
+
 /* -------------------------------------------------------------------- 5 */
 
 console.log("\n=== 5. /api/updates 与缓存 ===");

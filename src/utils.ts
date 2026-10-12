@@ -3,7 +3,7 @@
  */
 
 import { execFileSync, execSync, spawn } from "node:child_process";
-import { existsSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, openSync, readdirSync, readFileSync, readSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, extname, join } from "node:path";
 import type { ExecResult, ManagedApp, PathExecutable } from "./types.js";
@@ -739,3 +739,84 @@ export function namesLikelyMatch(a: string, b: string): boolean {
   if (na.length >= 4 && nb.length >= 4 && (na.includes(nb) || nb.includes(na))) return true;
   return false;
 }
+
+/* -------------------------------------------------------------------------- */
+/*  Windows PE subsystem: does this program own a window?                      */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * `IMAGE_SUBSYSTEM_WINDOWS_GUI` — the program presents a graphical interface.
+ * Windows gives it no console, so launching it from a terminal detaches.
+ */
+const IMAGE_SUBSYSTEM_WINDOWS_GUI = 2;
+
+/**
+ * Read a Windows executable's PE `Subsystem` field.
+ *
+ * This is how the launcher decides whether an app is a pure CLI tool or a
+ * windowed program — and the decision cannot come from the command name, the
+ * install source, or the file extension:
+ *
+ *   - `kimi.exe` and `Fiddler.exe` are both `.exe` on PATH; only one is a CLI;
+ *   - npm installs of GUI apps (VS Code, Cursor) are `.cmd` shims that *look*
+ *     like CLI tools but start a window as soon as the real `.exe` is reached;
+ *   - the same package can ship either, so no per-package allow-list holds.
+ *
+ * The subsystem only exists in the file header, so this reads ~70 bytes and
+ * **never executes anything** — the constraint that makes it safe to run
+ * during discovery, where spawning an unknown program is exactly the hazard
+ * `DO_NOT_EXECUTE` exists to prevent.
+ *
+ * @param file Absolute path to the candidate executable.
+ * @returns `true` when the PE header declares the GUI subsystem, `false` for
+ *   console programs and for anything that is not a PE image (script shims,
+ *   shebang wrappers, unreadable files) — a shim is launched *through* a
+ *   shell, so treating "not a PE" as console is the correct default.
+ */
+export function isGuiExecutable(file: string): boolean {
+  /* eslint-disable no-bitwise -- PE offsets are bit-packed little-endian fields */
+  let fd: number | undefined;
+  try {
+    fd = openSync(file, "r");
+
+    // DOS stub: "MZ" then a pointer to the PE header at offset 0x3c.
+    const dos = Buffer.alloc(64);
+    if (readSync(fd, dos, 0, 64, 0) !== 64) return false;
+    if (dos.readUInt16LE(0) !== 0x5a4d) return false;
+
+    const peOffset = dos.readUInt32LE(0x3c);
+    // Reject absurd offsets rather than seeking into a multi-MB binary. Every
+    // linker that emits PE keeps the header within the first 64 KiB.
+    if (peOffset <= 0 || peOffset > 0x10000) return false;
+
+    const signature = Buffer.alloc(4);
+    if (readSync(fd, signature, 0, 4, peOffset) !== 4) return false;
+    if (signature.readUInt32LE(0) !== 0x00004550) return false; // "PE\0\0"
+
+    // COFF header: the optional header's size is what tells us the field we
+    // want is actually present (object files carry an empty optional header).
+    const coff = Buffer.alloc(20);
+    if (readSync(fd, coff, 0, 20, peOffset + 4) !== 20) return false;
+    if (coff.readUInt16LE(16) < 70) return false;
+
+    // Subsystem sits at optional-header offset 68 in both PE32 and PE32+, so
+    // the same seek works for 32- and 64-bit images alike.
+    const subsystem = Buffer.alloc(2);
+    if (readSync(fd, subsystem, 0, 2, peOffset + 4 + 20 + 68) !== 2) return false;
+    return subsystem.readUInt16LE(0) === IMAGE_SUBSYSTEM_WINDOWS_GUI;
+  } catch {
+    // Missing file, permission denied, or a directory: not a PE we can read,
+    // so fall back to the console interpretation.
+    return false;
+  } finally {
+    if (fd !== undefined) {
+      try {
+        closeSync(fd);
+      } catch {
+        /* the handle is already gone — nothing left to release */
+      }
+    }
+  }
+  /* eslint-enable no-bitwise */
+}
+

@@ -21,12 +21,13 @@ type WindowsShell = "powershell" | "cmd";
  * so the argv shapes for all three platforms are only reachable through this
  * export, and only one of them can ever run for real on a given machine.
  */
-export declare function _terminalInvocationFor(platform: NodeJS.Platform, command: string, cwd: string, shell?: WindowsShell): {
+export declare function _terminalInvocationFor(platform: NodeJS.Platform, command: string, cwd: string, shell?: WindowsShell, hasGui?: boolean): {
     cmd: string;
     args: string[];
+    kind: "direct" | "terminal";
 };
 export declare function _setActionHooks(hooks: {
-    spawnTerminal?: (command: string, cwd: string, shell?: WindowsShell) => {
+    spawnTerminal?: (command: string, cwd: string, shell?: WindowsShell, hasGui?: boolean) => {
         ok: boolean;
         detail: string;
     };

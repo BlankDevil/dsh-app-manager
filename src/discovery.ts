@@ -9,7 +9,7 @@
  *                            is flagged as unmanaged (portable / manually-placed)
  */
 
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { basename, join } from "node:path";
 import type {
   AppCategory,
@@ -21,12 +21,15 @@ import type {
   ScanSourceReport,
 } from "./types.js";
 import {
+  EXECUTABLE_EXTS,
   appDataDir,
   dedupeBy,
   enumPathExecutables,
   execSafe,
   getLastSpawnError,
+  getPathDirs,
   homeDir,
+  isGuiExecutable,
   localAppDataDir,
   namesLikelyMatch,
   npmGlobalRoot,
@@ -234,6 +237,53 @@ function stripLauncherExt(name: string): string {
   return name;
 }
 
+/* -------------------------------------------------------------------------- */
+/*  GUI detection for the launcher                                            */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Resolve the first command on PATH and report whether it is a windowed
+ * program.
+ *
+ * The launcher needs this for one decision: a GUI app must be started
+ * *directly* (a terminal would only sit there attached to a process that owns
+ * its own window), while a pure CLI tool needs that terminal to stay open.
+ *
+ * What gets inspected is the file PATH actually resolves to, not the package
+ * directory or the `bin` declaration — an npm package can declare a `.js`
+ * entry but install a `.cmd` shim, and it is the shim Windows starts.
+ *
+ * Never executes anything: `isGuiExecutable` reads the PE header, and the
+ * whole probe degrades to `false` (console) when it cannot tell.
+ *
+ * @param command A bare command name, as it appears in `CliApp.commands`.
+ * @returns `true` only when a PE image on PATH declares the GUI subsystem.
+ */
+function commandHasGui(command: string): boolean {
+  // Off Windows the question does not arise: every app gets a terminal.
+  if (process.platform !== "win32") return false;
+
+  const dirs = getPathDirs();
+  const names = [command, ...EXECUTABLE_EXTS.map((ext) => command + ext)];
+
+  for (const dir of dirs) {
+    // Respect PATH precedence exactly like the shell does: the first match
+    // wins, and a match that is not a PE (a `.cmd` shim) settles the answer
+    // as "console" instead of falling through to a later duplicate.
+    for (const name of names) {
+      const candidate = join(dir, name);
+      if (!existsSync(candidate)) continue;
+      try {
+        if (!statSync(candidate).isFile()) continue;
+      } catch {
+        continue;
+      }
+      return isGuiExecutable(candidate);
+    }
+  }
+  return false;
+}
+
 function detectCliFromPackageJson(pkgPath: string, pkgName: string): CliApp | null {
   const pkg = readPackageJson(pkgPath);
   if (!pkg) return null;
@@ -321,6 +371,10 @@ function detectCliFromPackageJson(pkgPath: string, pkgName: string): CliApp | nu
     latestVersion: null,
     managed: false,
     installKind: "managed",
+    // npm ships GUI apps (VS Code, Cursor) through the same `.cmd` shims as
+    // CLI tools, so the shim says nothing — resolve the command on PATH and
+    // read the real executable's PE header instead.
+    hasGui: normalised.some((c) => commandHasGui(c)),
   };
 }
 
@@ -544,6 +598,7 @@ function discoverScoopRaw(): CliApp[] {
           latestVersion: null,
           managed: true,
           installKind: "managed",
+          hasGui: [...new Set(commands)].some((c) => commandHasGui(c)),
         });
       }
     }
@@ -612,6 +667,7 @@ function discoverChocoRaw(): CliApp[] {
         latestVersion: null,
         managed: true,
         installKind: "managed",
+        hasGui: commandHasGui(command),
       });
     }
     return apps;
@@ -646,6 +702,7 @@ function discoverChocoRaw(): CliApp[] {
         latestVersion: null,
         managed: true,
         installKind: "managed",
+        hasGui: commandHasGui(match[1].toLowerCase()),
       });
     }
   }
@@ -691,6 +748,7 @@ function discoverCargoRaw(): CliApp[] {
         latestVersion: null,
         managed: true,
         installKind: "managed",
+        hasGui: (bins.length > 0 ? bins : [match[1]]).some((c) => commandHasGui(c)),
       });
     }
   }
@@ -735,6 +793,7 @@ function discoverPipxRaw(): CliApp[] {
         latestVersion: null,
         managed: true,
         installKind: "managed",
+        hasGui: injected.some((c) => commandHasGui(c)),
       });
     }
   } catch {
@@ -777,6 +836,7 @@ function discoverPipGlobalRaw(): CliApp[] {
         latestVersion: null,
         managed: true,
         installKind: "managed",
+        hasGui: commandHasGui(command),
       });
     }
   } catch {
@@ -824,6 +884,7 @@ function discoverUvToolsRaw(): CliApp[] {
         latestVersion: null,
         managed: true,
         installKind: "managed",
+        hasGui: commandHasGui(pkgMatch[1].toLowerCase()),
       });
     }
   }
@@ -859,6 +920,9 @@ function discoverFromPathRaw(): CliApp[] {
       // Managed-ness is resolved later during cross-referencing with ARP.
       managed: false,
       installKind: "path-shim",
+      // PATH enumeration already handed us the executable itself, so this is
+      // a direct header read — no PATH re-resolution needed.
+      hasGui: isGuiExecutable(exe.path),
     });
   }
 
@@ -890,6 +954,16 @@ const PATH_NOISE_DIRS = [
   // noise: a "version scan" that pops a GUI window and cannot be dismissed
   // blocks the very refresh it was meant to serve.
   "\\program files\\wsl",
+  // Fiddler's install directory holds no user-facing command: every `.exe` in
+  // it is an internal step of the product — the GUI itself, its certificate
+  // helper, the loopback enabler, and `uninst.exe`, which *is* the uninstaller.
+  // They are on PATH, so they were listed as if they were tools, and each one
+  // is a hazard to start: `uninst` uninstalls on launch, and `EnableLoopback` /
+  // `TrustCert` mutate machine-wide network and certificate state. Dropping the
+  // directory keeps them out of the table entirely; `DO_NOT_EXECUTE` in
+  // commands.ts stays as the second layer, for copies that arrive some other
+  // way (scoop, choco, a hand-placed shim).
+  "\\programs\\fiddler",
   "\\nodejs\\node_modules\\npm\\bin",
   "\\node_modules\\.bin",
   "\\pnpm\\",

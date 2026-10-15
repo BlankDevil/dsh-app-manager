@@ -284,7 +284,11 @@ function commandHasGui(command: string): boolean {
   return false;
 }
 
-function detectCliFromPackageJson(pkgPath: string, pkgName: string): CliApp | null {
+function detectCliFromPackageJson(
+  pkgPath: string,
+  pkgName: string,
+  options: { allowNoCommand?: boolean } = {}
+): CliApp | null {
   const pkg = readPackageJson(pkgPath);
   if (!pkg) return null;
 
@@ -356,13 +360,24 @@ function detectCliFromPackageJson(pkgPath: string, pkgName: string): CliApp | nu
       return pathIndexHas(c);
     });
 
-  if (normalised.length === 0) return null;
-
   const known = KNOWN_CLI_PACKAGES[canonicalName] ?? KNOWN_CLI_PACKAGES[pkgName];
+
+  // Packages that expose no command are still installed software. Showing them
+  // keeps the dashboard honest about what is on the machine — a deprecated or
+  // mis-packaged install (e.g. `deepseek-tui`) is less confusing when it is
+  // visible with a "no command" marker than when it silently disappears after
+  // a global install. Launch routes will refuse to start it for lack of a bin.
+  //
+  // Only global package-manager roots opt in. The npx cache is a *download*
+  // cache whose flat `node_modules` holds every transitive dependency of every
+  // package ever run through `npx`; listing those added 141 library rows on
+  // this machine (`ajv`, `zod`, `commander`, …) and buried the real tools.
+  if (normalised.length === 0 && !options.allowNoCommand) return null;
+  const resolvedCommands = [...new Set(normalised)];
   return {
     name: canonicalName,
     version: typeof pkg.version === "string" ? pkg.version : "unknown",
-    commands: [...new Set(normalised)],
+    commands: resolvedCommands,
     category: known?.category || "other",
     description: known?.desc || (typeof pkg.description === "string" ? pkg.description : ""),
     source: "npm",
@@ -374,7 +389,7 @@ function detectCliFromPackageJson(pkgPath: string, pkgName: string): CliApp | nu
     // npm ships GUI apps (VS Code, Cursor) through the same `.cmd` shims as
     // CLI tools, so the shim says nothing — resolve the command on PATH and
     // read the real executable's PE header instead.
-    hasGui: normalised.some((c) => commandHasGui(c)),
+    hasGui: resolvedCommands.length > 0 && resolvedCommands.some((c) => commandHasGui(c)),
   };
 }
 
@@ -423,7 +438,7 @@ function discoverNpmGlobalRaw(): CliApp[] {
             if (!scopedEntry.isDirectory()) continue;
             const fullName = `${entry.name}/${scopedEntry.name}`;
             const pkgPath = join(scopeDir, scopedEntry.name);
-            const app = detectCliFromPackageJson(pkgPath, fullName);
+            const app = detectCliFromPackageJson(pkgPath, fullName, { allowNoCommand: true });
             if (app) {
               app.source = "npm";
               apps.push(app);
@@ -434,7 +449,7 @@ function discoverNpmGlobalRaw(): CliApp[] {
         }
       } else {
         const pkgPath = join(globalDir, entry.name);
-        const app = detectCliFromPackageJson(pkgPath, entry.name);
+        const app = detectCliFromPackageJson(pkgPath, entry.name, { allowNoCommand: true });
         if (app) {
           app.source = "npm";
           apps.push(app);
@@ -480,7 +495,7 @@ function discoverPnpmGlobalRaw(): CliApp[] {
       if (!deps) continue;
       for (const [name, info] of Object.entries(deps)) {
         const pkgPath = info.path || join(process.env.PNPM_HOME || "", "global", "node_modules", name);
-        const app = detectCliFromPackageJson(pkgPath, name);
+        const app = detectCliFromPackageJson(pkgPath, name, { allowNoCommand: true });
         if (app) {
           app.version = info.version || app.version;
           app.source = "pnpm";

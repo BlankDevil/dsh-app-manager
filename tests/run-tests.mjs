@@ -565,10 +565,26 @@ async function main() {
     return `${seen.size} 个唯一键`;
   });
 
-  await test("TC-E06", "commands 非空数组", async () => {
-    const bad = appsJson.apps.filter((a) => !Array.isArray(a.commands) || a.commands.length === 0);
-    assert(bad.length === 0, `commands 为空: ${bad.map((a) => a.name).join(",")}`);
-    return `${appsJson.apps.length} 项全部有命令`;
+  await test("TC-E06", "commands 为数组；无命令项仅来自包管理器且不在 PATH", async () => {
+    // `commands` used to be required to be non-empty, because anything without
+    // a command was dropped from discovery. Packages installed with no `bin`
+    // are now listed (a global install that exposes no command should still be
+    // visible), so the invariant moves: it must be an array, an empty one is
+    // only legal for package-manager sources, and such an app can never claim
+    // to be on PATH.
+    const notArray = appsJson.apps.filter((a) => !Array.isArray(a.commands));
+    assert(notArray.length === 0, `commands 不是数组: ${notArray.map((a) => a.name).join(",")}`);
+
+    const noCmd = appsJson.apps.filter((a) => a.commands.length === 0);
+    const wrongSource = noCmd.filter((a) => a.source !== "npm" && a.source !== "pnpm");
+    assert(
+      wrongSource.length === 0,
+      `非包管理器来源出现无命令项: ${wrongSource.map((a) => `${a.name}@${a.source}`).join(",")}`
+    );
+    const pretending = noCmd.filter((a) => a.inPath === true);
+    assert(pretending.length === 0, `无命令却标为在 PATH: ${pretending.map((a) => a.name).join(",")}`);
+
+    return `${appsJson.apps.length} 项；其中 ${noCmd.length} 项无命令（包管理器来源，不可启动）`;
   });
 
   await test("TC-E07", "跨端点总数一致", async () => {

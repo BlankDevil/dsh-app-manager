@@ -1094,9 +1094,12 @@ function generateAppManagerPage(): string {
       .map((app) => {
         // pathIndexHas() reuses a cached PATH listing; commandExists() would
         // spawn a process per command (≈0.5s each) inside this render loop.
-        const status = app.commands.some((cmd) => pathIndexHas(cmd))
-          ? "<span class='status ok'>✅ PATH</span>"
-          : "<span class='status missing'>❌ PATH</span>";
+        const hasCommands = app.commands.length > 0;
+        const status = !hasCommands
+          ? "<span class='status none' title='Package exposes no command'>— no command</span>"
+          : app.commands.some((cmd) => pathIndexHas(cmd))
+            ? "<span class='status ok'>✅ PATH</span>"
+            : "<span class='status missing'>❌ PATH</span>";
         const installBadge = app.managed
           ? "<span class='kind managed'>managed</span>"
           : `<span class='kind unmanaged'>${escapeHtml(app.installKind)}</span>`;
@@ -1324,6 +1327,20 @@ function generateAppManagerPage(): string {
     .tool-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
     .tool-btn[disabled] { opacity: 0.6; cursor: progress; }
     .tool-label { color: var(--muted); }
+    .tool-search {
+      font: inherit;
+      font-size: var(--fs-small);
+      color: var(--text);
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 0.24rem 0.5rem;
+      min-width: 10rem;
+    }
+    .tool-search::placeholder { color: var(--muted); }
+    .tool-warn { color: var(--warn); font-weight: 600; }
+    .tool-row-hidden { display: none !important; }
+    .cat-empty { display: none !important; }
     .tool-select {
       font: inherit;
       font-size: var(--fs-small);
@@ -1335,6 +1352,9 @@ function generateAppManagerPage(): string {
       cursor: pointer;
     }
     .tool-select:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+    /* margin-left:auto pins the status/countdown and everything after it
+       (the refresh button) to the right edge, as one adjacent cluster. The
+       left group keeps the shell / auto-refresh pickers and the search box. */
     .tool-status { color: var(--muted); margin-left: auto; }
 
     /* Leftover marker — lives **inside the app's own row**, not in a banner */
@@ -1588,6 +1608,7 @@ function generateAppManagerPage(): string {
     .status { font-size: var(--fs-small); font-weight: 600; }
     .status.ok { color: var(--ok); }
     .status.missing { color: var(--missing); }
+    .status.none { color: var(--muted); font-weight: 400; }
 
     .kind {
       display: inline-block;
@@ -1711,7 +1732,6 @@ function generateAppManagerPage(): string {
       </div>
 
       <div class="toolbar">
-        <button class="tool-btn" type="button" id="refresh-btn" title="重新扫描本机（并逐个探测版本；也检查一次更新）">⟳ 刷新</button>
         ${
           process.platform === "win32"
             ? `<label class="tool-label" for="shell-select">终端</label>
@@ -1728,7 +1748,12 @@ function generateAppManagerPage(): string {
           <option value="60">60 秒</option>
           <option value="300">5 分钟</option>
         </select>
+        <input class="tool-search" type="search" id="app-search" placeholder="搜索应用…" title="按名称或命令过滤列表" autocomplete="off">
+        <!-- Right-aligned cluster: the status/countdown and the refresh button
+             sit next to each other at the end of the row. -->
         <span class="tool-status" id="refresh-status">尚未刷新</span>
+        <button class="tool-btn" type="button" id="refresh-btn" title="重新扫描本机（并逐个探测版本；也检查一次更新）">⟳ 刷新</button>
+        <span class="tool-warn" id="storage-warn" hidden></span>
       </div>
 
       <div class="sources">
@@ -2146,6 +2171,25 @@ function generateAppManagerPage(): string {
       var moves = {};
       try { moves = JSON.parse(localStorage.getItem(MOVE_KEY) || '{}') || {}; } catch (e) { moves = {}; }
 
+      // Find a row by its app name WITHOUT building an attribute selector.
+      //
+      // The previous version built a selector string from the app name and
+      // escaped it with the platform escaping helper. That helper is missing
+      // in some engines this page runs in (jsdom, embedded WebViews), and a
+      // hand-rolled fallback has to escape quotes and backslashes inside a
+      // string that is itself embedded in a template literal — one missed
+      // backslash and the whole inline script dies with a syntax error, taking
+      // the drag feature with it. Comparing the attribute directly sidesteps
+      // escaping entirely: app names are arbitrary strings, so never build a
+      // selector out of one.
+      function findRowByName(appName) {
+        var rows = document.querySelectorAll('tbody tr[data-app]');
+        for (var i = 0; i < rows.length; i++) {
+          if (rows[i].getAttribute('data-app') === appName) return rows[i];
+        }
+        return null;
+      }
+
       function applyMoves() {
         var byCat = {};
         sections.forEach(function (s) { byCat[s.getAttribute('data-category')] = s; });
@@ -2154,7 +2198,7 @@ function generateAppManagerPage(): string {
           if (!target) return;
           var body = target.querySelector('tbody');
           if (!body) return;
-          var row = document.querySelector('tr[data-app="' + CSS.escape(appName) + '"]');
+          var row = findRowByName(appName);
           if (row && row.parentElement !== body) body.appendChild(row);
         });
       }
@@ -2436,6 +2480,56 @@ function generateAppManagerPage(): string {
           shellSelect.addEventListener('change', function () { writePref(SHELL_KEY, shellSelect.value); });
         }
 
+        // Layout preferences (column widths, category order, row moves) live in
+        // localStorage. If the browser blocks it — private mode, a sandboxed
+        // frame, storage disabled by policy — every change reverts on reload.
+        // That looked exactly like a bug in the drag feature, so say it out
+        // loud instead of letting the writes fail silently in a try/catch.
+        (function () {
+          var ok = false;
+          try {
+            var probe = 'am.storage.probe';
+            localStorage.setItem(probe, '1');
+            ok = localStorage.getItem(probe) === '1';
+            localStorage.removeItem(probe);
+          } catch (e) { ok = false; }
+          if (ok) return;
+          var warn = document.getElementById('storage-warn');
+          if (warn) {
+            warn.textContent = '⚠ 浏览器禁用了本地存储，拖动排序/分类无法保存';
+            warn.hidden = false;
+          }
+        })();
+
+        // Live filter: search by app name or command.
+        var searchEl = document.getElementById('app-search');
+        function applySearch() {
+          var q = (searchEl ? searchEl.value : '').trim().toLowerCase();
+          var rows = document.querySelectorAll('tbody tr[data-app]');
+          for (var i = 0; i < rows.length; i++) {
+            var tr = rows[i];
+            var name = (tr.getAttribute('data-app') || '').toLowerCase();
+            var cmd = (tr.getAttribute('data-cmd') || '').toLowerCase();
+            var match = !q || name.indexOf(q) >= 0 || cmd.indexOf(q) >= 0;
+            tr.classList.toggle('tool-row-hidden', !match);
+          }
+          // Collapse categories that have no visible rows; keep them searchable.
+          sections.forEach(function (sec) {
+            var visible = sec.querySelectorAll('tbody tr:not(.tool-row-hidden)').length;
+            sec.classList.toggle('cat-empty', visible === 0);
+          });
+        }
+        if (searchEl) {
+          searchEl.addEventListener('input', applySearch);
+          // Re-apply after a refresh repaints the table.
+          var _origApplyPayload = applyPayload;
+          applyPayload = function (data) {
+            var r = _origApplyPayload(data);
+            applySearch();
+            return r;
+          };
+        }
+
         // 只改版本单元格的第一个文本节点，保住可能存在的升级徽章。
         function setVersion(tr, version, note) {
           var cell = tr.querySelector('td.version');
@@ -2605,7 +2699,7 @@ function generateAppManagerPage(): string {
             function (n) { if (n.parentNode) n.parentNode.removeChild(n); }
           );
           leftovers.forEach(function (item) {
-            var row = document.querySelector('tr[data-app="' + CSS.escape(item.name) + '"]');
+            var row = findRowByName(item.name);
             if (!row) return;
             var cell = row.querySelector('td');
             if (!cell) return;

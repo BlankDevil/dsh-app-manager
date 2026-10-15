@@ -29,6 +29,21 @@ uninstallers leave behind are reported and offered for cleanup.
 - **`GET /app-manager/api/health`** — `uninstalled` + `leftovers` +
   `generatedAt` (`?refresh=1` bypasses the 60-second cache).
 - **`POST /app-manager/api/leftover/fix`** — cleans one leftover.
+- **Search box** — filters the table by app name or command as you type, hides
+  categories that end up empty, and re-applies itself after a refresh repaints
+  the rows. It sits with the left-hand controls, while the refresh button moved
+  to the end of the toolbar so that it and the refresh countdown form one
+  adjacent, right-aligned pair.
+- **Installed packages that expose no command are listed.** A global install
+  with no `bin` (`deepseek-tui` is one: the package was renamed upstream and
+  now ships only a deprecation notice) used to vanish from the table entirely,
+  which reads as "the dashboard did not notice my install". It is now shown
+  with a muted **`— no command`** status and a non-clickable name, so the list
+  matches what is actually installed without offering to launch something that
+  cannot start. The relaxation is limited to the npm/pnpm global roots: the npx
+  cache is a download cache whose flat `node_modules` holds every transitive
+  dependency of every package ever run through `npx`, and listing those added
+  141 library rows on this machine.
 - **Clicking an app starts it the way its own kind demands.** A command-line
   tool needs a terminal to hold its output — without one it flashes and the
   error is unreadable — while a program with a window *is* its own interface,
@@ -41,6 +56,26 @@ uninstallers leave behind are reported and offered for cleanup.
 
 ### Fixed
 
+- **Dragging an app into another category looked like it had not been saved.**
+  The move *was* written to `localStorage`, but restoring it after a reload
+  went through a `[data-app="…"]` selector built with `CSS.escape`. That helper
+  is missing in jsdom and in some embedded WebViews, and it is not a cosmetic
+  difference: the restore path threw, so every row quietly snapped back to its
+  original category on the next page load while the stored value sat there
+  unused. Rows are now located by comparing the `data-app` attribute directly,
+  so app names — which are arbitrary strings — are never interpolated into a
+  selector. Verified by reloading the page in jsdom with `localStorage`
+  pre-seeded: the old build fails the assertion (the move is lost), the new one
+  passes. The test that used to cover this asserted only that the script text
+  contained `applySavedOrder` and the storage key, which passes even when the
+  restore is broken; it now drives a real reload.
+- **A blocked `localStorage` reverted every layout change silently.** Column
+  widths, category order and row moves are stored client-side, and every write
+  was wrapped in a `try/catch` that swallowed the failure. In private mode, a
+  sandboxed frame or under a storage policy, the drag *appears* to work and is
+  gone on the next load, with nothing on screen to explain it. The page now
+  probes storage once at startup and shows **`⚠ 浏览器禁用了本地存储…`** in the
+  toolbar when the writes cannot land.
 - **Windows/WSL internals were listed as apps — and probing them popped a
   GUI window.** `C:\Program Files\WSL\` holds the WSL stack's own components
   (`wslg`, `wslhost`, `wslrelay`, `wslservice`, `wslc`, `container`, `msrdc`).

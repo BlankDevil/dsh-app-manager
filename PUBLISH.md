@@ -62,14 +62,18 @@ lib/bin/cli-app-manager.{js,d.ts,*.map}
 lib/src/{index,discovery,commands,utils,types}.{js,d.ts,*.map}
 ```
 
-**29 个文件。** 0.8.0 实测（`npm pack --dry-run --json`）：
+**29 个文件。** 0.8.0 实测（`npm pack`）：
 
 ```
-package size   : 141.0 kB（tgz）
+package size   : 141.0 kB（tgz，141 002 字节）
 unpacked size  : 527.7 kB
 total files    : 29
-shasum         : 9bdc87476b046c3c70e2c34838e2e3dc988edd2e
+sha1           : f2f6e8ba55274b9e3f8826c656ed2b57222fbee7   ← 应等于 registry 的 dist.shasum
+sha256         : a21e0abe808c10f8e392e45b123185e150d8e10e13e2c19aef39a7ff2988707d
 ```
+
+**可复现**：连打两次，sha256 完全相同（2026-10-15 实测）——所以发布后可用
+registry 的 `dist.shasum` 与本地 sha1 对拍，确认「发布的就是验证过的这份」。
 
 `LICENSE` / `README.md` / `CHANGELOG.md` / `patch.yml` / `package.json` 均已确认在包内。
 确认**不含**：`src/`、`tests/`、`node_modules`、
@@ -122,6 +126,10 @@ tar -tzf dsh-app-manager-*.tgz  # 核对内容清单（应与 §3 一致）
 | `ssh.github.com:443` | 不可达；`~/.ssh/` 为空（无密钥） |
 
 **但 `api.github.com` 是通的（200，0.5s）** —— 所以 GitHub API 可用，git 传输不行。
+
+**GitHub API 也写不了** —— connector 只读：`create_branch` / `push_files` 一律
+`403 Resource not accessible by integration`（读接口正常）。所以「用 API 建分支/开 PR」
+这条退路同样不存在。
 
 **处置**：在本机终端（有外网/VPN 的那个）执行一下推送：
 

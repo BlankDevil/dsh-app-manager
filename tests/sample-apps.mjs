@@ -55,30 +55,64 @@ function usable(pool, label) {
 /**
  * Pick a random sample of `pool`.
  *
- * Unbiased partial Fisher–Yates. Clamped: a pool smaller than `min` is used in
- * full rather than silently dropping apps, and an empty pool stays empty (the
- * caller decides whether that is a failure).
+ * Unbiased partial Fisher–Yates on a **copy** (the caller's array is left
+ * alone). Clamped: a pool smaller than `min` is used in full rather than
+ * silently dropping apps, and an empty pool stays empty (the caller decides
+ * whether that is a failure).
  *
- * @param {Array<{name: string}>} pool candidates
- * @param {{min?: number, max?: number, label?: string}} [opts]
+ * `stratify` spreads the sample across `source` values instead of drawing it
+ * uniformly. Uniform drawing is fine on a machine where the sources are evenly
+ * populated, but this one has ~35 `path` apps and ~10 `npm` ones — a uniform
+ * sample of 5 is mostly `path` most of the time, so the npm / choco / npx
+ * branches of the app record go untested run after run. Round-robin across
+ * sources means every run touches several of them.
+ *
+ * @param {Array<{name: string, source?: string}>} pool candidates
+ * @param {{min?: number, max?: number, label?: string, stratify?: boolean}} [opts]
  */
-export function sampleApps(pool, { min = 4, max = 6, label = "app" } = {}) {
+export function sampleApps(pool, { min = 4, max = 6, label = "app", stratify = false } = {}) {
   const list = usable(pool, label);
   if (list.length === 0) return [];
 
   const want = min + Math.floor(Math.random() * (max - min + 1));
   const n = Math.min(list.length, Math.max(min, Math.min(max, want)));
 
-  for (let i = 0; i < n; i += 1) {
-    const j = i + Math.floor(Math.random() * (list.length - i));
-    const t = list[i];
-    list[i] = list[j];
-    list[j] = t;
+  const shuffled = list.slice();
+  for (let i = 0; i < shuffled.length; i += 1) {
+    const j = i + Math.floor(Math.random() * (shuffled.length - i));
+    const t = shuffled[i];
+    shuffled[i] = shuffled[j];
+    shuffled[j] = t;
   }
 
-  const picked = list.slice(0, n);
+  let picked;
+  if (stratify) {
+    const bySource = new Map();
+    for (const app of shuffled) {
+      const key = app.source ?? "?";
+      if (!bySource.has(key)) bySource.set(key, []);
+      bySource.get(key).push(app);
+    }
+    const buckets = [...bySource.values()];
+    picked = [];
+    let progressed = true;
+    while (picked.length < n && progressed) {
+      progressed = false;
+      for (const bucket of buckets) {
+        if (picked.length >= n) break;
+        if (bucket.length > 0) {
+          picked.push(bucket.shift());
+          progressed = true;
+        }
+      }
+    }
+  } else {
+    picked = shuffled.slice(0, n);
+  }
+
+  const sources = [...new Set(picked.map((a) => a.source ?? "?"))].join("+");
   console.log(
-    `  · 随机抽样 ${label} ${picked.length}/${list.length}：${picked.map((a) => a.name).join(", ")}`
+    `  · 随机抽样 ${label} ${picked.length}/${list.length}（来源 ${sources}）：${picked.map((a) => a.name).join(", ")}`
   );
   return picked;
 }

@@ -42,8 +42,10 @@ const PLUGIN_ENTRY = path.join(PLUGIN_DIR, "lib/src/index.js");
 
 const require_ = createRequire(import.meta.url);
 const cp = require_("node:child_process");
-/** spawnSync is captured before patching so the self-check can still spawn. */
+/** Captured BEFORE patching so the escape-hatch check can still start a real child. */
 const spawnSync = cp.spawnSync;
+/** Real async spawn, also captured before the stub replaces `cp.spawn`. */
+const realSpawn = cp.spawn;
 
 /** Every stubbed spawn call, as `[command, args, options]`. */
 const SPAWNS = [];
@@ -84,9 +86,23 @@ if (process.argv[2] === "--child-unattended") {
   const tools = makeToolsService();
   loadTools(plugin, { tools }); // deliberately NO approval service
   const tool = tools.registered.find((t) => t.name === "app_manager_update");
+
+  // 动态挑一个**可升级来源（npm）**的应用，不写死名字。
+  // 曾写死 "dsh"，但本机那份全局 dsh 安装损坏后退化成 path-shim，
+  // 于是 `update dsh` 走的是"来源不支持自动更新"的拒绝分支 —— 测试随之失败，
+  // 而失败原因与被测逻辑无关。挑选逻辑与 TC-A15 挑 path 应用一致。
+  const { discoverAll } = await import(
+    pathToFileURL(path.join(PLUGIN_DIR, "lib/src/discovery.js")).href
+  );
+  const target = discoverAll().find((a) => a.source === "npm" && a.commands?.length > 0);
+  if (!target) {
+    process.stdout.write("本机没有 npm 来源的应用，无法验证逃生口\n[spawns=0]");
+    process.exit(4);
+  }
+
   const out = String(
     await tool.execute(
-      { name: "dsh" },
+      { name: target.name },
       { signal: new AbortController().signal, callId: "child_call_1", agent: { fake: "agent" } }
     )
   );
@@ -112,6 +128,49 @@ async function check(label, fn) {
 }
 function assert(cond, msg) {
   if (!cond) throw new Error(msg);
+}
+
+/**
+ * 异步跑一个子进程并收集输出。
+ *
+ * 用它而不是 `spawnSync`：本机宿主环境里 `spawnSync` 对**任何**目标都返回 EBUSY
+ * （连 `cmd.exe /c echo` 都不行），异步 `spawn` 则完全正常。用具名返回值把
+ * 「没起来」和「起来了但行为不对」分开，避免把环境问题误读成被测代码缺陷。
+ */
+async function runChildAsync(args, env, timeoutMs = 120000) {
+  return await new Promise((resolve) => {
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(result);
+    };
+    const child = realSpawn(NODE, args, { stdio: ["ignore", "pipe", "pipe"], env, windowsHide: true });
+    const timer = setTimeout(() => {
+      try {
+        child.kill();
+      } catch {
+        /* already gone */
+      }
+      finish({ code: null, stdout, stderr: `TIMEOUT after ${timeoutMs}ms`, spawnError: null });
+    }, timeoutMs);
+    child.stdout?.on("data", (d) => {
+      stdout += d;
+    });
+    child.stderr?.on("data", (d) => {
+      stderr += d;
+    });
+    child.on("error", (e) =>
+      finish({ code: null, stdout, stderr, spawnError: `${e.code ?? ""}: ${e.message}` })
+    );
+    // 以 exit 为准结算（理由见 run-tests.mjs 里 runCli 的注释：孙进程可能继承
+    // 管道并让 close 永不触发）。
+    child.on("exit", (code) => setTimeout(() => finish({ code, stdout, stderr, spawnError: null }), 250));
+    child.on("close", (code) => finish({ code, stdout, stderr, spawnError: null }));
+  });
 }
 
 function makeToolsService() {
@@ -272,13 +331,15 @@ await check("allowed-once 时执行更新，且审批请求带齐身份信息", 
 console.log("");
 console.log("━━━ 逃生口：APP_MANAGER_ALLOW_UNATTENDED_UPDATE=1 ━━━");
 
-await check("子进程实测：置位后无需审批直接放行", () => {
-  const r = spawnSync(NODE, [fileURLToPath(import.meta.url), "--child-unattended"], {
-    encoding: "utf8",
-    timeout: 120000,
-    env: { ...process.env, APP_MANAGER_ALLOW_UNATTENDED_UPDATE: "1" },
+await check("子进程实测：置位后无需审批直接放行", async () => {
+  // 异步 spawn（非 spawnSync）：本机环境下 spawnSync 对任何目标都报 EBUSY，
+  // 而异步 spawn 正常。用它才能把「子进程没起来」与「起来了但行为不对」分开。
+  const r = await runChildAsync([fileURLToPath(import.meta.url), "--child-unattended"], {
+    ...process.env,
+    APP_MANAGER_ALLOW_UNATTENDED_UPDATE: "1",
   });
-  assert(r.status === 0, `child exited ${r.status}: ${String(r.stderr).slice(0, 300)}`);
+  assert(!r.spawnError, `子进程未能启动：${r.spawnError ?? ""}`);
+  assert(r.code === 0, `child exited ${r.code}: ${String(r.stderr).slice(0, 300)}`);
   assert(/Updated/.test(r.stdout), `expected the update to proceed: ${r.stdout.slice(0, 200)}`);
   assert(/\[spawns=1\]/.test(r.stdout), `child should have stubbed exactly 1 spawn: ${r.stdout.slice(-80)}`);
   return "proceeded without prompting";

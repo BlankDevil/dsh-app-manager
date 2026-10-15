@@ -187,4 +187,28 @@ export declare function normalizeName(name: string): string;
  * Uses a normalised substring match in either direction.
  */
 export declare function namesLikelyMatch(a: string, b: string): boolean;
+/**
+ * Read a Windows executable's PE `Subsystem` field.
+ *
+ * This is how the launcher decides whether an app is a pure CLI tool or a
+ * windowed program — and the decision cannot come from the command name, the
+ * install source, or the file extension:
+ *
+ *   - `kimi.exe` and `Fiddler.exe` are both `.exe` on PATH; only one is a CLI;
+ *   - npm installs of GUI apps (VS Code, Cursor) are `.cmd` shims that *look*
+ *     like CLI tools but start a window as soon as the real `.exe` is reached;
+ *   - the same package can ship either, so no per-package allow-list holds.
+ *
+ * The subsystem only exists in the file header, so this reads ~70 bytes and
+ * **never executes anything** — the constraint that makes it safe to run
+ * during discovery, where spawning an unknown program is exactly the hazard
+ * `DO_NOT_EXECUTE` exists to prevent.
+ *
+ * @param file Absolute path to the candidate executable.
+ * @returns `true` when the PE header declares the GUI subsystem, `false` for
+ *   console programs and for anything that is not a PE image (script shims,
+ *   shebang wrappers, unreadable files) — a shim is launched *through* a
+ *   shell, so treating "not a PE" as console is the correct default.
+ */
+export declare function isGuiExecutable(file: string): boolean;
 //# sourceMappingURL=utils.d.ts.map

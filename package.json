@@ -1,6 +1,6 @@
 {
   "name": "dsh-app-manager",
-  "version": "0.5.3",
+  "version": "0.8.0",
   "description": "A CLI application manager for discovering, monitoring, and managing installed command-line tools across package managers. DSH plugin: 7 AI-callable tools plus a web dashboard at http://127.0.0.1:3080/app-manager.",
   "main": "lib/src/index.js",
   "types": "lib/src/index.d.ts",
@@ -26,6 +26,7 @@
     "test:paths": "node tests/crossplatform-paths.test.mjs",
     "test:approval": "node tests/approval-gate.test.mjs",
     "test:actions": "node tests/actions.test.mjs",
+    "test:compat": "node tests/dsh-compat.test.mjs",
     "smoke": "node tests/smoke-features.mjs",
     "prepublishOnly": "npm run build"
   },
@@ -73,7 +74,7 @@
     "typescript": "^5.7.0"
   },
   "peerDependencies": {
-    "@deepseek-ai/dsh-tools": "^0.1.5-rc.1"
+    "@deepseek-ai/dsh-tools": "^0.1.5-rc.1 || ^0.2.0-rc.2"
   },
   "peerDependenciesMeta": {
     "@deepseek-ai/dsh-tools": {

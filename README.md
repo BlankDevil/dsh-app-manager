@@ -14,8 +14,11 @@
 | 🏷️ Managed vs Unmanaged | 交叉比对 Windows「添加/删除程序」注册表，标出**非托管**程序 |
 | 📊 Unified View | 在一个界面查看所有 CLI 应用的版本、来源、托管状态 |
 | ⬆️ Update Check | 一键检查所有应用是否有新版本 |
-| 🖱️ Click NAME to launch | **点击名称直接在终端里打开**：CLI 工具进入自己的交互提示（`claude`），服务类当场启动（`9router`） |
+| 🖱️ Click NAME to launch | **点击名称直接在终端里打开**（默认 **PowerShell**，可选 cmd）：CLI 工具进入自己的交互提示（`claude`），服务类当场启动（`9router`） |
 | 🔼 Per-app Upgrade | VERSION 列显示 `⬆ 最新版` 徽章，点击（确认后）升到最新版本 |
+| 🔢 Real versions | 版本号优先取包元数据；**PATH 发现的工具（无元数据）逐个探测 `<cmd> --version` 补齐**，探不到的在悬停提示里说明原因 |
+| ⟳ Refresh | 手动刷新：重扫本机 + 重新探测版本 + 检查更新，**就地更新表格**（不丢滚动与筛选） |
+| ⏱️ Auto-refresh | 自动刷新（关闭 / 30 秒 / 60 秒 / 5 分钟，选择会记住）；**页面切到后台时暂停**，切回来立刻补一次 |
 | 🏥 Health Check | 验证应用是否正常工作、命令是否在 PATH 中 |
 | 📈 Process Monitor | 查看哪些 CLI 工具正在运行 |
 | 🔎 Quick Search | 按名称、分类或命令搜索应用 |
@@ -83,6 +86,26 @@ npm link
 # （相对路径会被 dsh 锚定到当前目录，所以 `add .` 即指本仓库）
 dsh plugin --profile web add .
 ```
+
+### dsh host compatibility / dsh 宿主兼容性
+
+| Host line / 宿主线 | Status |
+|---|---|
+| **dsh 0.2.0-rc.2** | ✅ supported（0.6.0 起） |
+| **dsh 0.1.5-rc.x** | ✅ supported |
+
+One artifact serves both lines: the host contracts this plugin uses are
+additive across them (`peerDependencies` is `^0.1.5-rc.1 || ^0.2.0-rc.2`).
+逐项契约对照见 **[COMPATIBILITY.md](./COMPATIBILITY.md)**。
+
+⚠️ **dsh 会先校验 peer 范围，再加载插件**：0.2.0 的 `dsh-app-boot` 对每个
+`@deepseek-ai/dsh*` peer 做 `semver.satisfies(runtime, range, {includePrerelease:true})`，
+不满足就**抛错并跳过该 bundle**（报错里会建议 `dsh plugin allow-version` 做精确版本豁免）。
+所以插件版本与宿主版本不匹配时，表现为**装不上**而不是运行时报错 —— 升级插件即可解决。
+
+> 💡 在 dsh 0.2.0 上，`app_manager_update` 的**审批闸门会真正生效**（该宿主自带
+> `@deepseek-ai/dsh-user-approval` 与 UI 应答器）；在 0.1.5 线上没有该服务，
+> 闸门按 fail-closed 一律拒绝。这是既有设计的自然结果，无需配置。
 
 ---
 

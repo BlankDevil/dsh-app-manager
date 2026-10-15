@@ -4,13 +4,23 @@
  */
 
 import { spawn } from "node:child_process";
-import { existsSync, statSync } from "node:fs";
+import { existsSync, renameSync, statSync } from "node:fs";
 import { homedir } from "node:os";
+import { join } from "node:path";
 
 import type { ApprovalOutcome, ApprovalService, CliApp, ContentBlock, CordisContext, HttpRequest, HttpResponse, PluginLifecycle, ToolDefinition, ToolRunContext, WebServerService } from "./types.js";
 import { _resetScanCache, buildScanReport, discoverAll, discoverUnmanaged, findApp, readManagedBaseline } from "./discovery.js";
-import { runUpdate, updateCommandFor, type UpdateOutcome } from "./commands.js";
-import { compareVersions, execAsync, pathIndexHas } from "./utils.js";
+import {
+  runUpdate,
+  updateCommandFor,
+  resolveAppVersion,
+  probeCommandHealth,
+  refuseToExecute,
+  shimFilesOnPath,
+  viaHashedPackageDir,
+  type UpdateOutcome,
+} from "./commands.js";
+import { EXECUTABLE_EXTS, compareVersions, execAsync, getPathDirs, pathIndexHas } from "./utils.js";
 
 /**
  * Answer a request that arrived after this plugin was unloaded.
@@ -64,7 +74,9 @@ function sendJson(res: HttpResponse, status: number, payload: unknown): void {
  */
 const COMMAND_TOKEN = /^[A-Za-z0-9._-]+$/;
 
-/** Where a launched terminal starts: the app's own directory when we know it. */
+/**
+ * Where a launched terminal starts: the app's own directory when we know it.
+ */
 function launchCwd(app: CliApp): string {
   if (app.path && existsSync(app.path)) {
     try {
@@ -76,23 +88,88 @@ function launchCwd(app: CliApp): string {
   return homedir();
 }
 
-/** How to open a terminal running `command`, per platform. */
+/**
+ * Which shell a click-to-launch should open on Windows.
+ *
+ * `powershell` is the default (requested behaviour): most of these tools are
+ * used interactively, and PowerShell is the shell a Windows user expects in
+ * that role. `cmd` stays available for tools/habits that need cmd semantics,
+ * and the choice is a **whitelist** — the browser may pick between these
+ * values and nothing else, so this can never become a free-form shell switch.
+ */
+type WindowsShell = "powershell" | "cmd";
+
+const WINDOWS_SHELLS: readonly WindowsShell[] = ["powershell", "cmd"];
+
+/** Validate a `?shell=` value; anything unrecognised falls back to the default. */
+function asWindowsShell(value: string | null): WindowsShell {
+  const v = (value ?? "").toLowerCase();
+  return (WINDOWS_SHELLS as readonly string[]).includes(v) ? (v as WindowsShell) : "powershell";
+}
+
+/**
+ * How to start `command`, per platform and per app kind.
+ *
+ * The app's kind decides whether a terminal is involved at all:
+ *
+ *   - **GUI app** → start the program itself, no shell. A windowed program
+ *     owns its own window and never reads a console, so wrapping it in one
+ *     leaves an empty terminal sitting next to it that the user has to close
+ *     by hand — and because `-NoExit`/`/k` keep that shell alive forever, the
+ *     empty window never goes away on its own.
+ *
+ *   - **CLI app** → open a terminal that stays open (`-NoExit` on PowerShell,
+ *     `/k` on cmd). A bare command like `claude` would otherwise flash a
+ *     window and vanish the moment it exits, taking the error message with it
+ *     — which is exactly when the user needs to read it.
+ *
+ * @param command A bare command name (already validated by `COMMAND_TOKEN`).
+ * @param cwd Directory the terminal (or program) starts in.
+ * @param platform Host platform; injectable so every branch is testable.
+ * @param shell Which whitelisted Windows shell to use for the CLI case.
+ * @param hasGui Whether the target program is a windowed application.
+ */
 function terminalInvocation(
   command: string,
   cwd: string,
-  platform: NodeJS.Platform = process.platform
-): { cmd: string; args: string[] } {
+  platform: NodeJS.Platform = process.platform,
+  shell: WindowsShell = "powershell",
+  hasGui = false
+): { cmd: string; args: string[]; kind: "direct" | "terminal" } {
+  // A windowed program is launched on its own — there is no terminal to keep,
+  // so the shell choice does not apply. `start` is still used on Windows so
+  // the child is not attached to our own console.
+  if (hasGui) {
+    if (platform === "win32") {
+      return { cmd: "cmd.exe", args: ["/c", "start", "", command], kind: "direct" };
+    }
+    if (platform === "darwin") {
+      return { cmd: "open", args: ["-a", command], kind: "direct" };
+    }
+    return { cmd: command, args: [], kind: "direct" };
+  }
+
   if (platform === "win32") {
     // `start` treats its first argument as the window title, so the empty ""
     // is required — without it a quoted command would be eaten as the title.
-    // `/k` keeps the window open after the command exits, so a failure stays
-    // readable instead of flashing away.
-    return { cmd: "cmd.exe", args: ["/c", "start", "", "cmd.exe", "/k", command] };
+    // `-NoExit` (PowerShell) / `/k` (cmd) keep the window open after the
+    // command exits, so a failure stays readable instead of flashing away.
+    if (shell === "cmd") {
+      return { cmd: "cmd.exe", args: ["/c", "start", "", "cmd.exe", "/k", command], kind: "terminal" };
+    }
+    // Prefer PowerShell 7 (`pwsh`) when it is installed, else Windows
+    // PowerShell 5.1 — same flags, so one code path covers both.
+    const ps = pathIndexHas("pwsh") ? "pwsh.exe" : "powershell.exe";
+    return { cmd: "cmd.exe", args: ["/c", "start", "", ps, "-NoExit", "-Command", command], kind: "terminal" };
   }
   if (platform === "darwin") {
-    return { cmd: "open", args: ["-a", "Terminal", "--args", "-c", `cd ${cwd} && ${command}`] };
+    return { cmd: "open", args: ["-a", "Terminal", "--args", "-c", `cd ${cwd} && ${command}`], kind: "terminal" };
   }
-  return { cmd: "x-terminal-emulator", args: ["-e", "sh", "-c", `cd ${cwd} && ${command}; exec sh`] };
+  return {
+    cmd: "x-terminal-emulator",
+    args: ["-e", "sh", "-c", `cd ${cwd} && ${command}; exec sh`],
+    kind: "terminal",
+  };
 }
 
 /**
@@ -105,21 +182,29 @@ function terminalInvocation(
 export function _terminalInvocationFor(
   platform: NodeJS.Platform,
   command: string,
-  cwd: string
-): { cmd: string; args: string[] } {
-  return terminalInvocation(command, cwd, platform);
+  cwd: string,
+  shell: WindowsShell = "powershell",
+  hasGui = false
+): { cmd: string; args: string[]; kind: "direct" | "terminal" } {
+  return terminalInvocation(command, cwd, platform, shell, hasGui);
 }
 
 /**
- * Open a terminal window running one command.
+ * Launch one discovered app.
  *
- * Detached on purpose: the window belongs to the user (they may sit inside
- * `claude` for an hour), so it has to outlive the request *and* the plugin.
- * That is the inverse of DESIGN §6's "clean up child processes on dispose",
- * which is about background services we own — not terminals we hand over.
+ * Detached on purpose: whatever starts — a terminal the user may sit inside
+ * for an hour, or a GUI window — belongs to them, so it has to outlive the
+ * request *and* the plugin. That is the inverse of DESIGN §6's "clean up child
+ * processes on dispose", which is about background services we own — not
+ * windows we hand over.
  */
-function spawnTerminal(command: string, cwd: string): { ok: boolean; detail: string } {
-  const spec = terminalInvocation(command, cwd);
+function spawnTerminal(
+  command: string,
+  cwd: string,
+  shell: WindowsShell = "powershell",
+  hasGui = false
+): { ok: boolean; detail: string } {
+  const spec = terminalInvocation(command, cwd, process.platform, shell, hasGui);
   try {
     const child = spawn(spec.cmd, spec.args, {
       cwd,
@@ -128,7 +213,10 @@ function spawnTerminal(command: string, cwd: string): { ok: boolean; detail: str
       windowsHide: false,
     });
     child.unref();
-    return { ok: true, detail: `opened ${spec.cmd}` };
+    return {
+      ok: true,
+      detail: spec.kind === "direct" ? `started ${command}` : `opened ${spec.cmd} (${shell})`,
+    };
   } catch (error) {
     return { ok: false, detail: (error as { message?: string })?.message ?? String(error) };
   }
@@ -140,18 +228,51 @@ function spawnTerminal(command: string, cwd: string): { ok: boolean; detail: str
  * The probe swaps these so it can assert the exact command line without
  * opening a real window, and so no test can ever install a global package.
  */
-let terminalSpawner = spawnTerminal;
+let terminalSpawner: (
+  command: string,
+  cwd: string,
+  shell?: WindowsShell,
+  hasGui?: boolean
+) => { ok: boolean; detail: string } = spawnTerminal;
 let updateRunner: (app: CliApp) => Promise<UpdateOutcome> = runUpdate;
 let updatesCollector: () => Promise<UpdatesPayload> = collectUpdates;
+let versionResolver: (app: CliApp, options?: { refresh?: boolean }) => Promise<string | null> =
+  resolveAppVersion;
+let scanResetter: () => void = _resetScanCache;
 
 export function _setActionHooks(hooks: {
-  spawnTerminal?: (command: string, cwd: string) => { ok: boolean; detail: string };
+  spawnTerminal?: (
+    command: string,
+    cwd: string,
+    shell?: WindowsShell,
+    hasGui?: boolean
+  ) => { ok: boolean; detail: string };
   runUpdate?: (app: CliApp) => Promise<UpdateOutcome>;
   collectUpdates?: () => Promise<UpdatesPayload>;
+  resolveAppVersion?: (app: CliApp, options?: { refresh?: boolean }) => Promise<string | null>;
+  resetScanCache?: () => void;
+  probeCommandHealth?: (app: CliApp, options?: { refresh?: boolean }) => Promise<{ broken: boolean; reason: string }>;
+  renameOrphanShim?: (file: string) => string;
+  findOrphanShims?: (command: string) => string[];
 }): void {
   if (hooks.spawnTerminal) terminalSpawner = hooks.spawnTerminal;
   if (hooks.runUpdate) updateRunner = hooks.runUpdate;
   if (hooks.collectUpdates) updatesCollector = hooks.collectUpdates;
+  if (hooks.resolveAppVersion) versionResolver = hooks.resolveAppVersion;
+  if (hooks.resetScanCache) scanResetter = hooks.resetScanCache;
+  if (hooks.probeCommandHealth) commandHealthProbe = hooks.probeCommandHealth;
+  if (hooks.renameOrphanShim) orphanShimRemover = hooks.renameOrphanShim;
+  if (hooks.findOrphanShims) orphanShimFinder = hooks.findOrphanShims;
+}
+
+interface VersionsPayload {
+  checkedAt: string;
+  /** Apps whose version was resolved by probing the tool itself. */
+  resolved: Record<string, string>;
+  /** Apps that were probed but did not report a version. */
+  unresolved: string[];
+  /** True when the sweep hit its deadline; the answer is partial. */
+  truncated?: boolean;
 }
 
 interface UpdatesPayload {
@@ -239,6 +360,279 @@ async function getUpdates(force = false): Promise<UpdatesPayload> {
   const data = await updatesCollector();
   updatesCache = { at: Date.now(), data };
   return data;
+}
+
+/**
+ * Apps whose displayed version has to be discovered by asking the tool itself.
+ *
+ * This is the majority of a real machine: everything found by PATH enumeration
+ * has no manifest to read, so the table used to render `unknown` for ~2/3 of
+ * its rows (`codex`, `kimi`, portable tools, …).
+ */
+function appsNeedingVersionProbe(): CliApp[] {
+  return discoverAll().filter((app) => {
+    const v = (app.version ?? "").trim();
+    return (!v || v === "unknown") && app.commands?.length > 0;
+  });
+}
+
+/** Sources whose record points at an install directory we can verify. */
+const PACKAGE_SOURCES = new Set([
+  "npm",
+  "pnpm",
+  "npx-cache",
+  "scoop",
+  "choco",
+  "cargo",
+  "pipx",
+  "pip",
+  "uv",
+]);
+
+/**
+ * Records that survived an uninstall: the source still lists the app but the
+ * install directory is gone.
+ */
+function findUninstalled(): Array<{ name: string; source: string; path: string }> {
+  return discoverAll()
+    // A record with **no** install path is not evidence of an uninstall: `pip`
+    // reports packages without a directory, so reading "" as "gone" hid every
+    // pip package on the machine. Only a path that is recorded *and* missing
+    // on disk means the app was uninstalled.
+    .filter((app) => {
+      if (!PACKAGE_SOURCES.has(app.source) || !app.path) return false;
+      if (existsSync(app.path)) return false;
+      // ...and a missing path is not the last word either. npm stores packages
+      // whose name starts with a digit — and, on some layouts, scoped packages
+      // too — in a hashed directory (`@anthropic-ai/.claude-code-MPHaZ0ov`)
+      // while the record points at the logical path. Checking for the hashed
+      // sibling before concluding "uninstalled" keeps a working app in the
+      // table; hiding it is what the user sees as an app disappearing.
+      return !viaHashedPackageDir(app.path);
+    })
+    .map((app) => ({ name: app.name, source: app.source, path: app.path || "" }));
+}
+
+/**
+ * The shim files a command leaves behind in PATH directories.
+ *
+ * Only **script** shims are returned: `.cmd` / `.bat` / `.ps1` and the
+ * extensionless POSIX wrapper npm writes. A real `.exe` is a program, not a
+ * leftover — offering to "fix" one would be offering to delete the user's
+ * binary, so it is never a candidate.
+ */
+function findOrphanShimFiles(command: string): string[] {
+  if (!COMMAND_TOKEN.test(command)) return [];
+  // One implementation of "where can this command leave files": the same
+  // locator the health probe uses, so detection and cleanup cannot drift apart.
+  return shimFilesOnPath(command);
+}
+
+/**
+ * Rename an orphan shim aside instead of deleting it.
+ *
+ * The action is destructive in intent and tiny in size, so it is made
+ * reversible: `<name>` becomes `<name>.orphan-<timestamp>`. A user who
+ * disagrees can rename it back, and nothing is silently destroyed.
+ */
+function renameShimAside(file: string): string {
+  const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\..+$/, "");
+  const target = `${file}.orphan-${stamp}`;
+  renameSync(file, target);
+  return target;
+}
+
+interface HealthPayload {
+  generatedAt: string;
+  /** Source records whose install directory is gone — hidden from the table. */
+  uninstalled: Array<{ name: string; source: string; path: string }>;
+  /** Commands that are still on PATH but no longer work (orphan shims). */
+  leftovers: Array<{ name: string; command: string; reason: string; files: string[] }>;
+  truncated?: boolean;
+}
+
+/** Seam: tests swap the renamer so no test can move a real file. */
+let orphanShimRemover: (file: string) => string = renameShimAside;
+
+/** Seam: tests swap the locator so no test depends on this machine's PATH. */
+let orphanShimFinder: (command: string) => string[] = findOrphanShimFiles;
+
+/** Seam: the health probe, so tests classify without spawning anything. */
+let commandHealthProbe: (
+  app: CliApp,
+  options?: { refresh?: boolean }
+) => Promise<{ broken: boolean; reason: string }> = probeCommandHealth;
+
+/**
+ * Health sweep: what is gone, and what was left behind.
+ *
+ * Probes are memoised by `probeCommandHealth`, so a sweep right after a refresh
+ * costs nothing extra.
+ */
+async function collectHealth(options: { refresh?: boolean } = {}): Promise<HealthPayload> {
+  const uninstalled = findUninstalled();
+  const leftovers: HealthPayload["leftovers"] = [];
+  const candidates = discoverAll().filter((app) => app.commands?.length > 0);
+  const startedAt = Date.now();
+  const DEADLINE_MS = 30_000;
+  const CONCURRENCY = 6;
+  let cursor = 0;
+  let truncated = false;
+
+  const worker = async (): Promise<void> => {
+    while (cursor < candidates.length) {
+      if (Date.now() - startedAt > DEADLINE_MS) {
+        truncated = true;
+        return;
+      }
+      const app = candidates[cursor++];
+      const health = await commandHealthProbe(app, options);
+      if (!health.broken) continue;
+      const files = orphanShimFinder(app.commands[0]);
+      // A command with **nothing** behind it is not a leftover. Two very common
+      // cases look identical to a broken command but are not:
+      //   - a package that exposes no command at all (a library like `semver`
+      //     or `js-yaml` — discovery still records a name for it);
+      //   - a package whose bin is named differently from the package
+      //     (`ripgrep` ships `rg`, so `ripgrep` itself is not a command).
+      // Only a shim that **exists on PATH** and no longer runs is evidence
+      // that something survived an uninstall, so that is all we report.
+      if (files.length === 0) continue;
+      leftovers.push({
+        name: app.name,
+        command: app.commands[0],
+        reason: health.reason,
+        files,
+      });
+    }
+  };
+
+  await Promise.all(Array.from({ length: Math.min(CONCURRENCY, candidates.length) }, worker));
+  return {
+    generatedAt: new Date().toISOString(),
+    uninstalled,
+    leftovers,
+    ...(truncated ? { truncated } : {}),
+  };
+}
+
+const HEALTH_TTL_MS = 60_000;
+let healthCache: { at: number; data: HealthPayload } | null = null;
+
+/** Cached view of {@link collectHealth}. */
+async function getHealth(force = false): Promise<HealthPayload> {
+  if (!force && healthCache && Date.now() - healthCache.at < HEALTH_TTL_MS) {
+    return healthCache.data;
+  }
+  const data = await collectHealth({ refresh: force });
+  healthCache = { at: Date.now(), data };
+  return data;
+}
+
+/** Version results are cached: probing spawns one child process per app. */
+const VERSIONS_TTL_MS = 10 * 60_000;
+let versionsCache: { at: number; data: VersionsPayload } | null = null;
+
+/**
+ * Probe every app that has no declared version, with a small concurrency
+ * window and an overall deadline.
+ *
+ * Probing is a child process per app (measured: ~150–1500ms each), so a wide
+ * sweep is exactly the kind of thing that made the page slow before. Two
+ * properties keep it honest: results are cached for ten minutes, and the sweep
+ * stops taking new work past the deadline and says so (`truncated`) instead of
+ * running unbounded.
+ */
+async function collectVersions(options: { refresh?: boolean } = {}): Promise<VersionsPayload> {
+  const apps = appsNeedingVersionProbe();
+  const resolved: VersionsPayload["resolved"] = {};
+  const unresolved: string[] = [];
+  const startedAt = Date.now();
+  const DEADLINE_MS = 30_000;
+  const CONCURRENCY = 6;
+  let cursor = 0;
+  let truncated = false;
+
+  const worker = async (): Promise<void> => {
+    while (cursor < apps.length) {
+      if (Date.now() - startedAt > DEADLINE_MS) {
+        truncated = true;
+        return;
+      }
+      const app = apps[cursor++];
+      try {
+        const version = await versionResolver(app, options);
+        if (version) resolved[app.name] = version;
+        else unresolved.push(app.name);
+      } catch {
+        unresolved.push(app.name);
+      }
+    }
+  };
+
+  await Promise.all(Array.from({ length: Math.min(CONCURRENCY, apps.length) }, worker));
+  return {
+    checkedAt: new Date().toISOString(),
+    resolved,
+    unresolved,
+    ...(truncated ? { truncated } : {}),
+  };
+}
+
+/** Cached view of {@link collectVersions}. */
+async function getVersions(force = false): Promise<VersionsPayload> {
+  if (!force && versionsCache && Date.now() - versionsCache.at < VERSIONS_TTL_MS) {
+    return versionsCache.data;
+  }
+  const data = await collectVersions({ refresh: force });
+  versionsCache = { at: Date.now(), data };
+  return data;
+}
+
+/**
+ * The JSON shape both `/api/apps` and `/api/refresh` return.
+ *
+ * `versionOverrides` lets a refresh hand back rows that already carry the
+ * probed version, so the page can update cells straight from the payload
+ * instead of stitching two responses together.
+ */
+function appsPayload(versionOverrides?: Record<string, string>): {
+  total: number;
+  managedCount: number;
+  unmanagedCount: number;
+  hiddenUninstalled: number;
+  apps: Array<Record<string, unknown>>;
+} {
+  // Records whose install directory is gone are dropped from the table: the
+  // app is uninstalled, and a row for it would be a lie. The count travels with
+  // the payload so the page can say what it hid instead of silently shrinking.
+  const uninstalled = new Set(findUninstalled().map((u) => u.name));
+  const apps = discoverAll()
+    .filter((app) => !uninstalled.has(app.name))
+    .map((app) => {
+      const probed = versionOverrides?.[app.name];
+      const declared = (app.version ?? "").trim();
+      return {
+        name: app.name,
+        version: probed ?? (declared || "unknown"),
+        commands: app.commands,
+        category: app.category,
+        source: app.source,
+        description: app.description,
+        path: app.path,
+        managed: app.managed,
+        installKind: app.installKind,
+        inPath: app.commands.some((cmd) => pathIndexHas(cmd)),
+      };
+    });
+  const managedCount = apps.filter((a) => a.managed === true).length;
+  return {
+    total: apps.length,
+    managedCount,
+    unmanagedCount: apps.length - managedCount,
+    hiddenUninstalled: uninstalled.size,
+    apps,
+  };
 }
 
 /**
@@ -700,9 +1094,12 @@ function generateAppManagerPage(): string {
       .map((app) => {
         // pathIndexHas() reuses a cached PATH listing; commandExists() would
         // spawn a process per command (≈0.5s each) inside this render loop.
-        const status = app.commands.some((cmd) => pathIndexHas(cmd))
-          ? "<span class='status ok'>✅ PATH</span>"
-          : "<span class='status missing'>❌ PATH</span>";
+        const hasCommands = app.commands.length > 0;
+        const status = !hasCommands
+          ? "<span class='status none' title='Package exposes no command'>— no command</span>"
+          : app.commands.some((cmd) => pathIndexHas(cmd))
+            ? "<span class='status ok'>✅ PATH</span>"
+            : "<span class='status missing'>❌ PATH</span>";
         const installBadge = app.managed
           ? "<span class='kind managed'>managed</span>"
           : `<span class='kind unmanaged'>${escapeHtml(app.installKind)}</span>`;
@@ -905,6 +1302,75 @@ function generateAppManagerPage(): string {
       letter-spacing: 0.06em;
     }
     .stat.is-active { border-color: var(--accent); background: var(--surface-2); }
+
+    /* Page toolbar: refresh · terminal choice · auto-refresh */
+    .toolbar {
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 0.45rem;
+      margin: 0.85rem 0 0.2rem;
+      font-size: var(--fs-small);
+    }
+    .tool-btn {
+      font: inherit;
+      font-size: var(--fs-small);
+      font-weight: 600;
+      color: var(--accent);
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 0.28rem 0.6rem;
+      cursor: pointer;
+    }
+    .tool-btn:hover { background: var(--surface-2); border-color: var(--accent); }
+    .tool-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+    .tool-btn[disabled] { opacity: 0.6; cursor: progress; }
+    .tool-label { color: var(--muted); }
+    .tool-search {
+      font: inherit;
+      font-size: var(--fs-small);
+      color: var(--text);
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 0.24rem 0.5rem;
+      min-width: 10rem;
+    }
+    .tool-search::placeholder { color: var(--muted); }
+    .tool-warn { color: var(--warn); font-weight: 600; }
+    .tool-row-hidden { display: none !important; }
+    .cat-empty { display: none !important; }
+    .tool-select {
+      font: inherit;
+      font-size: var(--fs-small);
+      color: var(--text);
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 0.24rem 0.3rem;
+      cursor: pointer;
+    }
+    .tool-select:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+    /* margin-left:auto pins the status/countdown and everything after it
+       (the refresh button) to the right edge, as one adjacent cluster. The
+       left group keeps the shell / auto-refresh pickers and the search box. */
+    .tool-status { color: var(--muted); margin-left: auto; }
+
+    /* Leftover marker — lives **inside the app's own row**, not in a banner */
+    .leftover-mark {
+      display: inline-flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 0.35rem;
+      margin-left: 0.5rem;
+      padding: 0.15rem 0.4rem;
+      border: 1px solid color-mix(in srgb, var(--warn) 45%, transparent);
+      border-radius: 6px;
+      background: color-mix(in srgb, var(--warn) 12%, transparent);
+      font-size: var(--fs-small);
+    }
+    .leftover-label { color: var(--text); }
 
     /* ---------- Source chips (also clickable) ---------- */
     .sources {
@@ -1132,8 +1598,7 @@ function generateAppManagerPage(): string {
     col.m-available  { width: 14%; }
     col.m-found      { width: 14%; }
 
-    .name { font-weight: 600; color: var(--accent); }
-    .version, .commands, .mono { font-family: var(--font-mono); }
+    .name { font-weight: 600; color: var(--accent); }    .version, .commands, .mono { font-family: var(--font-mono); }
     .version { font-size: var(--fs-small); }
     .commands { font-size: var(--fs-small); color: var(--text); }
     .source { text-transform: capitalize; }
@@ -1143,6 +1608,7 @@ function generateAppManagerPage(): string {
     .status { font-size: var(--fs-small); font-weight: 600; }
     .status.ok { color: var(--ok); }
     .status.missing { color: var(--missing); }
+    .status.none { color: var(--muted); font-weight: 400; }
 
     .kind {
       display: inline-block;
@@ -1263,6 +1729,31 @@ function generateAppManagerPage(): string {
           <span class="stat-value" style="color:var(--accent)">${inPathCount}</span>
           <span class="stat-label">On PATH</span>
         </button>
+      </div>
+
+      <div class="toolbar">
+        ${
+          process.platform === "win32"
+            ? `<label class="tool-label" for="shell-select">终端</label>
+        <select class="tool-select" id="shell-select" title="点击应用名称时用哪个终端执行">
+          <option value="powershell">PowerShell</option>
+          <option value="cmd">cmd</option>
+        </select>`
+            : ""
+        }
+        <label class="tool-label" for="auto-select">自动刷新</label>
+        <select class="tool-select" id="auto-select" title="本页可见时按此间隔自动刷新（页面切到后台时暂停）">
+          <option value="0">关闭</option>
+          <option value="30">30 秒</option>
+          <option value="60">60 秒</option>
+          <option value="300">5 分钟</option>
+        </select>
+        <input class="tool-search" type="search" id="app-search" placeholder="搜索应用…" title="按名称或命令过滤列表" autocomplete="off">
+        <!-- Right-aligned cluster: the status/countdown and the refresh button
+             sit next to each other at the end of the row. -->
+        <span class="tool-status" id="refresh-status">尚未刷新</span>
+        <button class="tool-btn" type="button" id="refresh-btn" title="重新扫描本机（并逐个探测版本；也检查一次更新）">⟳ 刷新</button>
+        <span class="tool-warn" id="storage-warn" hidden></span>
       </div>
 
       <div class="sources">
@@ -1680,6 +2171,25 @@ function generateAppManagerPage(): string {
       var moves = {};
       try { moves = JSON.parse(localStorage.getItem(MOVE_KEY) || '{}') || {}; } catch (e) { moves = {}; }
 
+      // Find a row by its app name WITHOUT building an attribute selector.
+      //
+      // The previous version built a selector string from the app name and
+      // escaped it with the platform escaping helper. That helper is missing
+      // in some engines this page runs in (jsdom, embedded WebViews), and a
+      // hand-rolled fallback has to escape quotes and backslashes inside a
+      // string that is itself embedded in a template literal — one missed
+      // backslash and the whole inline script dies with a syntax error, taking
+      // the drag feature with it. Comparing the attribute directly sidesteps
+      // escaping entirely: app names are arbitrary strings, so never build a
+      // selector out of one.
+      function findRowByName(appName) {
+        var rows = document.querySelectorAll('tbody tr[data-app]');
+        for (var i = 0; i < rows.length; i++) {
+          if (rows[i].getAttribute('data-app') === appName) return rows[i];
+        }
+        return null;
+      }
+
       function applyMoves() {
         var byCat = {};
         sections.forEach(function (s) { byCat[s.getAttribute('data-category')] = s; });
@@ -1688,7 +2198,7 @@ function generateAppManagerPage(): string {
           if (!target) return;
           var body = target.querySelector('tbody');
           if (!body) return;
-          var row = document.querySelector('tr[data-app="' + CSS.escape(appName) + '"]');
+          var row = findRowByName(appName);
           if (row && row.parentElement !== body) body.appendChild(row);
         });
       }
@@ -1868,7 +2378,7 @@ function generateAppManagerPage(): string {
           var name = tr && tr.getAttribute('data-app');
           if (!name) return;
           btn.disabled = true;
-          post(API + '/open?name=' + encodeURIComponent(name))
+          post(API + '/open?name=' + encodeURIComponent(name) + '&shell=' + encodeURIComponent(currentShell()))
             .then(function (res) {
               var body = res.body || {};
               if (body.ok) {
@@ -1903,7 +2413,7 @@ function generateAppManagerPage(): string {
           return marked;
         }
 
-        function refresh() {
+        function refreshUpdates() {
           return fetch(API + '/updates', { headers: { accept: 'application/json' } })
             .then(function (r) { return r.json(); })
             .then(function (data) { return decorate((data && data.updates) || {}); })
@@ -1945,8 +2455,367 @@ function generateAppManagerPage(): string {
             });
         });
 
-        window.__appActions = { toast: toast, decorate: decorate, refresh: refresh };
-        refresh();
+        /* ---------- 版本补齐 · 手动/自动刷新 · 终端选择 ---------- */
+        // 这三件事是一组的：PATH 枚举出来的应用**没有包元数据**，版本只能逐个
+        // 探测（跑一次 <cmd> --version）。探测要 spawn 子进程，所以既不能阻塞首屏，
+        // 也不该每次刷新都重来 —— 首屏后异步补一次，之后由手动/自动刷新按需触发。
+
+        var SHELL_KEY = 'am.shell';
+        var AUTO_KEY = 'am.autorefresh';
+        var shellSelect = document.getElementById('shell-select');
+        var autoSelect = document.getElementById('auto-select');
+        var refreshBtn = document.getElementById('refresh-btn');
+        var statusEl = document.getElementById('refresh-status');
+
+        function readPref(key, fallback) {
+          try { return localStorage.getItem(key) || fallback; } catch (e) { return fallback; }
+        }
+        function writePref(key, value) {
+          try { localStorage.setItem(key, value); } catch (e) {}
+        }
+        function currentShell() { return shellSelect ? shellSelect.value : 'powershell'; }
+
+        if (shellSelect) {
+          shellSelect.value = readPref(SHELL_KEY, 'powershell');
+          shellSelect.addEventListener('change', function () { writePref(SHELL_KEY, shellSelect.value); });
+        }
+
+        // Layout preferences (column widths, category order, row moves) live in
+        // localStorage. If the browser blocks it — private mode, a sandboxed
+        // frame, storage disabled by policy — every change reverts on reload.
+        // That looked exactly like a bug in the drag feature, so say it out
+        // loud instead of letting the writes fail silently in a try/catch.
+        (function () {
+          var ok = false;
+          try {
+            var probe = 'am.storage.probe';
+            localStorage.setItem(probe, '1');
+            ok = localStorage.getItem(probe) === '1';
+            localStorage.removeItem(probe);
+          } catch (e) { ok = false; }
+          if (ok) return;
+          var warn = document.getElementById('storage-warn');
+          if (warn) {
+            warn.textContent = '⚠ 浏览器禁用了本地存储，拖动排序/分类无法保存';
+            warn.hidden = false;
+          }
+        })();
+
+        // Live filter: search by app name or command.
+        var searchEl = document.getElementById('app-search');
+        function applySearch() {
+          var q = (searchEl ? searchEl.value : '').trim().toLowerCase();
+          var rows = document.querySelectorAll('tbody tr[data-app]');
+          for (var i = 0; i < rows.length; i++) {
+            var tr = rows[i];
+            var name = (tr.getAttribute('data-app') || '').toLowerCase();
+            var cmd = (tr.getAttribute('data-cmd') || '').toLowerCase();
+            var match = !q || name.indexOf(q) >= 0 || cmd.indexOf(q) >= 0;
+            tr.classList.toggle('tool-row-hidden', !match);
+          }
+          // Collapse categories that have no visible rows; keep them searchable.
+          sections.forEach(function (sec) {
+            var visible = sec.querySelectorAll('tbody tr:not(.tool-row-hidden)').length;
+            sec.classList.toggle('cat-empty', visible === 0);
+          });
+        }
+        if (searchEl) {
+          searchEl.addEventListener('input', applySearch);
+          // Re-apply after a refresh repaints the table.
+          var _origApplyPayload = applyPayload;
+          applyPayload = function (data) {
+            var r = _origApplyPayload(data);
+            applySearch();
+            return r;
+          };
+        }
+
+        // 只改版本单元格的第一个文本节点，保住可能存在的升级徽章。
+        function setVersion(tr, version, note) {
+          var cell = tr.querySelector('td.version');
+          if (!cell) return;
+          var node = null;
+          for (var i = 0; i < cell.childNodes.length; i++) {
+            var n = cell.childNodes[i];
+            if (n.nodeType === 3 && n.textContent.trim()) { node = n; break; }
+          }
+          if (node) node.textContent = version + ' ';
+          else cell.insertBefore(document.createTextNode(version + ' '), cell.firstChild);
+          cell.title = note ? version + ' —— ' + note : version;
+        }
+
+        // 遍历比较，而不是拼选择器字符串：页内 JS 里出现属性选择器的字面量
+        // 会被「按 HTML 抓标记」的静态断言误扫到（D 组已经抓到过两次）。
+        function setStat(jump, value) {
+          if (typeof value !== 'number') return;
+          var stats = document.querySelectorAll('.stat');
+          for (var i = 0; i < stats.length; i++) {
+            if (stats[i].getAttribute('data-jump') !== jump) continue;
+            var el = stats[i].querySelector('.stat-value');
+            if (el) el.textContent = String(value);
+            return;
+          }
+        }
+
+        // 首屏后补齐版本：只补 unknown 的，不动已知版本。
+        function fillVersions() {
+          return fetch(API + '/versions', { headers: { accept: 'application/json' } })
+            .then(function (r) { return r.json(); })
+            .then(function (data) {
+              var resolved = (data && data.resolved) || {};
+              var unresolved = (data && data.unresolved) || [];
+              var rows = document.querySelectorAll('tr[data-app]');
+              for (var i = 0; i < rows.length; i++) {
+                var tr = rows[i];
+                var name = tr.getAttribute('data-app');
+                if (resolved[name]) setVersion(tr, resolved[name], '由 ' + name + ' --version 探测得到');
+                else if (unresolved.indexOf(name) >= 0) setVersion(tr, 'unknown', '该工具不响应 --version，无法探测');
+              }
+              return Object.keys(resolved).length;
+            })
+            .catch(function () { return 0; });
+        }
+
+        // 用一份刷新结果就地更新表格；应用集合变了就整页重载（就地更新表达不了增删）。
+        function applyPayload(data) {          var apps = (data && data.apps) || [];
+          var rows = document.querySelectorAll('tr[data-app]');
+          var known = {};
+          for (var i = 0; i < rows.length; i++) known[rows[i].getAttribute('data-app')] = true;
+          var sameSet = Object.keys(known).length === apps.length;
+          for (var j = 0; j < apps.length && sameSet; j++) if (!known[apps[j].name]) sameSet = false;
+          if (!sameSet) { location.reload(); return false; }
+
+          var byName = {};
+          for (var k = 0; k < apps.length; k++) byName[apps[k].name] = apps[k];
+          var inPath = 0;
+          for (var m = 0; m < rows.length; m++) {
+            var tr = rows[m];
+            var app = byName[tr.getAttribute('data-app')];
+            if (!app) continue;
+            if (app.version) setVersion(tr, app.version);
+            if (app.inPath) inPath++;
+            var cell = tr.querySelector('td.status-cell');
+            if (cell) {
+              cell.innerHTML = app.inPath
+                ? "<span class='status ok'>✅ PATH</span>"
+                : "<span class='status missing'>❌ PATH</span>";
+            }
+          }
+          setStat('all', data.total);
+          setStat('managed', data.managedCount);
+          setStat('unmanaged', data.unmanagedCount);
+          setStat('inpath', inPath);
+          return true;
+        }
+
+        var lastRefresh = null;
+
+        function updateStatus() {
+          if (!statusEl) return;
+          var parts = [];
+          if (lastRefresh) {
+            var secs = Math.max(0, Math.round((Date.now() - lastRefresh.getTime()) / 1000));
+            parts.push('上次刷新 ' + (secs < 60 ? secs + ' 秒前' : Math.round(secs / 60) + ' 分钟前'));
+          } else {
+            parts.push('尚未刷新');
+          }
+          var every = autoSelect ? Number(autoSelect.value) : 0;
+          parts.push(every > 0
+            ? '自动刷新 ' + (every >= 60 ? every / 60 + ' 分钟' : every + ' 秒')
+            : '自动刷新已关闭');
+          statusEl.textContent = parts.join(' · ');
+        }
+
+        function doRefresh(opts) {
+          opts = opts || {};
+          if (refreshBtn) { refreshBtn.disabled = true; refreshBtn.textContent = '⟳ 刷新中…'; }
+          var qs = '?versions=' + (opts.versions === false ? '0' : '1');
+          if (opts.updates) qs += '&updates=1';
+          return post(API + '/refresh' + qs)
+            .then(function (res) {
+              var body = res.body || {};
+              if (!body.apps) { toast('刷新失败：' + (body.message || res.status), 'err'); return; }
+              lastRefresh = new Date();
+              var applied = applyPayload(body);
+              if (applied && opts.quiet !== true) {
+                var n = body.versions && body.versions.resolved ? Object.keys(body.versions.resolved).length : 0;
+                toast('已刷新：' + body.apps.length + ' 个应用' + (n ? '，探测到 ' + n + ' 个版本' : ''), 'ok');
+              }
+            })
+            .catch(function (e) { toast('刷新失败：' + e.message, 'err'); })
+            .then(function () {
+              if (refreshBtn) { refreshBtn.disabled = false; refreshBtn.textContent = '⟳ 刷新'; }
+              updateStatus();
+            });
+        }
+
+        if (refreshBtn) {
+          // 手动刷新把注册表检查也做上（明确点了按钮，值得多花几秒）。
+          refreshBtn.addEventListener('click', function () { doRefresh({ updates: true }); });
+        }
+
+        var autoTimer = null;
+        function startAuto() {
+          if (autoTimer) { clearInterval(autoTimer); autoTimer = null; }
+          if (autoSelect) autoSelect.value = readPref(AUTO_KEY, '60');
+          var every = autoSelect ? Number(autoSelect.value) : 0;
+          updateStatus();
+          if (!every) return;
+          autoTimer = setInterval(function () {
+            if (document.hidden) return; // 页面不可见时不打扰机器
+            doRefresh({ versions: true, quiet: true });
+          }, every * 1000);
+        }
+        if (autoSelect) {
+          autoSelect.addEventListener('change', function () {
+            writePref(AUTO_KEY, autoSelect.value);
+            startAuto();
+          });
+        }
+        // 回到页面时立刻补一次，免得盯着过期数据。
+        document.addEventListener('visibilitychange', function () {
+          if (!document.hidden && autoSelect && Number(autoSelect.value) > 0) {
+            doRefresh({ versions: true, quiet: true });
+          }
+        });
+        setInterval(updateStatus, 1000);
+
+        /* ---------- 已卸载 / 残留提示与修复 ---------- */
+        // 判定在服务端做（要探测命令）；页面只负责展示与「是否修复」的选择。
+        function fillHealth() {
+          return fetch(API + '/health', { headers: { accept: 'application/json' } })
+            .then(function (r) { return r.json(); })
+            .then(function (data) { renderHealth(data); return data; })
+            .catch(function () { return null; });
+        }
+
+        // 提示只出现在**对应应用的那一行里**。顶部横幅的做法被否掉了：它把机器状态
+        // 变成一块跟列表脱节的公告板，用户还得自己去找到底是哪一行有问题。
+        function renderHealth(data) {
+          var leftovers = (data && data.leftovers) || [];
+          // 先清掉上一轮的标记，否则每次刷新都会在同一格里越堆越多。
+          Array.prototype.forEach.call(
+            document.querySelectorAll('.leftover-mark'),
+            function (n) { if (n.parentNode) n.parentNode.removeChild(n); }
+          );
+          leftovers.forEach(function (item) {
+            var row = findRowByName(item.name);
+            if (!row) return;
+            var cell = row.querySelector('td');
+            if (!cell) return;
+
+            var mark = document.createElement('span');
+            mark.className = 'leftover-mark';
+
+            var label = document.createElement('span');
+            label.className = 'leftover-label';
+            label.textContent = '⚠ 残留：' + item.command + ' 已跑不起来';
+            label.title = item.reason || '';
+            mark.appendChild(label);
+
+            var clean = document.createElement('button');
+            clean.type = 'button';
+            clean.className = 'tool-btn';
+            clean.textContent = '清除残留';
+            clean.disabled = item.files.length === 0;
+            clean.addEventListener('click', function () { fixLeftover(item, clean); });
+            mark.appendChild(clean);
+
+            var repair = document.createElement('button');
+            repair.type = 'button';
+            repair.className = 'tool-btn';
+            repair.textContent = '修复软件';
+            repair.addEventListener('click', function () { repairApp(item, repair); });
+            mark.appendChild(repair);
+
+            cell.appendChild(mark);
+          });
+        }
+
+        // 「修复软件」= 重装：跑这个应用自己的升级命令，把缺掉的包目录补回来。
+        // 与「清除残留」的区别：一个是把软件修好，一个是把尸体收走。
+        function repairApp(item, btn) {
+          var ok = window.confirm(
+            '将对 ' + item.name + ' 执行重装（' + (item.command || '') + '）。\\n\\n' +
+            '这会改动全局安装的包，且无法撤销。继续？'
+          );
+          if (!ok) return;
+          btn.disabled = true;
+          btn.textContent = '修复中…';
+          post(API + '/update?name=' + encodeURIComponent(item.name))
+            .then(function (res) {
+              var body = res.body || {};
+              if (body.ok) {
+                window.alert('✅ 已重装 ' + item.name + '\\n' + (body.command || ''));
+                return fillHealth();
+              }
+              window.alert('❌ 重装失败：' + (body.detail || body.message || res.status));
+              btn.disabled = false;
+              btn.textContent = '修复软件';
+            })
+            .catch(function (e) {
+              window.alert('❌ 重装失败：' + e.message);
+              btn.disabled = false;
+              btn.textContent = '修复软件';
+            });
+        }
+
+        function fixLeftover(item, btn) {
+          var listed = item.files.map(function (f) { return '  ' + f; }).join('\\n');
+          var ok = window.confirm(
+            '将把下列文件**改名移走**（改名可逆，不删除文件）：\\n\\n' + listed +
+            '\\n\\n继续？'
+          );
+          if (!ok) return;
+          btn.disabled = true;
+          btn.textContent = '处理中…';
+          post(API + '/leftover/fix?name=' + encodeURIComponent(item.name))
+            .then(function (res) {
+              var body = res.body || {};
+              if (body.ok) {
+                // 用 alert 而不是 toast：清除之后这个应用很可能整行消失（页面会
+                // reload），toast 会被 reload 冲掉 —— 用户点完什么反馈都看不到，
+                // 只能以为没生效。成功和失败都必须给用户一个不会被冲掉的结果。
+                window.alert('✅ 已移走 ' + body.moved.length + ' 个残留文件（改名，可改回）：\\n' +
+                  body.moved.map(function (m) { return m.to; }).join('\\n'));
+                return fillHealth();
+              }
+              window.alert('❌ 未能清除：' + (body.message || body.error || res.status));
+              btn.disabled = false;
+              btn.textContent = '清除残留';
+            })
+            .catch(function (e) {
+              window.alert('❌ 请求失败：' + e.message);
+              btn.disabled = false;
+              btn.textContent = '清除残留';
+            });
+        }
+
+        window.__appActions = {
+          toast: toast,
+          decorate: decorate,
+          refreshUpdates: refreshUpdates,
+          refresh: doRefresh,
+          applyPayload: applyPayload,
+          fillHealth: fillHealth,
+        };
+        // Each init step is isolated on purpose: they are independent, and one
+        // of them failing must not take the rest down with it. Before this, a
+        // throw in refreshUpdates() silently skipped everything after it —
+        // the banner, the version fill and the auto-refresh timer.
+        var safeInit = function (label, fn) {
+          try {
+            fn();
+          } catch (e) {
+            // Never surface as a blank page: log and carry on.
+            if (window.console && console.warn) console.warn('[app-manager] init step failed: ' + label, e);
+          }
+        };
+        safeInit('refreshUpdates', refreshUpdates);
+        safeInit('fillVersions', fillVersions);
+        safeInit('fillHealth', fillHealth);
+        safeInit('updateStatus', updateStatus);
+        safeInit('startAuto', startAuto);
       })();
     })();
   </script>
@@ -1983,27 +2852,8 @@ function registerWebRoutes(
       path: "/app-manager/api/apps",
       handler: (_req: HttpRequest, res: HttpResponse) => {
         if (lifecycle.disposed) return sendDisposed(res, "/app-manager/api/apps");
-        const apps = discoverAll().map((app) => ({
-          name: app.name,
-          version: app.version,
-          commands: app.commands,
-          category: app.category,
-          source: app.source,
-          description: app.description,
-          path: app.path,
-          managed: app.managed,
-          installKind: app.installKind,
-          inPath: app.commands.some((cmd) => pathIndexHas(cmd)),
-        }));
-        const managedCount = apps.filter((a) => a.managed).length;
         res.writeHead(200, { "content-type": "application/json; charset=utf-8", ...NO_STORE });
-        res.end(
-          JSON.stringify(
-            { total: apps.length, managedCount, unmanagedCount: apps.length - managedCount, apps },
-            null,
-            2
-          )
-        );
+        res.end(JSON.stringify(appsPayload(), null, 2));
       },
     })
   );
@@ -2085,6 +2935,19 @@ function registerWebRoutes(
             message: `${app.name} exposes no command to run`,
           });
         }
+        // Same gate the version probe and health scan already go through, and
+        // for the same reason: some entries on this list are parts of a
+        // product we must never start. Fiddler ships `uninst.exe`, and its
+        // very name is the command — launching it begins an uninstall. That
+        // happened while probing for a version; a click must not be able to
+        // reach it either.
+        const refused = refuseToExecute(app);
+        if (refused) {
+          return sendJson(res, 403, {
+            error: "refused",
+            message: refused,
+          });
+        }
         if (!COMMAND_TOKEN.test(command)) {
           return sendJson(res, 400, {
             error: "bad_command",
@@ -2092,12 +2955,21 @@ function registerWebRoutes(
           });
         }
         const cwd = launchCwd(app);
-        const result = terminalSpawner(command, cwd);
+        // `?shell=` picks between the two whitelisted Windows shells; anything
+        // else (including a missing value) falls back to the PowerShell default.
+        // It only matters for CLI apps — a GUI app is started directly, with
+        // no shell involved at all.
+        const shell = asWindowsShell(
+          new URL(req.url ?? "/", "http://localhost").searchParams.get("shell")
+        );
+        const result = terminalSpawner(command, cwd, shell, app.hasGui === true);
         return sendJson(res, result.ok ? 200 : 500, {
           ok: result.ok,
           app: app.name,
           command,
+          hasGui: app.hasGui === true,
           cwd,
+          shell: process.platform === "win32" ? shell : process.platform,
           detail: result.detail,
         });
       },
@@ -2162,6 +3034,138 @@ function registerWebRoutes(
         } finally {
           upgradesInFlight.delete(app.name);
         }
+      },
+    })
+  );
+
+  // Resolve versions for apps that carry none. This is what turns the majority
+  // of rows (everything found by PATH enumeration, which has no manifest to
+  // read) from `unknown` into a real version — done asynchronously so first
+  // paint stays fast, with the results cached server-side.
+  disposers.push(
+    webServer.register({
+      kind: "exact",
+      path: "/app-manager/api/versions",
+      handler: async (req: HttpRequest, res: HttpResponse) => {
+        if (lifecycle.disposed) return sendDisposed(res, "/app-manager/api/versions");
+        const force =
+          new URL(req.url ?? "/", "http://localhost").searchParams.get("refresh") === "1";
+        const payload = await getVersions(force);
+        return sendJson(res, 200, payload);
+      },
+    })
+  );
+
+  // Force a fresh look at the machine: drop the scan caches and re-read
+  // discovery. Backs the page's refresh button and its auto-refresh timer, so
+  // a user can see the machine's real state without restarting the host.
+  disposers.push(
+    webServer.register({
+      kind: "exact",
+      path: "/app-manager/api/refresh",
+      handler: async (req: HttpRequest, res: HttpResponse) => {
+        if (lifecycle.disposed) return sendDisposed(res, "/app-manager/api/refresh");
+        if ((req.method ?? "GET").toUpperCase() !== "POST") {
+          return sendJson(res, 405, {
+            error: "method_not_allowed",
+            message: "POST only — refreshing re-reads the machine.",
+          });
+        }
+        const params = new URL(req.url ?? "/", "http://localhost").searchParams;
+        // Both extra sweeps are opt-in: probing versions spawns a child per app
+        // and asking the registry is a network round trip, so an auto-refresh
+        // tick stays cheap while an explicit refresh can be thorough.
+        const withVersions = params.get("versions") === "1";
+        const withUpdates = params.get("updates") === "1";
+
+        scanResetter();
+        const versions = withVersions ? await getVersions(true) : null;
+        const updates = withUpdates ? await getUpdates(true) : null;
+        return sendJson(res, 200, {
+          ...appsPayload(versions?.resolved),
+          refreshedAt: new Date().toISOString(),
+          ...(versions ? { versions } : {}),
+          ...(updates ? { updates } : {}),
+        });
+      },
+    })
+  );
+
+  // What is gone, and what was left behind — backs the page's warning banner.
+  disposers.push(
+    webServer.register({
+      kind: "exact",
+      path: "/app-manager/api/health",
+      handler: async (req: HttpRequest, res: HttpResponse) => {
+        if (lifecycle.disposed) return sendDisposed(res, "/app-manager/api/health");
+        const force =
+          new URL(req.url ?? "/", "http://localhost").searchParams.get("refresh") === "1";
+        return sendJson(res, 200, await getHealth(force));
+      },
+    })
+  );
+
+  // Clean up one orphan shim: its files are **renamed aside**, never deleted,
+  // so the action is reversible and the user keeps the last word.
+  disposers.push(
+    webServer.register({
+      kind: "exact",
+      path: "/app-manager/api/leftover/fix",
+      handler: async (req: HttpRequest, res: HttpResponse) => {
+        if (lifecycle.disposed) return sendDisposed(res, "/app-manager/api/leftover/fix");
+        if ((req.method ?? "GET").toUpperCase() !== "POST") {
+          return sendJson(res, 405, {
+            error: "method_not_allowed",
+            message: "POST only — a GET must not move files.",
+          });
+        }
+        const app = appNamed(req);
+        if (!app) {
+          return sendJson(res, 404, { error: "not_found", message: "no discovered app with that name" });
+        }
+        const command = app.commands?.[0];
+        if (!command || !COMMAND_TOKEN.test(command)) {
+          return sendJson(res, 400, {
+            error: "bad_command",
+            message: `${app.name} has no command we are willing to touch`,
+          });
+        }
+        // Re-verify immediately before touching anything: if the tool was
+        // reinstalled (or repaired) since the sweep, leave its files alone.
+        const health = await commandHealthProbe(app, { refresh: true });
+        if (!health.broken) {
+          return sendJson(res, 409, {
+            ok: false,
+            error: "not_broken",
+            message: `${command} runs fine right now — nothing was changed`,
+          });
+        }
+        const files = orphanShimFinder(command);
+        if (files.length === 0) {
+          return sendJson(res, 409, {
+            ok: false,
+            error: "no_files",
+            message: `no script shims for ${command} found in any PATH directory`,
+          });
+        }
+        const moved: Array<{ from: string; to: string }> = [];
+        const failed: Array<{ file: string; error: string }> = [];
+        for (const file of files) {
+          try {
+            moved.push({ from: file, to: orphanShimRemover(file) });
+          } catch (error) {
+            failed.push({ file, error: (error as { message?: string })?.message ?? String(error) });
+          }
+        }
+        // The machine changed: drop the caches so the next read is fresh.
+        healthCache = null;
+        scanResetter();
+        return sendJson(res, moved.length > 0 ? 200 : 500, {
+          ok: moved.length > 0 && failed.length === 0,
+          command,
+          moved,
+          failed,
+        });
       },
     })
   );
@@ -2277,6 +3281,10 @@ export function apply(ctx: CordisContext): () => void {
     }
     // Same reasoning for the latest-version results fetched from the registry.
     updatesCache = null;
+    // …and for the probed tool versions.
+    versionsCache = null;
+    // …and for the health sweep (it carries install paths for the whole machine).
+    healthCache = null;
     // In-flight upgrades finish on their own; drop the bookkeeping so a later
     // load of this plugin starts from an empty set.
     upgradesInFlight.clear();

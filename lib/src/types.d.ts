@@ -27,6 +27,16 @@ export interface CliApp {
     managed: boolean;
     /** How the app is installed on disk. */
     installKind: InstallKind;
+    /**
+     * Whether the underlying program is a windowed (GUI) application rather
+     * than a console tool.
+     *
+     * Read from the Windows PE header's subsystem field, never by running the
+     * program. `false` is the default and also covers non-PE entries — script
+     * shims (`.cmd`/`.bat`/`.ps1`) and everything on non-Windows hosts, where
+     * the question does not arise because a terminal is always the right answer.
+     */
+    hasGui: boolean;
 }
 /**
  * A program managed by a Windows installer (read from the Uninstall
@@ -75,6 +85,8 @@ export interface RegistryExport {
         path: string;
         managed: boolean;
         installKind: InstallKind;
+        /** See {@link CliApp.hasGui}. */
+        hasGui: boolean;
     }>;
 }
 /**

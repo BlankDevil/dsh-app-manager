@@ -197,6 +197,43 @@ window.document.elementFromPoint = (x, y) => {
   return document.body;
 };
 
+/**
+ * Load the page again with localStorage pre-seeded.
+ *
+ * jsdom runs inline scripts during construction, so localStorage has to be
+ * written *before* the page's own script executes. That is done by injecting a
+ * seed script at the top of <head>; it also stubs `fetch` because the page
+ * fires a few background requests that jsdom cannot serve.
+ *
+ * Without this, "the order is restored after a reload" could only be asserted
+ * statically — which is exactly how the persistence bug went unnoticed.
+ */
+function loadSeeded(seed) {
+  const seedJs =
+    "<script>try{" +
+    Object.entries(seed)
+      .map(([k, v]) => `localStorage.setItem(${JSON.stringify(k)},${JSON.stringify(v)});`)
+      .join("") +
+    "}catch(e){}" +
+    "window.fetch=function(){return Promise.resolve({ok:true,json:function(){return Promise.resolve({});},text:function(){return Promise.resolve('')}});};" +
+    "</script>";
+  const dom2 = new JSDOM(html.replace("<head>", "<head>" + seedJs), {
+    runScripts: "dangerously",
+    pretendToBeVisual: true,
+    virtualConsole,
+    url: "http://localhost/app-manager",
+  });
+  const secs = Array.from(dom2.window.document.querySelectorAll("details.category"));
+  let y = 0;
+  for (const sec of secs) {
+    const h = 300;
+    const rect = { top: y, bottom: y + h, left: 0, right: 800, width: 800, height: h, x: 0, y };
+    sec.getBoundingClientRect = () => rect;
+    y += h;
+  }
+  return dom2;
+}
+
 function pointer(el, type, props) {
   const ev = new window.PointerEvent(type, {
     bubbles: true,
@@ -284,21 +321,26 @@ check("拖拽结果已持久化到 localStorage:catorder", () => {
   );
 });
 
-check("重载后顺序从 localStorage 恢复", () => {
-  const saved = catOrder();
-  const dom2 = new JSDOM(html, {
-    runScripts: "dangerously",
-    pretendToBeVisual: true,
-    url: "http://localhost/app-manager",
-  });
-  // seed localStorage before scripts run is not possible here, so instead we
-  // verify the apply path exists and is wired to ORDER_KEY.
-  const js = Array.from(dom2.window.document.querySelectorAll("script"))
-    .map((s) => s.textContent)
-    .join("\n");
-  assert(js.includes("applySavedOrder"), "applySavedOrder() missing");
-  assert(js.includes(ORDER_KEY), `ORDER_KEY (${ORDER_KEY}) not referenced in page script`);
-  assert(saved.length >= 2, "sanity: order has >=2 entries");
+check("重载后顺序从 localStorage 恢复（真·行为断言）", () => {
+  // The previous revision of this check only asserted that the page script
+  // contained the strings "applySavedOrder" and ORDER_KEY — a static check
+  // that passes even if the restore path is broken. It is replaced by an
+  // actual reload: seed localStorage with the order we just persisted, load
+  // the page again, and compare the rendered DOM order.
+  const expected = catOrder();
+  const raw = window.localStorage.getItem(ORDER_KEY);
+  assert(raw, "no persisted order to reload with");
+
+  const dom2 = loadSeeded({ [ORDER_KEY]: raw });
+  const actual = Array.from(dom2.window.document.querySelectorAll("details.category")).map(
+    (s) => s.getAttribute("data-category")
+  );
+  dom2.window.close();
+
+  assert(
+    JSON.stringify(actual) === JSON.stringify(expected),
+    `reload lost the order: expected ${expected.join(",")}, got ${actual.join(",")}`
+  );
 });
 
 console.log("");
@@ -417,6 +459,136 @@ check("未发生拖拽的单击不会移动行（阈值生效）", () => {
     JSON.stringify(before) === JSON.stringify(after),
     "a plain click moved a row (threshold not respected)"
   );
+});
+
+check("重载后跨分类移动仍然生效（真·行为断言）", () => {
+  const raw = window.localStorage.getItem(MOVE_KEY);
+  assert(raw, "no persisted moves to reload with");
+  const obj = JSON.parse(raw);
+  const names = Object.keys(obj);
+  assert(names.length > 0, "persisted moves object is empty");
+
+  const dom3 = loadSeeded({ [MOVE_KEY]: raw });
+  for (const appName of names) {
+    const row = Array.from(dom3.window.document.querySelectorAll("tbody tr[data-app]")).find(
+      (r) => r.getAttribute("data-app") === appName
+    );
+    if (!row) continue;
+    const cat = row.closest("details.category")?.getAttribute("data-category");
+    dom3.window.close();
+    assert(cat === obj[appName], `after reload ${appName} is in ${cat}, expected ${obj[appName]}`);
+    return;
+  }
+  dom3.window.close();
+  assert(false, "none of the moved apps were found after reload");
+});
+
+console.log("");
+console.log("━━━ 搜索框 ━━━");
+
+check("工具栏存在搜索输入框", () => {
+  const el = document.getElementById("app-search");
+  assert(el, "#app-search not found");
+  assert(el.getAttribute("type") === "search", `type is ${el.getAttribute("type")}`);
+  const toolbar = el.closest(".toolbar");
+  assert(toolbar, "search box is not inside the toolbar");
+  const refresh = document.getElementById("refresh-btn");
+  assert(refresh, "refresh button missing");
+  // It must sit on the same row as the search box: same parent element.
+  assert(refresh.parentElement === toolbar, "refresh button is not in the toolbar");
+  // The storage warning must be present but hidden while storage works —
+  // without it, a blocked localStorage silently reverts drag changes.
+  const warn = document.getElementById("storage-warn");
+  assert(warn, "#storage-warn missing");
+  assert(warn.hidden, "storage warning should be hidden when localStorage works");
+});
+
+check("刷新按钮紧挨在倒计时右侧（右对齐的那一组）", () => {
+  // Requested layout: the status/countdown and the refresh button form one
+  // adjacent, right-aligned cluster at the end of the row; the search box
+  // stays with the left-hand controls.
+  const toolbar = document.querySelector(".toolbar");
+  const status = document.getElementById("refresh-status");
+  const refresh = document.getElementById("refresh-btn");
+  const search = document.getElementById("app-search");
+  assert(status && refresh && search, "toolbar elements missing");
+
+  const order = Array.from(toolbar.children);
+  const iStatus = order.indexOf(status);
+  const iRefresh = order.indexOf(refresh);
+  const iSearch = order.indexOf(search);
+
+  assert(
+    iRefresh === iStatus + 1,
+    `refresh button must sit immediately after the countdown (status@${iStatus}, refresh@${iRefresh})`
+  );
+  assert(
+    iSearch < iStatus,
+    `search box must stay left of the right-aligned cluster (search@${iSearch}, status@${iStatus})`
+  );
+
+  // The spacer that pushes the cluster right must be on the countdown, not on
+  // the search box — otherwise the cluster would not be flush right.
+  const style = window.getComputedStyle(status);
+  assert(
+    style.marginLeft === "auto",
+    `#refresh-status should carry margin-left:auto, got "${style.marginLeft}"`
+  );
+  const searchStyle = window.getComputedStyle(search);
+  assert(
+    searchStyle.marginLeft !== "auto",
+    "#app-search must not carry margin-left:auto (keeps it in the left group)"
+  );
+});
+
+check("输入关键字后只保留匹配的行", () => {
+  const el = document.getElementById("app-search");
+  const rows = Array.from(document.querySelectorAll("tbody tr[data-app]"));
+  assert(rows.length > 0, "no rows to filter");
+  const target = rows[0].getAttribute("data-app");
+
+  el.value = target;
+  el.dispatchEvent(new window.Event("input", { bubbles: true }));
+
+  const visible = Array.from(document.querySelectorAll("tbody tr[data-app]")).filter(
+    (r) => !r.classList.contains("tool-row-hidden")
+  );
+  assert(visible.length > 0, "search hid every row");
+  assert(
+    visible.every((r) => {
+      const name = (r.getAttribute("data-app") || "").toLowerCase();
+      const cmd = (r.getAttribute("data-cmd") || "").toLowerCase();
+      const q = target.toLowerCase();
+      return name.includes(q) || cmd.includes(q);
+    }),
+    "a visible row does not match the query"
+  );
+
+  // Clearing the box restores every row.
+  el.value = "";
+  el.dispatchEvent(new window.Event("input", { bubbles: true }));
+  const restored = Array.from(document.querySelectorAll("tbody tr[data-app]")).filter(
+    (r) => !r.classList.contains("tool-row-hidden")
+  );
+  assert(restored.length === rows.length, `clearing hid rows: ${restored.length}/${rows.length}`);
+});
+
+check("无命令的包显示为 no command 而不是 PATH 缺失", () => {
+  const rows = Array.from(document.querySelectorAll("tbody tr[data-app]"));
+  const noCmd = rows.filter((r) => r.getAttribute("data-cmd") === "");
+  if (noCmd.length === 0) return; // machine-dependent; nothing to assert
+  for (const r of noCmd) {
+    const status = r.querySelector("td.status-cell");
+    assert(status, "row has no status cell");
+    assert(
+      /no command/.test(status.textContent),
+      `a package with no command shows "${status.textContent.trim()}"`
+    );
+    assert(
+      !r.querySelector("button.name-btn"),
+      "a package with no command must not be launchable"
+    );
+  }
 });
 
 // ---------- summary ----------

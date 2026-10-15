@@ -1,7 +1,30 @@
 # dsh-app-manager 测试用例规格
 
-版本：v3（对应插件 0.5.3 · dsh 0.1.5-rc.1）
+版本：v7（对应插件 0.8.0 · dsh 0.1.5-rc.1 / 0.2.0-rc.2）
 状态基线：用例先于脚本编写；执行结果见 `reports/`。
+
+> **v7 相对 v6 的变化**：**报告必须写明本轮测的是哪些 app**。
+> 抽样随机化之后，「这份报告全绿」离开了样本就没有意义 —— 换一批样本可能就红，
+> 而报告里没写样本等于无法复现。故 ① `run-tests.mjs` 生成的 `reports/run-*.md`
+> 新增「本次测试用到的应用」表（用途 / 应用 / 来源 / 首命令 / 抽样方式）+ 禁用名单；
+> ② `actions.test.mjs` 新增落盘报告 `reports/actions-*.md`，含独立抽样表与收尾结论；
+> ③ 新增 `describeApp()` / `excludedPatterns()` 两个导出供两份报告共用。
+
+> **v6 相对 v5 的变化**：新增「已卸载清除 + 残留检测与可逆修复」，
+> 故 ① TC-C01 路由数 9 → **11**（新增 `/api/health`、`/api/leftover/fix`）；
+> ② K 组新增 6e（健康：已卸载与残留）一节；
+> ③ **被测应用改为每次运行随机抽样 4~6 个**（原来是 `apps.find()` 永远钉死第一个），
+>    K 组断言数因此随抽样结果浮动。
+
+> **v5 相对 v4 的变化**：页面新增「版本补齐 / 刷新 / 自动刷新 / PowerShell 默认」，
+> 故 ① TC-C01 路由数 7 → **9**（新增 `/api/versions`、`/api/refresh`）；
+> ② K 组新增 6b（版本补齐）、6c（刷新）、6d（shell 白名单）三节，共 +21 条断言；
+> ③ win32 终端形态断言由 cmd 改为 **PowerShell 默认 + cmd 可选**。
+
+> **v4 相对 v3 的变化**：新增 **L 组**（`dsh-compat.test.mjs`，16 条）守住宿主兼容性声明。
+> 背景：插件能否在某个 dsh 上**加载**，取决于 `package.json` 的 peer 范围 ——
+> dsh 0.2.0 的 app-boot 会做 `semver.satisfies(runtime, range, {includePrerelease:true})`
+> 校验，不满足即抛错跳过该 bundle。0.5.3 的 `^0.1.5-rc.1` 因此**无法在 0.2.0-rc.2 上加载**。
 
 **通用前置**
 - 插件已构建（`lib/` 存在），版本 0.5.3
@@ -79,7 +102,7 @@
 
 | ID | 用例 | 步骤 | 预期 |
 |----|------|------|------|
-| TC-C01 | 路由注册面 | 遍历注册结果 | 恰好 **7** 条 `exact` 路由；路径集合 = 4 只读 + 3 动作（`/app-manager`、`/api/apps`、`/api/unmanaged`、`/api/method`、`/api/open`、`/api/updates`、`/api/update`） |
+| TC-C01 | 路由注册面 | 遍历注册结果 | 恰好 **11** 条 `exact` 路由；路径集合 = 4 只读 + 3 动作 + 2 刷新 + 2 健康（`/app-manager`、`/api/apps`、`/api/unmanaged`、`/api/method`、`/api/open`、`/api/updates`、`/api/update`、`/api/versions`、`/api/refresh`、`/api/health`、`/api/leftover/fix`） |
 | TC-C02 | 页面响应 | GET `/app-manager` | 200；`content-type: text/html`；body 含 `<style>`、`<script>`、`<title>` |
 | TC-C03 | apps API | GET `/app-manager/api/apps` | 200；合法 JSON；`total>0`；`total===apps.length`；`managedCount+unmanagedCount===total`；每项含 `name/version/commands/source/managed/installKind/inPath` |
 | TC-C04 | unmanaged API | GET `/app-manager/api/unmanaged` | 200；合法 JSON；每项 `installKind !== "managed"` |
@@ -114,10 +137,11 @@
 
 **独立行为/性能组**（不在 `run-tests.mjs` 计数内，各自单独运行）：
 - G 组 13 条 · 拖拽交互行为（`node tests/drag-behavior.test.mjs`）
-- H 组 12 条 · 性能守卫（`node tests/perf-guard.test.mjs`）
+- H 组 15 条 · 性能守卫（`node tests/perf-guard.test.mjs`）
 - I 组 15 条 · 跨平台全局路径（`node tests/crossplatform-paths.test.mjs`）
 - J 组 11 条 · 审批门槛（`node tests/approval-gate.test.mjs`）
-- K 组 44 条 · 页面动作与退出机制（`node tests/actions.test.mjs`）
+- K 组 · 页面动作与退出机制（`node tests/actions.test.mjs`）—— 断言数随随机抽样（4~6 个 app）浮动
+- L 组 16 条 · 宿主兼容性声明（`node tests/dsh-compat.test.mjs`）
 
 ---
 
@@ -256,7 +280,7 @@ TC-H03 的职责。真实 dsh 服务在插件 `apply()` 时有后台预热（`se
 
 ---
 
-## K 组 — 页面动作与退出机制（`actions.test.mjs`，44 条）
+## K 组 — 页面动作与退出机制（`actions.test.mjs`，断言数随抽样浮动）
 
 > 0.5.3 让页面不再只读：点击名字开终端、查更新、单个升级。这三个动作
 > **会改动真实机器**（弹终端窗口、执行全局安装），所以本组**真实调用插件注册的
@@ -277,7 +301,8 @@ TC-H03 的职责。真实 dsh 服务在插件 `apply()` 时有后台预热（`se
 | TC-K06 | 开终端·已知应用 | → 200，且**确实调用了桩** |
 | TC-K07 | 命令来自 discovery | 跑的是该应用的第一个命令（实测取到 `9router`），不是请求里塞的 |
 | TC-K08 | cwd 非空 | 应用目录或主目录 |
-| TC-K09–K11 | win32 终端形态 | 解释器 `cmd.exe`；参数含**空标题**（否则 `start` 会把命令当窗口标题）；`/k` 保持窗口；命令在末位 |
+| TC-K09–K11 | win32 终端形态（**默认 PowerShell**） | 解释器 `cmd.exe`（借 `start` 开新窗口）；参数含**空标题**（否则命令会被当成窗口标题）；第三个参数为 `pwsh.exe` 或 `powershell.exe`；含 `-NoExit`（保持窗口）与 `-Command`；命令在末位 |
+| TC-K11b–K11d | win32 · cmd 模式 | 显式 `shell=cmd` 时回落到旧形态：`cmd.exe` + `/k` |
 | TC-K12–K14 | darwin 终端形态 | 走 `open`；含 `Terminal`；命令带 cwd |
 | TC-K15–K16 | linux 终端形态 | 走 `x-terminal-emulator`；命令带 cwd |
 | TC-K17–K19 | 更新检查 | 200；返回体含 `updates`；首次采集调用桩一次 |
@@ -291,6 +316,41 @@ TC-H03 的职责。真实 dsh 服务在插件 `apply()` 时有后台预热（`se
 | TC-K29 | 卸载·路由清空 | dispose 后宿主路由表为 0 |
 | TC-K30–K35 | **卸载·fail closed** | 扣住卸载前的旧 handler 直调：三条动作路由全部 404 且带 `no-store` |
 | TC-K36 | 重复卸载 | 不抛错（幂等） |
+| TC-K37–K41 | **版本补齐** | 200；返回体含 `resolved`/`unresolved`；确实探测过且 resolved 非空；二次请求命中缓存（不再探测）；`?refresh=1` 重新探测且带 `refresh` 标记 |
+| TC-K42–K48 | **刷新接口** | `GET` → 405（刷新必须 POST）；`POST` → 200 且返回 `apps` + `refreshedAt`；**确实重置了扫描缓存**（否则读到旧数据）；未指定 `versions` 时**不**做版本探测（自动刷新要便宜）；`versions=1` 时探测结果并入 app 清单 |
+| TC-K49–K51 | **shell 白名单** | `shell=cmd` 透传到终端；未指定时默认 `powershell`；`shell=evil;rm -rf` 这类非法值**回退默认**（白名单，不可能是任意 shell） |
+| TC-K52–K56 | **健康扫描** | `GET /api/health` → 200 且返回 `generatedAt` + `uninstalled` + `leftovers`；已卸载项**不出现在** `/api/apps` 里；`hiddenUninstalled` 计数已返回；`?refresh=1` 触发重新探测；二次请求命中缓存 |
+| TC-K57–K58 | **残留判定** | 命令跑不起来**且** PATH 上有 shim → 报为残留并带上文件清单；跑不起来但**无 shim**（是没有 bin 的库 / bin 名与包名不同，如 `ripgrep` 的可执行文件叫 `rg`）→ **不算**残留 |
+| TC-K59–K65 | **可逆修复** | `GET` → 405（移动文件必须 POST）；未知应用 404；`POST` → 200 且 `ok=true`，移动方式是**改名**（`.MOVED-STUB`）而非删除；磁盘未被真动（改名走桩）；修复后重置扫描缓存；复检发现已修好 → **409 `not_broken`**（拒绝动手）；无 shim 可移 → **409 `no_files`** |
+| TC-K66–K68 | **收尾·关闭打开的应用** | 启动动作全部走桩（无需要登记关闭的进程）；测试期间打开的应用**全部关闭成功**；收尾后**无遗留**应用进程（进程快照差集，只比对本次抽样接触过的命令，避免把用户自己开的程序算进去） |
+
+### 随机抽样：被测应用不再是固定的那几个
+
+`tests/sample-apps.mjs` 提供 `sampleApps(pool, {min:4, max:6})` 与 `pickOne(pool)`。
+
+- **K 组**：从「带命令的应用」里随机抽 4~6 个跑终端 / shell 白名单 / 残留修复断言；
+  从「npm 来源应用」里随机抽 4~6 个跑升级并发保护。
+- **主套件**：`info` / `search` 的目标应用（`TC-B08`、`TC-A04`、`TC-A12`）每次随机抽 1 个。
+- 抽到的名字会打印出来（`· 随机抽样 …`），便于复现失败的那一次。
+- **为什么**：`apps.find()` 永远返回同一个应用，而那个应用往往恰好是名字干净、命令规范、
+  路径正常的那个 —— 名字带空格、命令名与包名不同、路径特殊的应用可能一次都没被测过。
+- **副作用**：断言总数随抽样规模（4~6）浮动，不再是固定值。
+- **黑名单**：Fiddler 全家永不被抽中（`tests/sample-apps.mjs` 的 `EXCLUDED`，按
+  名称 / 安装路径 / 命令匹配）。实测排除项：`ExecAction`、`Fiddler`、`EnableLoopback`、
+  `TrustCert`、`ForceCPU`、`SFXWiz32`、`SFXWiz32-gcc`、`uninst`。
+  原因：跑 `ExecAction` 会**启动 Fiddler**，而 Fiddler 启动即把 Windows 系统代理开关
+  打到 `127.0.0.1:8888` —— 一个会偷偷改机器网络的"测试"不是测试。
+
+### 收尾：关闭测试打开的应用（`tests/close-apps.mjs`）
+
+- `snapshot()` 取进程快照（`tasklist /FO CSV`），`discoverLeaks(before, after, commands)`
+  做差集，只认**本次抽样接触过的命令**对应的进程。
+- `closeAll()` 先关登记的 PID（`registerOpened`），再关差集发现的遗留。
+- ⚠️ **必须用异步 `spawn`，不能用 `spawnSync`**：本机 `spawnSync` 对**任何**目标都返回
+  EBUSY，用了它快照就是空的、差集永远为 0，整个检查会退化成**永远通过的空检查**。
+  因此 `available()` 显式校验 `tasklist` 可用，不可用则按"跳过即失败"处理。
+- 关闭路径本身**实测过**：起一个无害的 `PING.EXE` → `killPid` → 进程表中确认消失。
+  否则"关闭"只是一段从没被执行过的代码 —— 空集合通过和坏掉的关闭长得一模一样。
 
 **为什么必须扣住旧 handler 直调**：卸载后路由已从宿主表摘除，若只对宿主路由表
 断言"404"，测的是宿主而非插件 —— 那正是"看起来通过、实际没测到"的坑。
@@ -339,4 +399,42 @@ TC-H11/H12 用 `process.execPath` 起子进程验证超时，而它**只在 Node
   名叫 `pwsh -Command "…"` 的文件；
 - 测试侧 TC-H13 直接传**原始含空格路径**（不再由测试自己加引号）——
   一旦有人把引用逻辑改回去，本组立刻失败。
+
+---
+
+## L 组 — 宿主兼容性声明（`dsh-compat.test.mjs`，16 条）
+
+> 插件**能否在某个 dsh 上加载**，不取决于代码，而取决于 `package.json` 的 peer 范围。
+> dsh 0.2.0 的 `dsh-app-boot` 在加载 bundle 前执行
+> `semver.satisfies(runtimeVersion, range, { includePrerelease: true })`，
+> **不满足即抛错并跳过该 bundle**（报错建议用 `dsh plugin allow-version` 做精确版本豁免）。
+>
+> 0.5.3 就是这样被挡住的：`^0.1.5-rc.1` 不匹配 `0.2.0-rc.2`（实测，用 dsh 依赖树里的
+> `semver`）。代码全对、声明写窄了，插件照样装不上。
+
+| ID | 用例 | 断言 |
+|----|------|------|
+| TC-L01–L05 | peer 覆盖每条声称支持的线 | 每条线各有一条子句；子句数 === 声称的线数；多线必须 `\|\|` 并列 |
+| TC-L06–L07 | 范围书写整洁 | 无前后空白、无空子句 |
+| TC-L08–L12 | bundle 声明可用 | 声明了 `dsh.bundle.patch`；文件真实存在；含 `insert` 段；插入的是本包 |
+| TC-L13–L16 | 包身份 | version 是合法 semver；包名正确；运行时依赖保持为空 |
+
+**回归能力（已实测）**：把 peer 改回单线 `^0.1.5-rc.1` → 本组 3 项失败、退出码 1。
+
+⚠️ **本组的边界（不要误读）**：它**不重实现 semver**，只防「声明与自称支持范围不一致」。
+范围与运行时版本之间的**语义判定**由宿主在加载时执行 —— 手写一个评估器，
+风险是把错的规则固化成"守卫"，比没有守卫更糟。
+实测参考（`includePrerelease: true`）：
+
+```
+satisfies("0.2.0-rc.2",  "^0.1.5-rc.1")                  = false   ← 0.5.3 被拒的原因
+satisfies("0.2.0-rc.2",  "^0.2.0-rc.2")                  = true
+satisfies("0.1.5-rc.3",  "^0.1.5-rc.1 || ^0.2.0-rc.2")    = true
+satisfies("0.2.0-rc.2",  "^0.1.5-rc.1 || ^0.2.0-rc.2")    = true
+satisfies("0.3.0",       "^0.1.5-rc.1 || ^0.2.0-rc.2")    = false
+satisfies("0.1.7-rc.2",  "^0.1.5-rc.1")                  = true    ← 注意：与 0.2.0-rc.2 不同
+```
+
+最后一行正是「不能手写评估器」的证据：同为预发布版本，`0.1.7-rc.2` 落在
+`^0.1.5-rc.1` 的范围内，而 `0.2.0-rc.2` 不落 —— 规则比"同 tuple 才允许预发布"更微妙。
 

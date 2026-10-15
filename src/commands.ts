@@ -2,8 +2,8 @@
  * Command handlers for dsh-app-manager
  */
 
-import { existsSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { basename, dirname, join, resolve } from "node:path";
 import type { CliApp } from "./types.js";
 import { buildScanReport, discoverAll, discoverUnmanaged, findApp, readManagedBaseline } from "./discovery.js";
 import {
@@ -13,6 +13,7 @@ import {
   execAsync,
   formatBytes,
   formatDuration,
+  getPathDirs,
   pathIndexHas,
 } from "./utils.js";
 
@@ -70,7 +71,7 @@ const VERSION_PROBE_TIMEOUT_MS = 8000;
  * `cmd.exe` spawn. Failures are cached too — a missing broken shim should not
  * be retried 50 times.
  */
-const versionProbeCache = new Map<string, { ok: boolean; output: string; at: number }>();
+const versionProbeCache = new Map<string, { ok: boolean; output: string; error: string; at: number }>();
 const VERSION_CACHE_TTL_MS = Number(process.env.APP_MANAGER_VERSION_CACHE_TTL_MS ?? 300_000);
 
 /** Drop the version-probe cache (used by tests and after installs). */
@@ -82,19 +83,346 @@ export function resetVersionCache(): void {
  * Probe `cmd --version`, memoised. Returns `{ ok, output }` where `ok` means
  * the process exited 0. Uses the async spawn path so concurrent probes really
  * do overlap (see `execAsync`).
+ *
+ * `refresh` bypasses the memo (the page's refresh button/re-resolve path needs
+ * a genuinely fresh answer, not the cached failure from a tool that has since
+ * been repaired).
  */
-async function probeVersion(cmd: string): Promise<{ ok: boolean; output: string }> {
+async function probeVersion(
+  cmd: string,
+  options: { refresh?: boolean } = {}
+): Promise<{ ok: boolean; output: string; error: string }> {
+  // The gate lives here, at the lowest level, so *every* caller is covered —
+  // `resolveAppVersion` and `runDoctor` alike. Doctor used to call this
+  // directly, which is how a `doctor` run (and the test suite that runs it)
+  // still executed ExecAction and started Fiddler after the higher-level gate
+  // was already in place.
+  const refusal = refuseToExecute({
+    name: cmd,
+    commands: [cmd],
+    path: commandExecutablePath(cmd) ?? undefined,
+  });
+  if (refusal) return { ok: false, output: "", error: refusal };
   const hit = versionProbeCache.get(cmd);
-  if (hit && Date.now() - hit.at < VERSION_CACHE_TTL_MS) {
-    return { ok: hit.ok, output: hit.output };
+  if (!options.refresh && hit && Date.now() - hit.at < VERSION_CACHE_TTL_MS) {
+    return { ok: hit.ok, output: hit.output, error: hit.error };
   }
+  if (options.refresh) versionProbeCache.delete(cmd);
   const res = await execAsync(cmd, ["--version"], {
     shell: process.platform === "win32",
     timeout: VERSION_PROBE_TIMEOUT_MS,
   });
-  const entry = { ok: res.success, output: res.output.trim(), at: Date.now() };
+  const entry = { ok: res.success, output: res.output.trim(), error: res.error.trim(), at: Date.now() };
   versionProbeCache.set(cmd, entry);
-  return { ok: entry.ok, output: entry.output };
+  return { ok: entry.ok, output: entry.output, error: entry.error };
+}
+
+/**
+ * Products we refuse to execute — even just to ask their version.
+ *
+ * Asking `<cmd> --version` looks harmless, but a command is a program: running
+ * it can open windows, start a daemon, or change system settings. Fiddler's
+ * `ExecAction` is the proof — it ignores the argument and launches Fiddler,
+ * which flips the Windows system-proxy switch to `127.0.0.1:8888`. A version
+ * scan that silently reconfigures the machine's network is a bug, not a
+ * feature.
+ *
+ * Matched against name / install path / commands: one such product ships
+ * several executables, each of which is a separate "app" to discovery.
+ */
+const DO_NOT_EXECUTE: RegExp[] = [
+  /fiddler/i,
+  /telerik/i,
+  /execaction/i,
+  /sfxwiz/i,
+  /trustcert/i,
+  /enableloopback/i,
+  /forcecpu/i,
+  // An executable literally named `uninst` / `uninstall` *is* an uninstaller.
+  // Fiddler ships one at `...\Fiddler\uninst.exe`: asking it for `--version`
+  // does not print a version, it starts uninstalling. That is exactly what
+  // happened — and unlike `ExecAction` it never touches the proxy, which is
+  // why the proxy stayed off while Fiddler's uninstaller still opened.
+  /^uninst/i,
+  // Windows components that answer `--version` with a **window**.
+  //
+  // `C:\Program Files\WSL\msrdc.exe` is the Remote Desktop client: it does not
+  // print a version, it opens a modal "远程桌面使用情况" error dialog. A modal
+  // dialog cannot be killed with the child process, so the version scan it
+  // belonged to never returns — a refresh that hangs forever rather than
+  // failing. `wslg` answers by dumping its help text.
+  //
+  // Discovery already drops the whole `Program Files\WSL` directory; this is
+  // the second line, for the day one of them arrives through another source
+  // (choco, scoop, a PATH shim).
+  /\bmsrdc\b/i,
+  /\bwslg\b/i,
+];
+
+/**
+ * Where the command's executable actually lives, if we can find it.
+ *
+ * The low-level gate only receives a command *name*, and a name is not enough:
+ * Fiddler's `uninst` gives nothing away by name, but its path
+ * (`...\Fiddler\uninst.exe`) does. Resolving it lets the path-based patterns
+ * work for every caller, not just the ones that happen to hold the app record.
+ */
+function commandExecutablePath(cmd: string): string | null {
+  if (!/^[A-Za-z0-9._-]+$/.test(cmd)) return null;
+  for (const dir of getPathDirs()) {
+    for (const name of [`${cmd}.exe`, `${cmd}.cmd`, `${cmd}.bat`, `${cmd}.ps1`]) {
+      const file = join(dir, name);
+      if (existsSync(file)) return file;
+    }
+  }
+  return null;
+}
+
+/** Why this app may not be run; `null` means it may. */
+export function refuseToExecute(app: {
+  name?: string;
+  path?: string;
+  commands?: string[];
+}): string | null {
+  const hay = [app?.name, app?.path, ...(app?.commands || [])].filter(Boolean).join(" ");
+  const hit = DO_NOT_EXECUTE.find((re) => re.test(hay));
+  return hit ? `${app?.name ?? "?"} belongs to a product we never execute (${hit})` : null;
+}
+
+/** Placeholders a shim uses to mean "the directory I live in". */
+const DIR_TOKENS = /%(?:~?dp0)%|\$basedir|\$\{basedir\}/gi;
+
+/**
+ * The program files a shim asks its interpreter to run.
+ *
+ * Only **script** targets are returned, never the interpreter: a shim
+ * references its interpreter conditionally (`IF EXIST "%dp0%\node.exe" … ELSE
+ * node`), so a missing `.exe` there is normal and must not read as "broken".
+ */
+export function shimTargets(file: string): string[] {
+  let text: string;
+  try {
+    text = readFileSync(file, "utf8");
+  } catch {
+    return [];
+  }
+  if (text.includes("\0")) return []; // binary — not a shim we can read
+  const dir = dirname(file);
+  const out = new Set<string>();
+  const re = /["']?([^\s"']+\.(?:js|mjs|cjs|py|rb|pl|pm|jar|php))["']?/gi;
+  for (const m of text.matchAll(re)) {
+    const raw = m[1];
+    // `set PATHEXT=%PATHEXT:;.JS;=;%` and friends end in a script extension too,
+    // but they are environment plumbing, not a path. Without this filter every
+    // healthy npm shim looked "broken" — the fake path never exists.
+    if (/[=;]/.test(raw)) continue;
+    const expanded = raw.replace(DIR_TOKENS, dir);
+    // A placeholder that survived expansion is a variable we cannot resolve.
+    // Electron apps are the reason this matters: VS Code's shim references
+    // `$VSCODE_PATH\$VERSIONFOLDER\resources\app\out\cli.js`, which is filled
+    // in at runtime — statically it looks like a missing file, and reporting
+    // the app as an orphan would offer to "fix" a perfectly working install.
+    if (expanded.includes("%") || expanded.includes("$")) continue;
+    out.add(resolve(dir, expanded));
+  }
+  return [...out];
+}
+
+/**
+ * Resolve a shim target through npm's **hashed** package directory.
+ *
+ * npm installs any package whose name starts with a digit into a hashed
+ * directory — `9router` lands in `node_modules/.9router-wssQRq4J` — but the
+ * shims it generates still reference the *logical* path
+ * `node_modules/9router/cli.js`. That logical path is normally a link to the
+ * hashed one; when a manifest-less directory from an older layout is sitting
+ * at `node_modules/9router` instead, the link is never created and the logical
+ * path does not exist.
+ *
+ * A plain "does the target exist?" check then reports a perfectly installed,
+ * perfectly working package as an orphan, and offers to "clean up the
+ * leftover" — which moves the user's working shims away. That is worse than
+ * the problem it claims to fix. So: if the logical path is missing but the
+ * hashed equivalent exists, the package is present and the shim is fine.
+ *
+ * @returns the hashed path that does exist, or `null` when there is none.
+ */
+export function viaHashedPackageDir(target: string): string | null {
+  // The optional group is what makes this work for scoped packages: npm puts
+  // `@anthropic-ai/claude-code` in `@anthropic-ai/.claude-code-MPHaZ0ov`, so
+  // the hashed sibling lives one level below the *scope*, not below
+  // `node_modules`. Without it, `@anthropic-ai/claude-code` looked gone and
+  // the app was hidden from the table as "uninstalled".
+  const m = /(.*[\\/]node_modules(?:[\\/]@[^\\/]+)?)[\\/]([^\\/]+)[\\/](.+)$/.exec(target);
+  if (!m) return null;
+  const [, nmRoot, pkgName, rest] = m;
+  // No "the directory exists, so this is the normal layout" short-circuit:
+  // a manifest-less `node_modules/9router` left over from an older install is
+  // exactly what makes the logical path look populated while `cli.js` inside
+  // it is missing. Callers only reach here when `target` itself is absent.
+
+  let entries: string[];
+  try {
+    entries = readdirSync(nmRoot);
+  } catch {
+    return null;
+  }
+  const prefix = `.${pkgName}-`;
+  for (const entry of entries) {
+    if (!entry.startsWith(prefix)) continue;
+    const suffix = entry.slice(prefix.length);
+    if (!/^[A-Za-z0-9]+$/.test(suffix)) continue; // npm's random suffix
+    const candidate = join(nmRoot, entry, rest);
+    if (existsSync(candidate)) return candidate;
+  }
+  return null;
+}
+
+/**
+ * Is this leftover really broken? **Pure** — it reads the shim and checks what
+ * the shim points at. No child process is spawned.
+ */
+export function brokenShimReason(files: string[]): string | null {
+  let sawTarget = false;
+  let firstMissing: string | null = null;
+  for (const file of files) {
+    const targets = shimTargets(file);
+    // Nothing readable in this shim — that is *unknown*, not broken. VS Code
+    // and Cursor ship a `.cmd` launcher whose real target is built at runtime;
+    // guessing from the parts we can parse would condemn a working app.
+    if (targets.length === 0) return null;
+    sawTarget = true;
+    // One *working* shim is enough: a command installed under several runtimes
+    // (npm ships one shim per node version) is healthy as long as any of them
+    // resolves. Only when every readable shim points at something gone is the
+    // command an orphan.
+    // A target inside npm's hashed package directory counts as present —
+    // see `viaHashedPackageDir`.
+    const missing = targets.find((t) => !existsSync(t) && !viaHashedPackageDir(t));
+    if (!missing) return null;
+    firstMissing ??= `${basename(file)} points at ${missing}, which no longer exists`;
+  }
+  return sawTarget ? firstMissing : null;
+}
+
+/**
+ * The script shims a command leaves in PATH directories.
+ *
+ * Only `cmd` / `bat` / `ps1` and the extensionless POSIX wrapper — a real
+ * `.exe` is a program, not a leftover, and is never a candidate.
+ */
+export function shimFilesOnPath(command: string): string[] {
+  if (!/^[A-Za-z0-9._-]+$/.test(command)) return [];
+  const out: string[] = [];
+  for (const dir of getPathDirs()) {
+    for (const name of [command, `${command}.cmd`, `${command}.bat`, `${command}.ps1`]) {
+      const file = join(dir, name);
+      if (existsSync(file)) out.push(file);
+    }
+  }
+  return out;
+}
+
+/**
+ * Is this app's command a leftover from an uninstall?
+ *
+ * Deliberately **does not run the command**. It used to (`<cmd> --version`,
+ * then pattern-match the failure), which meant one child process per app on
+ * every sweep — and on this machine that executed Fiddler's `ExecAction`,
+ * starting Fiddler and flipping the system proxy. Static analysis answers the
+ * same question: a shim whose target no longer exists *is* the leftover, and
+ * reading a file cannot start a program.
+ */
+export async function probeCommandHealth(
+  app: CliApp,
+  _options: { refresh?: boolean } = {}
+): Promise<{ broken: boolean; reason: string }> {
+  if (refuseToExecute(app)) return { broken: false, reason: "" };
+  const cmd = app.commands?.[0];
+  if (!cmd) return { broken: false, reason: "" };
+  const files = shimFilesOnPath(cmd);
+  if (files.length === 0) return { broken: false, reason: "" };
+  const reason = brokenShimReason(files);
+  return reason ? { broken: true, reason } : { broken: false, reason: "" };
+}
+
+/**
+ * Pull a version-looking token out of probe output.
+ *
+ * Deliberately permissive on shape and strict on "has digits and dots": the
+ * outputs in the wild are `v22.22.2`, `2.1.293 (Claude Code)`,
+ * `Docker version 28.4.0, build d8eb465`, `Docker Compose version v2.39.2-desktop.1`,
+ * `0.34.0` … A strict parser would reject half of them, and the token is shown
+ * as-is next to the app, not compared unless a numeric version is needed.
+ */
+export function extractVersionToken(text: string): string | null {
+  const m = String(text).match(/\d+\.\d+(?:\.\d+)?(?:[-.+][0-9A-Za-z.-]+)?/);
+  return m ? m[0] : null;
+}
+
+/**
+ * Resolve an app's displayed version.
+ *
+ * Package-manager sources already carry a version from their manifest, so they
+ * are answered without spawning anything. Everything else — the ~2/3 of a real
+ * machine that is discovered by **PATH enumeration** (portable tools, and shims
+ * whose package directory is gone) — has no metadata at all, which is why the
+ * table used to show `unknown` for most rows. For those we probe the tool
+ * itself: `<cmd> --version`, falling back to `-v` (some tools only accept the
+ * short form).
+ *
+ * Returns `null` when the tool does not answer or answers without a version.
+ */
+export async function resolveAppVersion(
+  app: CliApp,
+  options: { refresh?: boolean } = {}
+): Promise<string | null> {
+  const declared = (app.version ?? "").trim();
+  if (declared && declared !== "unknown") return declared;
+  const cmd = app.commands?.[0];
+  if (!cmd) return null;
+  // Never run a program we must not run just to read its version — the answer
+  // is not worth a machine whose network just got reconfigured.
+  if (refuseToExecute(app)) return null;
+
+  for (const flag of ["--version", "-v"]) {
+    const res = await probeVersionFlag(cmd, flag, options);
+    if (!res.ok) continue;
+    const token = extractVersionToken(res.output);
+    if (token) return token;
+  }
+  return null;
+}
+
+/**
+ * Probe one command with an explicit flag, through the same memo as
+ * `probeVersion` (keyed by `cmd + flag`, so `--version` and `-v` do not
+ * overwrite each other's answers).
+ */
+async function probeVersionFlag(
+  cmd: string,
+  flag: string,
+  options: { refresh?: boolean } = {}
+): Promise<{ ok: boolean; output: string; error: string }> {
+  const refusal = refuseToExecute({
+    name: cmd,
+    commands: [cmd],
+    path: commandExecutablePath(cmd) ?? undefined,
+  });
+  if (refusal) return { ok: false, output: "", error: refusal };
+  if (flag === "--version") return await probeVersion(cmd, options);
+  const key = `${cmd} ${flag}`;
+  const hit = versionProbeCache.get(key);
+  if (!options.refresh && hit && Date.now() - hit.at < VERSION_CACHE_TTL_MS) {
+    return { ok: hit.ok, output: hit.output, error: hit.error };
+  }
+  const res = await execAsync(cmd, [flag], {
+    shell: process.platform === "win32",
+    timeout: VERSION_PROBE_TIMEOUT_MS,
+  });
+  const entry = { ok: res.success, output: res.output.trim(), error: res.error.trim(), at: Date.now() };
+  versionProbeCache.set(key, entry);
+  return { ok: entry.ok, output: entry.output, error: entry.error };
 }
 
 /**
@@ -606,6 +934,9 @@ export async function runDoctor(options: CommandOptions = {}): Promise<void> {
     if (app.path && !existsSync(app.path)) {
       local.push({ app: app.name, severity: "warning", message: `Package directory missing: ${app.path}` });
     }
+    // The full record carries the install path, so decide with it before
+    // probing — never on the command name alone.
+    if (refuseToExecute(app)) return { name: app.name, ok: local.length === 0, issues: local };
     if (app.commands.length > 0 && pathIndexHas(app.commands[0])) {
       const probe = await probeVersion(app.commands[0]);
       if (!probe.ok) {

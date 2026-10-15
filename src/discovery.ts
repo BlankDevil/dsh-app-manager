@@ -9,7 +9,7 @@
  *                            is flagged as unmanaged (portable / manually-placed)
  */
 
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { basename, join } from "node:path";
 import type {
   AppCategory,
@@ -21,12 +21,15 @@ import type {
   ScanSourceReport,
 } from "./types.js";
 import {
+  EXECUTABLE_EXTS,
   appDataDir,
   dedupeBy,
   enumPathExecutables,
   execSafe,
   getLastSpawnError,
+  getPathDirs,
   homeDir,
+  isGuiExecutable,
   localAppDataDir,
   namesLikelyMatch,
   npmGlobalRoot,
@@ -234,9 +237,74 @@ function stripLauncherExt(name: string): string {
   return name;
 }
 
-function detectCliFromPackageJson(pkgPath: string, pkgName: string): CliApp | null {
+/* -------------------------------------------------------------------------- */
+/*  GUI detection for the launcher                                            */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Resolve the first command on PATH and report whether it is a windowed
+ * program.
+ *
+ * The launcher needs this for one decision: a GUI app must be started
+ * *directly* (a terminal would only sit there attached to a process that owns
+ * its own window), while a pure CLI tool needs that terminal to stay open.
+ *
+ * What gets inspected is the file PATH actually resolves to, not the package
+ * directory or the `bin` declaration — an npm package can declare a `.js`
+ * entry but install a `.cmd` shim, and it is the shim Windows starts.
+ *
+ * Never executes anything: `isGuiExecutable` reads the PE header, and the
+ * whole probe degrades to `false` (console) when it cannot tell.
+ *
+ * @param command A bare command name, as it appears in `CliApp.commands`.
+ * @returns `true` only when a PE image on PATH declares the GUI subsystem.
+ */
+function commandHasGui(command: string): boolean {
+  // Off Windows the question does not arise: every app gets a terminal.
+  if (process.platform !== "win32") return false;
+
+  const dirs = getPathDirs();
+  const names = [command, ...EXECUTABLE_EXTS.map((ext) => command + ext)];
+
+  for (const dir of dirs) {
+    // Respect PATH precedence exactly like the shell does: the first match
+    // wins, and a match that is not a PE (a `.cmd` shim) settles the answer
+    // as "console" instead of falling through to a later duplicate.
+    for (const name of names) {
+      const candidate = join(dir, name);
+      if (!existsSync(candidate)) continue;
+      try {
+        if (!statSync(candidate).isFile()) continue;
+      } catch {
+        continue;
+      }
+      return isGuiExecutable(candidate);
+    }
+  }
+  return false;
+}
+
+function detectCliFromPackageJson(
+  pkgPath: string,
+  pkgName: string,
+  options: { allowNoCommand?: boolean } = {}
+): CliApp | null {
   const pkg = readPackageJson(pkgPath);
   if (!pkg) return null;
+
+  /**
+   * The installed directory name is NOT the package name.
+   *
+   * npm puts packages whose name starts with a digit into a hashed directory —
+   * `9router` lands in `node_modules/.9router-wssQRq4J` — while the shims it
+   * generates still point at the *logical* path `node_modules/9router/...`.
+   * Reading the name off the directory therefore shows the user a string like
+   * `.9router-wssQRq4J`, which is meaningless to them.
+   *
+   * The manifest is authoritative; the directory name is only a fallback for
+   * packages that somehow ship without a `name`.
+   */
+  const canonicalName = typeof pkg.name === "string" && pkg.name.trim() ? pkg.name.trim() : pkgName;
 
   const commands: string[] = [];
   /** Names explicitly declared in `package.json#bin` — always authoritative. */
@@ -247,8 +315,8 @@ function detectCliFromPackageJson(pkgPath: string, pkgName: string): CliApp | nu
   // keys are taken.
   if (pkg.bin) {
     if (typeof pkg.bin === "string") {
-      commands.push(basename(pkgName));
-      declared.add(basename(pkgName).toLowerCase());
+      commands.push(basename(canonicalName));
+      declared.add(basename(canonicalName).toLowerCase());
     } else if (typeof pkg.bin === "object" && pkg.bin !== null) {
       for (const key of Object.keys(pkg.bin)) {
         commands.push(key);
@@ -292,13 +360,24 @@ function detectCliFromPackageJson(pkgPath: string, pkgName: string): CliApp | nu
       return pathIndexHas(c);
     });
 
-  if (normalised.length === 0) return null;
+  const known = KNOWN_CLI_PACKAGES[canonicalName] ?? KNOWN_CLI_PACKAGES[pkgName];
 
-  const known = KNOWN_CLI_PACKAGES[pkgName];
+  // Packages that expose no command are still installed software. Showing them
+  // keeps the dashboard honest about what is on the machine — a deprecated or
+  // mis-packaged install (e.g. `deepseek-tui`) is less confusing when it is
+  // visible with a "no command" marker than when it silently disappears after
+  // a global install. Launch routes will refuse to start it for lack of a bin.
+  //
+  // Only global package-manager roots opt in. The npx cache is a *download*
+  // cache whose flat `node_modules` holds every transitive dependency of every
+  // package ever run through `npx`; listing those added 141 library rows on
+  // this machine (`ajv`, `zod`, `commander`, …) and buried the real tools.
+  if (normalised.length === 0 && !options.allowNoCommand) return null;
+  const resolvedCommands = [...new Set(normalised)];
   return {
-    name: pkgName,
+    name: canonicalName,
     version: typeof pkg.version === "string" ? pkg.version : "unknown",
-    commands: [...new Set(normalised)],
+    commands: resolvedCommands,
     category: known?.category || "other",
     description: known?.desc || (typeof pkg.description === "string" ? pkg.description : ""),
     source: "npm",
@@ -307,6 +386,10 @@ function detectCliFromPackageJson(pkgPath: string, pkgName: string): CliApp | nu
     latestVersion: null,
     managed: false,
     installKind: "managed",
+    // npm ships GUI apps (VS Code, Cursor) through the same `.cmd` shims as
+    // CLI tools, so the shim says nothing — resolve the command on PATH and
+    // read the real executable's PE header instead.
+    hasGui: resolvedCommands.length > 0 && resolvedCommands.some((c) => commandHasGui(c)),
   };
 }
 
@@ -355,7 +438,7 @@ function discoverNpmGlobalRaw(): CliApp[] {
             if (!scopedEntry.isDirectory()) continue;
             const fullName = `${entry.name}/${scopedEntry.name}`;
             const pkgPath = join(scopeDir, scopedEntry.name);
-            const app = detectCliFromPackageJson(pkgPath, fullName);
+            const app = detectCliFromPackageJson(pkgPath, fullName, { allowNoCommand: true });
             if (app) {
               app.source = "npm";
               apps.push(app);
@@ -366,7 +449,7 @@ function discoverNpmGlobalRaw(): CliApp[] {
         }
       } else {
         const pkgPath = join(globalDir, entry.name);
-        const app = detectCliFromPackageJson(pkgPath, entry.name);
+        const app = detectCliFromPackageJson(pkgPath, entry.name, { allowNoCommand: true });
         if (app) {
           app.source = "npm";
           apps.push(app);
@@ -412,7 +495,7 @@ function discoverPnpmGlobalRaw(): CliApp[] {
       if (!deps) continue;
       for (const [name, info] of Object.entries(deps)) {
         const pkgPath = info.path || join(process.env.PNPM_HOME || "", "global", "node_modules", name);
-        const app = detectCliFromPackageJson(pkgPath, name);
+        const app = detectCliFromPackageJson(pkgPath, name, { allowNoCommand: true });
         if (app) {
           app.version = info.version || app.version;
           app.source = "pnpm";
@@ -530,6 +613,7 @@ function discoverScoopRaw(): CliApp[] {
           latestVersion: null,
           managed: true,
           installKind: "managed",
+          hasGui: [...new Set(commands)].some((c) => commandHasGui(c)),
         });
       }
     }
@@ -598,6 +682,7 @@ function discoverChocoRaw(): CliApp[] {
         latestVersion: null,
         managed: true,
         installKind: "managed",
+        hasGui: commandHasGui(command),
       });
     }
     return apps;
@@ -632,6 +717,7 @@ function discoverChocoRaw(): CliApp[] {
         latestVersion: null,
         managed: true,
         installKind: "managed",
+        hasGui: commandHasGui(match[1].toLowerCase()),
       });
     }
   }
@@ -677,6 +763,7 @@ function discoverCargoRaw(): CliApp[] {
         latestVersion: null,
         managed: true,
         installKind: "managed",
+        hasGui: (bins.length > 0 ? bins : [match[1]]).some((c) => commandHasGui(c)),
       });
     }
   }
@@ -721,6 +808,7 @@ function discoverPipxRaw(): CliApp[] {
         latestVersion: null,
         managed: true,
         installKind: "managed",
+        hasGui: injected.some((c) => commandHasGui(c)),
       });
     }
   } catch {
@@ -763,6 +851,7 @@ function discoverPipGlobalRaw(): CliApp[] {
         latestVersion: null,
         managed: true,
         installKind: "managed",
+        hasGui: commandHasGui(command),
       });
     }
   } catch {
@@ -810,6 +899,7 @@ function discoverUvToolsRaw(): CliApp[] {
         latestVersion: null,
         managed: true,
         installKind: "managed",
+        hasGui: commandHasGui(pkgMatch[1].toLowerCase()),
       });
     }
   }
@@ -845,6 +935,9 @@ function discoverFromPathRaw(): CliApp[] {
       // Managed-ness is resolved later during cross-referencing with ARP.
       managed: false,
       installKind: "path-shim",
+      // PATH enumeration already handed us the executable itself, so this is
+      // a direct header read — no PATH re-resolution needed.
+      hasGui: isGuiExecutable(exe.path),
     });
   }
 
@@ -866,6 +959,26 @@ const PATH_NOISE_DIRS = [
   "\\git\\mingw",
   "\\git\\cmd",
   "\\portablegit",
+  // WSL's implementation directory. Everything in `C:\Program Files\WSL\` is
+  // an internal component of the WSL stack — `wslg`, `wslhost`, `wslrelay`,
+  // `wslservice`, `wslc`, `container`, `msrdc` — none of which is a tool a user
+  // runs. `msrdc` is the Remote Desktop client: probing it with `--version`
+  // throws a *modal error dialog* instead of printing anything, and `wslg`
+  // dumps its help text. The user-facing entry point is `wsl.exe`, which lives
+  // in System32 and is already filtered above. Listing these was worse than
+  // noise: a "version scan" that pops a GUI window and cannot be dismissed
+  // blocks the very refresh it was meant to serve.
+  "\\program files\\wsl",
+  // Fiddler's install directory holds no user-facing command: every `.exe` in
+  // it is an internal step of the product — the GUI itself, its certificate
+  // helper, the loopback enabler, and `uninst.exe`, which *is* the uninstaller.
+  // They are on PATH, so they were listed as if they were tools, and each one
+  // is a hazard to start: `uninst` uninstalls on launch, and `EnableLoopback` /
+  // `TrustCert` mutate machine-wide network and certificate state. Dropping the
+  // directory keeps them out of the table entirely; `DO_NOT_EXECUTE` in
+  // commands.ts stays as the second layer, for copies that arrive some other
+  // way (scoop, choco, a hand-placed shim).
+  "\\programs\\fiddler",
   "\\nodejs\\node_modules\\npm\\bin",
   "\\node_modules\\.bin",
   "\\pnpm\\",

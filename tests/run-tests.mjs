@@ -10,7 +10,7 @@
  *   - 退出码 0 = 无 FAIL；1 = 存在 FAIL
  */
 
-import { spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import path from "node:path";
@@ -18,6 +18,7 @@ import path from "node:path";
 // ---------- 环境常量 ----------
 const NODE = process.execPath;
 const TESTS_DIR = path.dirname(fileURLToPath(import.meta.url));
+import { pickOne, describeApp, excludedPatterns } from "./sample-apps.mjs";
 // The plugin root is the parent of this tests/ directory.
 const PLUGIN_DIR = path.resolve(TESTS_DIR, "..");
 const CLI = path.join(PLUGIN_DIR, "lib/bin/cli-app-manager.js");
@@ -91,17 +92,63 @@ async function test(id, title, fn) {
 }
 
 // ---------- 工具函数 ----------
-function runCli(args, timeoutMs = 180000) {
-  const r = spawnSync(NODE, [CLI, ...args], {
-    encoding: "utf8",
-    timeout: timeoutMs,
-    maxBuffer: 64 * 1024 * 1024,
-    env: process.env,
+/**
+ * 跑一次 CLI，返回 { code, stdout, stderr, timedOut }。
+ *
+ * **刻意用异步 `spawn` 而不是 `spawnSync`**：本机运行环境下 `spawnSync` 对**任何**
+ * 目标都返回 `EBUSY`（连 `spawnSync("cmd.exe", ["/c","echo","hi"])` 都是 EBUSY），
+ * 而异步 `spawn` 完全正常 —— 实测同一个 node 二进制：sync 8ms 报 EBUSY、
+ * async 247ms 正常返回 code=0。这是宿主环境的限制，与插件代码无关，但会让
+ * A 组 18 条全部"失败"，且报出来只是光秃秃的「退出码 null」，极易误判成被测程序的问题。
+ *
+ * 异步版还顺带避开了同步阻塞：全量套件里 A 组最长要等 300s（doctor）。
+ */
+async function runCli(args, timeoutMs = 180000) {
+  return await new Promise((resolve) => {
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(result);
+    };
+    const child = spawn(NODE, [CLI, ...args], {
+      stdio: ["ignore", "pipe", "pipe"],
+      env: process.env,
+      windowsHide: true,
+    });
+    const timer = setTimeout(() => {
+      try {
+        child.kill();
+      } catch {
+        /* already gone */
+      }
+      finish({ code: null, stdout, stderr: `TIMEOUT after ${timeoutMs}ms`, timedOut: true });
+    }, timeoutMs);
+    child.stdout?.on("data", (d) => {
+      stdout += d;
+    });
+    child.stderr?.on("data", (d) => {
+      stderr += d;
+    });
+    // 子进程压根没起来时，把原因带出来 —— 否则只看到「退出码 null」。
+    child.on("error", (e) => {
+      finish({ code: null, stdout, stderr: `SPAWN FAILED ${e.code ?? ""}: ${e.message}`, timedOut: false });
+    });
+    // ⚠️ 结算以 **exit**（进程已结束）为准，而不是 close（stdio EOF）。
+    // 原因：被测 CLI 会派生子进程，若某个孙进程在被超时清理后**仍持有继承来的
+    // stdout 管道**，close 永远不会触发 —— 于是测试卡满整个 timeout（实测
+    // TC-A10 doctor 就是这样挂到 300s 的，而 CLI 其实早已跑完并打印了汇总）。
+    // 进程退出后再给一小段时间冲刷剩余输出即可。
+    child.on("exit", (code, signal) => {
+      setTimeout(() => finish({ code, stdout, stderr, timedOut: false, signal }), 250);
+    });
+    child.on("close", (code, signal) => {
+      finish({ code, stdout, stderr, timedOut: false, signal });
+    });
   });
-  if (r.error && r.error.code === "ETIMEDOUT") {
-    return { code: null, stdout: "", stderr: `TIMEOUT after ${timeoutMs}ms`, timedOut: true };
-  }
-  return { code: r.status, stdout: r.stdout ?? "", stderr: r.stderr ?? "", timedOut: false };
 }
 
 function clip(text, max = 200) {
@@ -166,6 +213,16 @@ function countOccurrences(haystack, needle) {
   return haystack.split(needle).length - 1;
 }
 
+// ---------- 本轮测试用到的应用（随机抽样，必须写进报告） ----------
+//
+// 抽样是随机的，所以「这份报告全绿」这句话离开了「打的是哪几个应用」就没有
+// 意义：同一份用例换个样本可能就红了。把样本写进报告，失败才可复现。
+const sampledApps = [];
+function recordSample(role, app, how) {
+  if (app) sampledApps.push({ role, app, how });
+  return app;
+}
+
 // ---------- 主流程 ----------
 async function main() {
   const startedAt = new Date();
@@ -191,6 +248,19 @@ async function main() {
     assert(JSON.stringify(plugin.inject) === JSON.stringify(["tools", "webServer"]), `inject 应为 [tools,webServer]，实际 ${JSON.stringify(plugin.inject)}`);
     return `name=${plugin.name} inject=${JSON.stringify(plugin.inject)}`;
   });
+
+  // info / search 的目标应用：随机抽，不再写死 "dsh"。
+  // 写死一个应用等于只测那一个 —— 名字、命令、路径都恰好"干净"的那一个。
+  const appsRoute = pluginCtx.routes.find((r) => r.path === "/app-manager/api/apps");
+  const appsProbe = await callRoute(appsRoute, "/app-manager/api/apps");
+  const discovered = (JSON.parse(appsProbe.body).apps || []).filter((a) => a.commands && a.commands.length > 0);
+  const infoTarget = recordSample(
+    "info / search 目标应用",
+    pickOne(discovered, "info/search 目标应用"),
+    `随机 1 / 池 ${discovered.length}`
+  );
+  assert(infoTarget, "本机没有带命令的应用，无法随机选目标");
+  console.log(`  本次抽样目标: ${describeApp(infoTarget)}`);
 
   await test("TC-B02", "apply 注册工具数 = 7", async () => {
     assert(pluginCtx.tools.length === 7, `应注册 7 个工具，实际 ${pluginCtx.tools.length}`);
@@ -243,10 +313,10 @@ async function main() {
     return `全量 ${nFull} → npm 过滤 ${nFiltered}`;
   });
 
-  await test("TC-B08", "工具·info 命中 dsh", async () => {
-    const out = String(await getTool("app_manager_info").execute({ name: "dsh" }, execSignal));
+  await test("TC-B08", `工具·info 命中 ${infoTarget.name}`, async () => {
+    const out = String(await getTool("app_manager_info").execute({ name: infoTarget.name }, execSignal));
     assert(out.includes("Version:"), "缺少 Version 字段");
-    assert(out.toLowerCase().includes("dsh"), "输出未包含 dsh");
+    assert(out.toLowerCase().includes(infoTarget.name.toLowerCase()), `输出未包含 ${infoTarget.name}`);
     return clip(out, 120);
   });
 
@@ -284,12 +354,13 @@ async function main() {
   // ============ C 组（路由 + JSON，产物供 D/E/A 组使用） ============
   group("C 组 · Web 路由与 JSON API");
 
-  await test("TC-C01", "路由注册面 = 7 条 exact", async () => {
+  await test("TC-C01", "路由注册面 = 11 条 exact", async () => {
     const paths = pluginCtx.routes.map((r) => `${r.kind} ${r.path}`);
-    // 0.5.3 起为 4 条只读路由 + 3 条动作路由（open/updates/update）。
-    // 动作路由的**行为**（校验、并发、失败关闭）由 tests/actions.test.mjs 覆盖，
-    // 这里只守注册面：少一条就是接口凭空消失。
-    assert(pluginCtx.routes.length === 7, `应注册 7 条路由，实际 ${pluginCtx.routes.length}`);
+    // 4 条只读 + 3 条动作（open/updates/update）+ 2 条刷新（versions/refresh）
+    // + 2 条健康（health/leftover/fix）。
+    // 动作、刷新与健康路由的**行为**由 tests/actions.test.mjs 覆盖，这里只守注册面：
+    // 少一条就是接口凭空消失。
+    assert(pluginCtx.routes.length === 11, `应注册 11 条路由，实际 ${pluginCtx.routes.length}`);
     assert(pluginCtx.routes.every((r) => r.kind === "exact"), "存在非 exact 路由");
     const expected = [
       "/app-manager",
@@ -299,6 +370,10 @@ async function main() {
       "/app-manager/api/open",
       "/app-manager/api/updates",
       "/app-manager/api/update",
+      "/app-manager/api/versions",
+      "/app-manager/api/refresh",
+      "/app-manager/api/health",
+      "/app-manager/api/leftover/fix",
     ];
     for (const p of expected) assert(paths.some((x) => x.endsWith(p)), `缺少路由 ${p}`);
     return paths.join(" | ");
@@ -356,6 +431,9 @@ async function main() {
   // 为 update 守卫用例动态选取 path 来源应用（安全：非 npm/pnpm/choco/scoop 不会触发真实安装）
   const pathApp = appsJson?.apps.find((a) => a.source === "path");
   pathAppName = pathApp?.name ?? null;
+  if (pathApp) {
+    recordSample("update 守卫目标（必须被拒绝）", pathApp, "首个 path 来源（确定性）");
+  }
 
   // ============ D 组（UI 需求断言） ============
   group("D 组 · UI 需求断言");
@@ -487,10 +565,26 @@ async function main() {
     return `${seen.size} 个唯一键`;
   });
 
-  await test("TC-E06", "commands 非空数组", async () => {
-    const bad = appsJson.apps.filter((a) => !Array.isArray(a.commands) || a.commands.length === 0);
-    assert(bad.length === 0, `commands 为空: ${bad.map((a) => a.name).join(",")}`);
-    return `${appsJson.apps.length} 项全部有命令`;
+  await test("TC-E06", "commands 为数组；无命令项仅来自包管理器且不在 PATH", async () => {
+    // `commands` used to be required to be non-empty, because anything without
+    // a command was dropped from discovery. Packages installed with no `bin`
+    // are now listed (a global install that exposes no command should still be
+    // visible), so the invariant moves: it must be an array, an empty one is
+    // only legal for package-manager sources, and such an app can never claim
+    // to be on PATH.
+    const notArray = appsJson.apps.filter((a) => !Array.isArray(a.commands));
+    assert(notArray.length === 0, `commands 不是数组: ${notArray.map((a) => a.name).join(",")}`);
+
+    const noCmd = appsJson.apps.filter((a) => a.commands.length === 0);
+    const wrongSource = noCmd.filter((a) => a.source !== "npm" && a.source !== "pnpm");
+    assert(
+      wrongSource.length === 0,
+      `非包管理器来源出现无命令项: ${wrongSource.map((a) => `${a.name}@${a.source}`).join(",")}`
+    );
+    const pretending = noCmd.filter((a) => a.inPath === true);
+    assert(pretending.length === 0, `无命令却标为在 PATH: ${pretending.map((a) => a.name).join(",")}`);
+
+    return `${appsJson.apps.length} 项；其中 ${noCmd.length} 项无命令（包管理器来源，不可启动）`;
   });
 
   await test("TC-E07", "跨端点总数一致", async () => {
@@ -525,7 +619,7 @@ async function main() {
   group("A 组 · CLI 命令（子进程）");
 
   await test("TC-A01", "list 基本输出", async () => {
-    const r = runCli(["list"]);
+    const r = await runCli(["list"]);
     assert(r.code === 0, `退出码 ${r.code} · stderr: ${clip(r.stderr, 80)}`);
     const plain = r.stdout.replace(/\x1b\[[0-9;]*m/g, "");
     assert(plain.includes("Managed:"), "缺少 Managed: 统计行");
@@ -536,7 +630,7 @@ async function main() {
   });
 
   await test("TC-A02", "list -s npm 过滤", async () => {
-    const r = runCli(["list", "-s", "npm"]);
+    const r = await runCli(["list", "-s", "npm"]);
     assert(r.code === 0, `退出码 ${r.code}`);
     const plain = r.stdout.replace(/\x1b\[[0-9;]*m/g, "");
     const bySource = plain.slice(plain.indexOf("By source:"));
@@ -546,7 +640,7 @@ async function main() {
   });
 
   await test("TC-A03", "list -s path 过滤", async () => {
-    const r = runCli(["list", "-s", "path"]);
+    const r = await runCli(["list", "-s", "path"]);
     assert(r.code === 0, `退出码 ${r.code}`);
     const plain = r.stdout.replace(/\x1b\[[0-9;]*m/g, "");
     const bySource = plain.slice(plain.indexOf("By source:"));
@@ -555,8 +649,8 @@ async function main() {
     return clip(lineOf(bySource, "path:"), 60);
   });
 
-  await test("TC-A04", "info dsh", async () => {
-    const r = runCli(["info", "dsh"]);
+  await test("TC-A04", `info ${infoTarget.name}`, async () => {
+    const r = await runCli(["info", infoTarget.name]);
     assert(r.code === 0, `退出码 ${r.code}`);
     const plain = r.stdout.replace(/\x1b\[[0-9;]*m/g, "");
     assert(plain.includes("Version:"), "缺少 Version 字段");
@@ -566,14 +660,14 @@ async function main() {
   });
 
   await test("TC-A05", "info 未装应用", async () => {
-    const r = runCli(["info", "not-exist-xyz"]);
+    const r = await runCli(["info", "not-exist-xyz"]);
     assert(r.code === 0, `退出码应为 0（友好提示），实际 ${r.code}`);
     assert(r.stdout.includes("No application found matching"), `提示不符: ${clip(r.stdout, 80)}`);
     return clip(r.stdout, 80);
   });
 
   await test("TC-A06", "unmanaged 输出", async () => {
-    const r = runCli(["unmanaged"]);
+    const r = await runCli(["unmanaged"]);
     assert(r.code === 0, `退出码 ${r.code}`);
     const plain = r.stdout.replace(/\x1b\[[0-9;]*m/g, "");
     assert(plain.includes("Add/Remove-Programs baseline"), "缺少 ARP 基线行");
@@ -582,14 +676,14 @@ async function main() {
   });
 
   await test("TC-A07", "portable 别名等价", async () => {
-    const r = runCli(["portable"]);
+    const r = await runCli(["portable"]);
     assert(r.code === 0, `退出码 ${r.code}`);
     assert(r.stdout.replace(/\x1b\[[0-9;]*m/g, "").includes("unmanaged program(s)"), "别名输出与 unmanaged 不一致");
     return "别名输出同构";
   });
 
   await test("TC-A08", "method 方法论", async () => {
-    const r = runCli(["method"]);
+    const r = await runCli(["method"]);
     assert(r.code === 0, `退出码 ${r.code}`);
     const plain = r.stdout.replace(/\x1b\[[0-9;]*m/g, "");
     assert(plain.includes("Techniques used"), "缺少 Techniques used");
@@ -598,7 +692,7 @@ async function main() {
   });
 
   await test("TC-A09", "export 注册表 JSON", async () => {
-    const r = runCli(["export"]);
+    const r = await runCli(["export"]);
     assert(r.code === 0, `退出码 ${r.code}`);
     let reg;
     try {
@@ -614,7 +708,7 @@ async function main() {
   });
 
   await test("TC-A10", "doctor 健康检查", async () => {
-    const r = runCli(["doctor"], 300000);
+    const r = await runCli(["doctor"], 300000);
     assert(r.code === 0, `退出码 ${r.code}`);
     const plain = r.stdout.replace(/\x1b\[[0-9;]*m/g, "");
     assert(plain.includes("Running health check"), "缺少标题");
@@ -623,23 +717,25 @@ async function main() {
   });
 
   await test("TC-A11", "monitor 进程监视", async () => {
-    const r = runCli(["monitor"], 120000);
+    const r = await runCli(["monitor"], 120000);
     assert(r.code === 0, `退出码 ${r.code}`);
     assert(r.stdout.replace(/\x1b\[[0-9;]*m/g, "").includes("Monitoring running processes"), "缺少标题");
     return clip(lineOf(r.stdout, "instance") || lineOf(r.stdout, "not running") || "无运行实例", 80);
   });
 
-  await test("TC-A12", "search 搜索", async () => {
-    const r = runCli(["search", "dsh"]);
+  await test("TC-A12", `search 搜索 ${infoTarget.name}`, async () => {
+    const r = await runCli(["search", infoTarget.name]);
     assert(r.code === 0, `退出码 ${r.code}`);
     const plain = r.stdout.replace(/\x1b\[[0-9;]*m/g, "");
     assert(plain.includes("Found") || plain.includes("No apps found"), "缺少结果行");
-    if (plain.includes("Found")) assert(plain.toLowerCase().includes("dsh"), "结果未包含 dsh");
+    if (plain.includes("Found")) {
+      assert(plain.toLowerCase().includes(infoTarget.name.toLowerCase()), `结果未包含 ${infoTarget.name}`);
+    }
     return clip(lineOf(plain, "Found") || "No apps found", 80);
   });
 
   await test("TC-A13", "help 帮助", async () => {
-    const r = runCli(["help"]);
+    const r = await runCli(["help"]);
     assert(r.code === 0, `退出码 ${r.code}`);
     const plain = r.stdout.replace(/\x1b\[[0-9;]*m/g, "");
     assert(plain.includes("Commands:"), "缺少命令列表");
@@ -648,7 +744,7 @@ async function main() {
   });
 
   await test("TC-A14", "update 守卫·不存在名", async () => {
-    const r = runCli(["update", "not-exist-xyz"]);
+    const r = await runCli(["update", "not-exist-xyz"]);
     assert(r.code === 0, `退出码 ${r.code}`);
     const plain = r.stdout.replace(/\x1b\[[0-9;]*m/g, "");
     assert(plain.includes("No application found matching"), "守卫提示缺失");
@@ -658,7 +754,7 @@ async function main() {
 
   await test("TC-A15", "update 守卫·不支持来源", async () => {
     if (!pathAppName) skip("当前扫描无 path 来源应用");
-    const r = runCli(["update", pathAppName]);
+    const r = await runCli(["update", pathAppName]);
     assert(r.code === 0, `退出码 ${r.code}`);
     const plain = r.stdout.replace(/\x1b\[[0-9;]*m/g, "");
     assert(plain.includes("Auto-update not supported"), `守卫提示缺失: ${clip(plain, 100)}`);
@@ -667,7 +763,7 @@ async function main() {
   });
 
   await test("TC-A16", "未知命令回退帮助", async () => {
-    const r = runCli(["foobar"]);
+    const r = await runCli(["foobar"]);
     assert(plain0(r.stderr).includes("Unknown command: foobar"), "stderr 缺少 Unknown command 提示");
     assert(plain0(r.stdout).includes("Commands:"), "未回退到帮助");
     function plain0(s) {
@@ -677,14 +773,14 @@ async function main() {
   });
 
   await test("TC-A17", "info 缺参数报错", async () => {
-    const r = runCli(["info"]);
+    const r = await runCli(["info"]);
     assert(r.code === 1, `缺参数应退出码 1，实际 ${r.code}`);
     assert(r.stderr.includes("App name required"), `stderr 提示不符: ${clip(r.stderr, 80)}`);
     return "退出码 1 + 明确报错";
   });
 
   await test("TC-A18", "◆ check 更新检查", async () => {
-    const r = runCli(["check"], 300000);
+    const r = await runCli(["check"], 300000);
     if (r.timedOut) skip(`网络检查超时（>${300000 / 1000}s）`);
     assert(r.code === 0, `退出码 ${r.code}`);
     const plain = r.stdout.replace(/\x1b\[[0-9;]*m/g, "");
@@ -730,7 +826,22 @@ async function main() {
   md += `- 开始: ${startedAt.toLocaleString("zh-CN")} · 结束: ${endedAt.toLocaleString("zh-CN")} · 耗时: ${Math.round((endedAt - startedAt) / 1000)}s\n`;
   md += `- 结果: **PASS ${pass} · FAIL ${fail} · ERROR ${err} · SKIP ${skipped}**（共 ${results.length} 条）\n\n`;
 
-  md += `## 分组汇总\n\n| 组 | PASS | FAIL | ERROR | SKIP | 合计 |\n|---|---|---|---|---|---|\n`;
+  // ---------- 本轮打的是哪些应用 ----------
+  md += `## 本次测试用到的应用\n\n`;
+  md += `应用是**每次运行随机抽取**的（本套件：info/search 随机 1 个；动作组另抽 4~6 个）。\n`;
+  md += `脱离样本谈「全绿」没有意义 —— 换个样本可能就红，所以样本必须写进报告，失败才可复现。\n\n`;
+  md += `| 用途 | 应用 | 来源 | 首命令 | 抽样方式 |\n|---|---|---|---|---|\n`;
+  if (sampledApps.length === 0) {
+    md += `| — | — | — | — | 本轮未选中任何应用 |\n`;
+  }
+  for (const s of sampledApps) {
+    md += `| ${s.role} | \`${s.app.name}\` | ${s.app.source ?? "?"} | \`${s.app.commands?.[0] ?? "—"}\` | ${s.how} |\n`;
+  }
+  md += `\n禁用名单（永远不会成为测试对象，命中即剔除）：\n\n`;
+  md += excludedPatterns().map((p) => `- \`${p}\``).join("\n") + `\n`;
+  md += `\n> 动作组（\`tests/actions.test.mjs\`）另有一份独立抽样，写在该套件自己的 \`tests/reports/actions-*.md\` 里。\n`;
+
+  md += `\n## 分组汇总\n\n| 组 | PASS | FAIL | ERROR | SKIP | 合计 |\n|---|---|---|---|---|---|\n`;
   for (const g of groups) {
     const rs = results.filter((r) => r.group === g);
     md += `| ${g} | ${rs.filter((r) => r.status === "PASS").length} | ${rs.filter((r) => r.status === "FAIL").length} | ${rs.filter((r) => r.status === "ERROR").length} | ${rs.filter((r) => r.status === "SKIP").length} | ${rs.length} |\n`;
@@ -759,6 +870,7 @@ async function main() {
   if (skipped > 0) {
     console.log(`⚠️  有 ${skipped} 条被跳过 —— 跳过即视为失败（未验证 ≠ 通过）`);
   }
+  console.log(`本次抽中的应用: ${sampledApps.length ? sampledApps.map((s) => describeApp(s.app)).join(" / ") : "（无）"}`);
   console.log(`机器报告: ${reportPath}`);
   // SKIP 计入失败：见 TC-Z01 的说明。
   process.exit(fail + err + skipped > 0 ? 1 : 0);

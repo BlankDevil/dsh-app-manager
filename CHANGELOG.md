@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),  
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.8.0] - 2026-10-09
+## [0.8.0] - 2026-10-15
 
 Two questions the table used to answer wrongly: **"is this app still
 installed?"** and **"did an uninstall leave anything behind?"** An app is a

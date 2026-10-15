@@ -1,8 +1,8 @@
 # DSH App Manager — 发布上线指南
 
 > 本文档只写**当前真实状态**与**已验证过的事实**。每条命令都在本机执行过。
-> 最后核对：2026-10-09，插件版本 **0.7.0**，宿主 dsh **0.1.5-rc.1 / 0.2.0-rc.2**
-> （两条线都支持；契约逐项对照见 `COMPATIBILITY.md`）。
+> 最后核对：2026-10-15，插件版本 **0.8.0**（待发布，registry 上 `latest` 仍是 0.5.3），
+> 宿主 dsh **0.1.5-rc.1 / 0.2.0-rc.2**（两条线都支持；契约逐项对照见 `COMPATIBILITY.md`）。
 
 ---
 
@@ -42,7 +42,7 @@ DSH 会：用 pnpm 把包装进 profile → 读 `package.json` 的 `dsh.bundle.p
 | LICENSE | ✅ MIT | |
 | CHANGELOG | ✅ | Keep a Changelog + semver |
 | README | ✅ 双语 | 含平台支持矩阵、扫描方法论、已知限制 |
-| 测试 | ✅ | 217 项全过：套件 52 + 页面动作 65 + 宿主兼容 16 + 性能 15 + 跨平台 15 + 拖拽 13 + 审批 11 + 冒烟 22 + 修复回归 8 |
+| 测试 | ✅ | **380 项全过**（2026-10-15 实测）：主套件 52 + 页面动作 223 + 拖拽/布局 18 + 宿主兼容 16 + 性能 15 + 跨平台 15 + 审批 11 + 冒烟 22 + 修复回归 8 |
 | CI | ✅ | `.github/workflows/ci.yml`（ubuntu 构建 + Windows 全量测试） |
 | `peerDependencies` | ✅ | `@deepseek-ai/dsh-tools: ^0.1.5-rc.1 \|\| ^0.2.0-rc.2`（覆盖两条宿主线；**范围会被宿主校验，写窄=装不上**） |
 | lockfile | ✅ | 与 package.json 一致；`pnpm install --frozen-lockfile` 通过 |
@@ -62,7 +62,17 @@ lib/bin/cli-app-manager.{js,d.ts,*.map}
 lib/src/{index,discovery,commands,utils,types}.{js,d.ts,*.map}
 ```
 
-**29 个文件 / 88K。** 确认**不含**：`src/`、`tests/`、`node_modules`、
+**29 个文件。** 0.8.0 实测（`npm pack --dry-run --json`）：
+
+```
+package size   : 141.0 kB（tgz）
+unpacked size  : 527.7 kB
+total files    : 29
+shasum         : 9bdc87476b046c3c70e2c34838e2e3dc988edd2e
+```
+
+`LICENSE` / `README.md` / `CHANGELOG.md` / `patch.yml` / `package.json` 均已确认在包内。
+确认**不含**：`src/`、`tests/`、`node_modules`、
 `PRD.md`/`DESIGN.md`/`PUBLISH.md`、`.pptx`、`.slidep/`。
 
 **零运行时依赖** —— 只用 Node 内置模块，`tools`/`webServer`/`approval` 均由宿主注入。
@@ -96,6 +106,79 @@ npm publish --access public
 pnpm pack                       # 产出 dsh-app-manager-<version>.tgz
 tar -tzf dsh-app-manager-*.tgz  # 核对内容清单（应与 §3 一致）
 ```
+
+---
+
+## 4bis. ⚠️ 两个必须在发布前解掉的环境阻塞项（2026-10-15 实测）
+
+### (a) `git push` 在本机无法完成 —— `github.com:443` 不通
+
+三个方向全试过，都不通：
+
+| 方式 | 结果 |
+|------|------|
+| 走本机代理 `http://127.0.0.1:5183` | `CONNECT tunnel failed, response 502` |
+| 直连（`--noproxy '*'` / `env -u *_proxy`） | `Failed to connect to github.com:443 after 21068 ms` |
+| `ssh.github.com:443` | 不可达；`~/.ssh/` 为空（无密钥） |
+
+**但 `api.github.com` 是通的（200，0.5s）** —— 所以 GitHub API 可用，git 传输不行。
+
+**处置**：在本机终端（有外网/VPN 的那个）执行一下推送：
+
+```bash
+cd E:/Workspace/dsh-playground/dsh-app-manager
+git push -u origin feat/stale-cleanup feat/gui-aware-launch
+git push -u origin chore/ignore-test-artifacts
+```
+
+> 不要试图用 GitHub API 的 `push_files` 绕：本次待推的差异约 **39 个文件 / ~1.0 MB**
+> （`src/index.ts` 131 KB、`lib/src/index.js` 130 KB、多个 `.map`），
+> 该接口要求把**每个文件的完整内容**放进一次调用，既不现实也容易推坏。
+
+### (b) npm 凭据已失效 —— `npm whoami` 返回 401
+
+```bash
+npm whoami --registry=https://registry.npmjs.org/
+# npm error 401 Unauthorized - GET https://registry.npmjs.org/-/whoami
+```
+
+`~/.npmrc` 里键名是**对的**（`//registry.npmjs.org/:_authToken`，不是 `.com`），
+所以不是键名问题，是 **token 本身已过期/被撤销**。
+
+**处置（任选其一）**：
+
+1. **Granular Access Token + bypass 2FA**（推荐，可免 OTP）：
+   npmjs.com → Access Tokens → Generate New Token → Granular →
+   勾选 **Bypass two-factor authentication**，权限 `Read and write`，包范围选
+   `dsh-app-manager`（或全部）。把 token 写进 `~/.npmrc`：
+   ```
+   //registry.npmjs.org/:_authToken=<新 token>
+   ```
+2. **继续用 OTP**（账号开了 2FA）：`npm publish --otp=<6 位动态码>`。
+
+验证：`npm whoami --registry=https://registry.npmjs.org/` 应返回 `blankdevil`。
+
+### (c) 沙箱内 `npm` 会走 wsl.exe 被拦
+
+用系统 node 直调 npm-cli 绕过 shim：
+
+```bash
+"D:/Program Files/nodejs/node.exe" \
+  "D:/Program Files/nodejs/node_modules/npm/bin/npm-cli.js" \
+  publish --registry=https://registry.npmjs.org/ --access public
+```
+
+`pnpm` 不受影响，可用 `pnpm pack` 干跑。
+
+### (d) 发布顺序（不能颠倒）
+
+```
+push 分支 → 开 PR → review/verify → 合入 main
+        → 从 main 拉 rel-0.8.0 → 上线测试 → npm publish → 打 tag v0.8.0
+```
+
+**当前卡在第 1 步**（§4bis a）。在代码没进 main 之前**不要**发布 ——
+否则 npm 上的产物没有对应的仓库提交可追溯。
 
 ---
 

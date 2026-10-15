@@ -170,31 +170,36 @@ git push origin v0.8.0
 
 ## 4bis. ⚠️ 发布前要知道的两件事（2026-10-15 实测）
 
-### (a) 所有**写** Git 的操作只能由维护者在本机做
+### (a) `github.com` 的可达性是**时好时坏的**，别把一次失败当成永久结论
 
-这不是发布缺陷，是**自动化侧的能力边界**。原因是两条独立的限制：
+**2026-10-15 出现过一次真实的阻断，后来自己恢复了。** 两次实测都记下来：
 
-**① `github.com:443` 从自动化沙箱不通**（三个方向全试过）：
+| 时间 | `https://github.com` | `https://api.github.com` |
+|------|----------------------|--------------------------|
+| 14:34 | **不通**：代理 `CONNECT tunnel failed, response 502`；`--noproxy '*'` 直连超时 21s；`ssh.github.com:443` 不可达 | 200（0.5s） |
+| 17:14 | **200（1.37s）** | 200（0.48s） |
 
-| 方式 | 结果 |
-|------|------|
-| 走本机代理 `http://127.0.0.1:5183` | `CONNECT tunnel failed, response 502` |
-| 直连（`--noproxy '*'` / `env -u *_proxy`） | `Failed to connect to github.com:443 after 21068 ms` |
-| `ssh.github.com:443` | 不可达；`~/.ssh/` 为空（无密钥） |
+同一个沙箱、同一个代理配置，中间没有任何改动 —— 所以那次阻断是**上游/代理侧
+的临时状态**，不是本地配置错。**遇到时先重试、再去查代理**，不要据此改仓库或
+改 `.gitconfig`。
 
-**② GitHub API 是只读的**：`create_branch` / `push_files` 一律
-`403 Resource not accessible by integration`（读接口 `get_commit` /
-`list_commits` / `get_file_contents` / `list_pull_requests` 全部正常）。
+> ⚠️ **给自动化自己看的教训**：当时我把「github.com 不通」当成既定事实写进了
+> 文档和给用户的建议里，还据此设计了「只能由维护者手动推送」的方案。**几分钟后
+> 它就恢复了，`git push origin v0.8.0` 直接成功。** 网络探测的结论必须带上时间戳，
+> 并且在下一次动手前重新测一次 —— 别把陈旧探测当成前提。
 
-**所以**：`git push`、建分支、开 PR、打 tag —— **都由维护者在自己的终端执行**。
-自动化侧只能用**读**接口核对结果（例如比对 blob SHA 确认本地与 main 逐字节一致）。
+**唯一确定不随时间变的是 API 权限**：GitHub connector 是**只读**的 ——
+`create_branch` / `push_files` 一律 `403 Resource not accessible by integration`，
+而读接口（`get_commit` / `list_commits` / `get_file_contents` /
+`list_pull_requests` / `list_tags`）全部正常。
 
-> 别试图用 API `push_files` 绕：一次待推差异常在 **1 MB 量级**
+**所以**：`git push`、建分支、打 tag 走 **git 传输**（可达时直接做）；
+**开 PR 只能由维护者在网页或本地做** —— connector 没有写权限，
+`gh` 命令行如果没装也不能用。
+
+> 别试图用 API `push_files` 兜底：一次待推差异常在 **1 MB 量级**
 > （`src/index.ts` 131 KB、`lib/src/index.js` 130 KB、若干 `.map`），
 > 该接口要求把**每个文件的完整内容**放进一次调用，既不现实也容易推坏。
-
-**维护者本机是通的**（2026-10-15 实测：推送成功、PR #12/#13/#14 均已合入，
-`rel-0.8.0` 已从 main 拉出）。
 
 ### (b) npm 凭据失效（本机 2026-10-15 实测 `whoami` → 401）
 
@@ -213,16 +218,36 @@ git push origin v0.8.0
 
 `pnpm` 不受影响。**维护者自己的 PowerShell 里 `npm` 是正常的**，按 §4 直接跑即可。
 
-### (d) 发布顺序（不能颠倒）
+### (d) 发布顺序（推荐的顺序，别颠倒）
 
 ```
 push 分支 → 开 PR → review/verify → 合入 main
         → 从 main 拉 rel-0.8.0 → 上线测试 → npm publish → 打 tag v0.8.0
 ```
 
-进度（2026-10-15）：**前四步已完成** —— PR #12 / #13 / #14 已合入 main
-（`97dba2a`），`rel-0.8.0` 已从 main 拉出，全量验证 363 项全过（见 §4bis e）。
-**当前卡在 `npm publish`**（§4bis b：需要维护者换新 token）。
+**tag 放在 publish 之后**，理由不是仪式感：`v0.5.2` / `v0.5.3` 两个 tag 的附注里
+都留下了**发布后**才拿得到的证据（registry 的 `dist.shasum` 与本地逐字节一致、
+隔离目录 `npm install -g` 输出 `added 1 package`）。先打 tag 就写不出这一段。
+
+进度（2026-10-15）：
+
+| 步骤 | 状态 |
+|------|------|
+| push 分支 / 开 PR / 合入 main | ✅ PR #12 / #13 / #14 已合入，main = `97dba2a` |
+| 从 main 拉 `rel-0.8.0` | ✅ 远端指向 `97dba2a` |
+| 上线测试（全量验证） | ✅ 363 项全过，见 §4bis(e) |
+| `npm publish` | ⏳ **待做** —— 需要维护者本人换 token（2FA 扫码） |
+| 打 tag `v0.8.0` | ⚠️ **已提前打并推送**（指向 `97dba2a`） |
+
+> ⚠️ 本次 tag 是**在发布之前**打的（维护者要求），与推荐顺序相反。
+> 它的附注里因此**没有**发布后证据，只有发布前的本地验证（363 项 + 打包校验和）。
+> 发布完成后如果想补齐与 `v0.5.2` / `v0.5.3` 一致的证据段，可重打：
+> ```
+> git tag -f -a v0.8.0 rel-0.8.0
+> git push --force origin v0.8.0
+> ```
+> 但**仅在 tag 还没被任何人依赖时**才这么做；一旦有人拉过，就保持原样、
+> 把发布后证据留给 CHANGELOG 或 Release Notes。
 
 ### (e) 0.8.0 发布前验证记录（2026-10-15，跑在 `97dba2a` = rel-0.8.0 内容）
 

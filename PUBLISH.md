@@ -62,14 +62,18 @@ lib/bin/cli-app-manager.{js,d.ts,*.map}
 lib/src/{index,discovery,commands,utils,types}.{js,d.ts,*.map}
 ```
 
-**29 个文件。** 0.8.0 实测（`npm pack --dry-run --json`）：
+**29 个文件。** 0.8.0 实测（`npm pack`）：
 
 ```
-package size   : 141.0 kB（tgz）
+package size   : 141.0 kB（tgz，141 002 字节）
 unpacked size  : 527.7 kB
 total files    : 29
-shasum         : 9bdc87476b046c3c70e2c34838e2e3dc988edd2e
+sha1           : f2f6e8ba55274b9e3f8826c656ed2b57222fbee7   ← 应等于 registry 的 dist.shasum
+sha256         : a21e0abe808c10f8e392e45b123185e150d8e10e13e2c19aef39a7ff2988707d
 ```
+
+**可复现**：连打两次，sha256 完全相同（2026-10-15 实测）——所以发布后可用
+registry 的 `dist.shasum` 与本地 sha1 对拍，确认「发布的就是验证过的这份」。
 
 `LICENSE` / `README.md` / `CHANGELOG.md` / `patch.yml` / `package.json` 均已确认在包内。
 确认**不含**：`src/`、`tests/`、`node_modules`、
@@ -79,41 +83,98 @@ shasum         : 9bdc87476b046c3c70e2c34838e2e3dc988edd2e
 
 ---
 
-## 4. 发布步骤
+## 4. 发布步骤（**PowerShell 5.1，一行一条**）
 
-```bash
-cd dsh-app-manager
+> ⚠️ 本机终端是 **Windows PowerShell 5.1**，**不支持 `&&`**
+> （报 `标记"&&"不是此版本中的有效语句分隔符`）。
+> 下面每行都是一条独立命令，直接粘即可；**不要把它们合并成一行用 `&&` 串**。
 
-# 1) 确认在正确的分支、工作区干净
-git status && git log --oneline -3
+```powershell
+cd E:\Workspace\dsh-playground\dsh-app-manager
 
-# 2) 全量自检（CI 会跑同样的东西）
+# --- 1) 切到发布分支（本地若无，会自动跟踪 origin/rel-0.8.0）---
+git fetch origin
+git checkout rel-0.8.0
+git log --oneline -1          # 应显示 97dba2a
+
+# --- 2) 确认版本与工作区 ---
+git status                    # 应为 clean（未跟踪的 tests/reports/*.md 不算）
+npm pkg get version           # 应显示 "0.8.0"
+
+# --- 3) 构建 + 全量自检 ---
 pnpm install --frozen-lockfile
 pnpm build
-pnpm test:quick && pnpm test:paths && pnpm test:approval && pnpm test:perf && pnpm test:drag && pnpm smoke
+pnpm test:quick
+pnpm test:paths
+pnpm test:approval
+pnpm test:perf
+pnpm test:drag
+pnpm smoke
 
-# 3) 登录并发布
-npm login
-npm publish --access public
+# --- 4) 干跑，核对产物与校验和 ---
+npm pack
+Get-FileHash .\dsh-app-manager-0.8.0.tgz -Algorithm SHA1      # 应 f2f6e8ba55274b9e3f8826c656ed2b57222fbee7
+Get-FileHash .\dsh-app-manager-0.8.0.tgz -Algorithm SHA256    # 应 a21e0abe808c10f8e392e45b123185e150d8e10e13e2c19aef39a7ff2988707d
+Remove-Item .\dsh-app-manager-0.8.0.tgz                       # 别把 tgz 留在仓库里
+
+# --- 5) 登录（2FA 账号）---
+npm login --registry=https://registry.npmjs.org/
+npm whoami  --registry=https://registry.npmjs.org/            # 应显示 blankdevil
+
+# --- 6) 发布 ---
+npm publish --registry=https://registry.npmjs.org/ --access public
+# 若仍需 OTP：在上一行末尾加 --otp=<6位动态码>
 ```
 
 > `prepublishOnly` 已配置为 `pnpm build`，所以 `lib/` 一定是新的。
 > 包名非 scoped，`publishConfig.access = public` 已就位。
 
-### 发布前可先干跑
+### 4.1 ⚠️ `npm whoami` 报 401 时的排查顺序
 
-```bash
-pnpm pack                       # 产出 dsh-app-manager-<version>.tgz
-tar -tzf dsh-app-manager-*.tgz  # 核对内容清单（应与 §3 一致）
+本机 2026-10-15 就是这个状态。按顺序查，别乱试：
+
+1. **键名对不对**（历史上真踩过）：`~/.npmrc` 里必须是
+   `//registry.npmjs.org/:_authToken=` —— **`.org`**。
+   `registry.npmjs.com` 是**网站**域名，`registry.npmjs.org` 才是 **registry**，
+   两者不通用。若 `npm login` 写成了 `.com` 键，`whoami` 会报 ENEEDAUTH。
+   本机当前键名**已经是 `.org`**，所以这条不是本次原因。
+2. **token 本身是否还有效**：键名对了仍 401 → token 已过期/被撤销。
+   去 npmjs.com → Access Tokens 生成新的：
+   - 类型 **Granular Access Token**
+   - 勾选 **Bypass two-factor authentication**（这样 `publish` 不必带 `--otp`）
+   - 权限 `Read and write`，包范围含 `dsh-app-manager`
+   然后把 `~/.npmrc` 里那一行**整行替换**成新 token。
+3. `npm config get //registry.npmjs.org/:_authToken` 报
+   `option is protected` **不能作为"有没有 token"的证据** —— 查一个不存在的
+   域名会报同样的错。判据只有 `npm whoami` 是否返回 `blankdevil`。
+
+### 4.2 发布后验证（必做）
+
+```powershell
+npm view dsh-app-manager version     --registry=https://registry.npmjs.org/   # 应 0.8.0
+npm view dsh-app-manager dist.shasum --registry=https://registry.npmjs.org/   # 应 f2f6e8ba55274b9e3f8826c656ed2b57222fbee7
+npm view dsh-app-manager dist.tarball --registry=https://registry.npmjs.org/
+```
+
+`dist.shasum` 必须等于 §4 第 4 步算出的 SHA1 —— 这才是"发出去的就是验证过的
+那份"的证据。（`npm pack --dry-run` 报的 shasum **和实际产物不一致**，别拿它当基线。）
+
+### 4.3 打 tag（发布成功后，由维护者发起）
+
+```powershell
+git tag -a v0.8.0 -m "dsh-app-manager 0.8.0"
+git push origin v0.8.0
 ```
 
 ---
 
-## 4bis. ⚠️ 两个必须在发布前解掉的环境阻塞项（2026-10-15 实测）
+## 4bis. ⚠️ 发布前要知道的两件事（2026-10-15 实测）
 
-### (a) `git push` 在本机无法完成 —— `github.com:443` 不通
+### (a) 所有**写** Git 的操作只能由维护者在本机做
 
-三个方向全试过，都不通：
+这不是发布缺陷，是**自动化侧的能力边界**。原因是两条独立的限制：
+
+**① `github.com:443` 从自动化沙箱不通**（三个方向全试过）：
 
 | 方式 | 结果 |
 |------|------|
@@ -121,54 +182,36 @@ tar -tzf dsh-app-manager-*.tgz  # 核对内容清单（应与 §3 一致）
 | 直连（`--noproxy '*'` / `env -u *_proxy`） | `Failed to connect to github.com:443 after 21068 ms` |
 | `ssh.github.com:443` | 不可达；`~/.ssh/` 为空（无密钥） |
 
-**但 `api.github.com` 是通的（200，0.5s）** —— 所以 GitHub API 可用，git 传输不行。
+**② GitHub API 是只读的**：`create_branch` / `push_files` 一律
+`403 Resource not accessible by integration`（读接口 `get_commit` /
+`list_commits` / `get_file_contents` / `list_pull_requests` 全部正常）。
 
-**处置**：在本机终端（有外网/VPN 的那个）执行一下推送：
+**所以**：`git push`、建分支、开 PR、打 tag —— **都由维护者在自己的终端执行**。
+自动化侧只能用**读**接口核对结果（例如比对 blob SHA 确认本地与 main 逐字节一致）。
 
-```bash
-cd E:/Workspace/dsh-playground/dsh-app-manager
-git push -u origin feat/stale-cleanup feat/gui-aware-launch
-git push -u origin chore/ignore-test-artifacts
-```
-
-> 不要试图用 GitHub API 的 `push_files` 绕：本次待推的差异约 **39 个文件 / ~1.0 MB**
-> （`src/index.ts` 131 KB、`lib/src/index.js` 130 KB、多个 `.map`），
+> 别试图用 API `push_files` 绕：一次待推差异常在 **1 MB 量级**
+> （`src/index.ts` 131 KB、`lib/src/index.js` 130 KB、若干 `.map`），
 > 该接口要求把**每个文件的完整内容**放进一次调用，既不现实也容易推坏。
 
-### (b) npm 凭据已失效 —— `npm whoami` 返回 401
+**维护者本机是通的**（2026-10-15 实测：推送成功、PR #12/#13/#14 均已合入，
+`rel-0.8.0` 已从 main 拉出）。
 
-```bash
-npm whoami --registry=https://registry.npmjs.org/
-# npm error 401 Unauthorized - GET https://registry.npmjs.org/-/whoami
-```
+### (b) npm 凭据失效（本机 2026-10-15 实测 `whoami` → 401）
 
-`~/.npmrc` 里键名是**对的**（`//registry.npmjs.org/:_authToken`，不是 `.com`），
-所以不是键名问题，是 **token 本身已过期/被撤销**。
+排查顺序见 **§4.1**。一句话：键名已正确（`.org`），所以是 **token 本身失效**，
+需要重新生成 —— 且这个账号开了 2FA，**必须由维护者本人操作**（扫码 / 动态码），
+自动化侧拿不到、也不该拿到 token。
 
-**处置（任选其一）**：
+### (c) 自动化沙箱内 `npm` 会走 wsl.exe 被程序黑名单拦
 
-1. **Granular Access Token + bypass 2FA**（推荐，可免 OTP）：
-   npmjs.com → Access Tokens → Generate New Token → Granular →
-   勾选 **Bypass two-factor authentication**，权限 `Read and write`，包范围选
-   `dsh-app-manager`（或全部）。把 token 写进 `~/.npmrc`：
-   ```
-   //registry.npmjs.org/:_authToken=<新 token>
-   ```
-2. **继续用 OTP**（账号开了 2FA）：`npm publish --otp=<6 位动态码>`。
-
-验证：`npm whoami --registry=https://registry.npmjs.org/` 应返回 `blankdevil`。
-
-### (c) 沙箱内 `npm` 会走 wsl.exe 被拦
-
-用系统 node 直调 npm-cli 绕过 shim：
+自检时用系统 node 直调 npm-cli 绕过 shim：
 
 ```bash
 "D:/Program Files/nodejs/node.exe" \
-  "D:/Program Files/nodejs/node_modules/npm/bin/npm-cli.js" \
-  publish --registry=https://registry.npmjs.org/ --access public
+  "D:/Program Files/nodejs/node_modules/npm/bin/npm-cli.js" <npm 参数>
 ```
 
-`pnpm` 不受影响，可用 `pnpm pack` 干跑。
+`pnpm` 不受影响。**维护者自己的 PowerShell 里 `npm` 是正常的**，按 §4 直接跑即可。
 
 ### (d) 发布顺序（不能颠倒）
 
@@ -177,25 +220,59 @@ push 分支 → 开 PR → review/verify → 合入 main
         → 从 main 拉 rel-0.8.0 → 上线测试 → npm publish → 打 tag v0.8.0
 ```
 
-**当前卡在第 1 步**（§4bis a）。在代码没进 main 之前**不要**发布 ——
-否则 npm 上的产物没有对应的仓库提交可追溯。
+进度（2026-10-15）：**前四步已完成** —— PR #12 / #13 / #14 已合入 main
+（`97dba2a`），`rel-0.8.0` 已从 main 拉出，全量验证 363 项全过（见 §4bis e）。
+**当前卡在 `npm publish`**（§4bis b：需要维护者换新 token）。
+
+### (e) 0.8.0 发布前验证记录（2026-10-15，跑在 `97dba2a` = rel-0.8.0 内容）
+
+| 套件 | 结果 |
+|------|------|
+| `run-tests.mjs`（A–E 主套件，含元断言 TC-Z01） | 52 / 52 |
+| `actions.test.mjs`（页面动作 / 健康残留 / 收尾关闭） | 206 / 206 |
+| `drag-behavior.test.mjs`（jsdom 真实指针事件） | 18 / 18 |
+| `perf-guard.test.mjs` | 15 / 15 |
+| `crossplatform-paths.test.mjs` | 15 / 15 |
+| `approval-gate.test.mjs` | 11 / 11 |
+| `dsh-compat.test.mjs` | 16 / 16 |
+| `smoke-features.mjs` | 22 / 22 |
+| `verify-fixes.mjs` | 8 / 8 |
+| **合计** | **363 项，0 FAIL / 0 SKIP** |
+
+> 动作组的条数**随随机抽样浮动**（同一天跑出过 206 / 223），比较的是"是否全过"，
+> 不是绝对条数。机器报告在 `tests/reports/run-<stamp>.md`，**抽样应用列在报告里**，
+> 离开样本谈"全绿"没有意义。
+
+`doctor` 实测 **27.761s**（35 个 issue），落在历史性能修复后的基线区间（23–28s），无回归。
+
+**上线检查清单（§5）**：第 1 / 3 / 4 条已验证；**第 2 条（macOS/Linux 的 npm
+全局发现）本机是 Windows，无法验证** —— CI 为 ubuntu 构建 + Windows 全量测试，
+这条覆盖不全，是本次发布唯一缺少本机证据的项。
 
 ---
 
 ## 5. 发布后验证（在**另一台机器 / 全新 profile** 上做）
 
-```bash
-dsh plugin --profile web add dsh-app-manager
-dsh web --port 3080 --no-open
-# 打开 http://127.0.0.1:3080/app-manager
+**先建一个干净 profile**（本机 `web` / `headless` 里的 `dsh-app-manager` 是
+`link:` 指向本地仓库的，**装的不是 npm 上的那份**，用它验证等于没验证）：
+
+```powershell
+dsh plugin --profile verify add dsh-app-manager
+dsh web --port 3081 --no-open
 ```
 
-逐个确认：
+然后打开 `http://127.0.0.1:3081/app-manager`，逐个确认：
+
 1. `/app-manager` 能打开，列表非空；
 2. `app-manager list` 在 **macOS/Linux** 上也能列出 npm 全局包
    （0.5.0 前的版本在这里会**静默返回 0 条**）；
 3. AI 调用 `app_manager_update` 时**先弹审批**，拒绝后无任何改动；
 4. `app-manager doctor` 能在合理时间内返回（0.5.0 前可能永久挂起）。
+
+> 两个容易搞错的点：
+> - `dsh plugin --profile <name> <args...>` 是**把 args 原样转给 pnpm**，
+>   没有专门的 `add` 子命令 —— 所以是 `... verify add <包名>`（**没有** `--add`）。
+> - 命令名以包的 `bin` 为准，不是包名：本包的 bin 是 **`app-manager`** / **`am`**。
 
 ---
 

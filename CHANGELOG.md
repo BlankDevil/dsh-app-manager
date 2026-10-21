@@ -5,19 +5,37 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),  
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.8.2] - 2026-10-21
+## [0.9.0] - 2026-10-21
 
-Two gaps left over from 0.8.1.
+The dashboard stops being a page you leave the conversation for. It can now be
+**docked in the right sidebar**, next to the terminal, the browser and file
+previews — the placement the desktop shell is actually built around. Two smaller
+gaps from 0.8.1 are fixed alongside it.
 
 ### Added
 
+- **The dashboard as a right-sidebar tab** (`sidebarRightTabs` + the
+  `sidebar.right.pane.tab` slot). This is the placement that makes it coexist
+  with everything else: it docks beside the conversation instead of replacing it,
+  and `keepMounted` keeps the frame alive across tab switches, so switching to
+  the terminal and back does not reload the list.
+
+  It is also discoverable from the sidebar's own start page through a `guide`
+  entry, so it can be opened there without going through the plugin page at all.
+
+  The tab type is registered through `ctx.inject(["sidebarRightTabs",
+  "sidebarRight"])` rather than the plugin's required `inject` list: a hard
+  requirement would take the row page down with it on any host that lacks those
+  services. If they are missing, the tab simply never appears.
+
 - **An "Open dashboard" control in the plugin page header**
   (`plugins.detail.actions`). It sits on the bundle page *and* on the row page,
-  before anything has to be expanded. The row page still embeds the dashboard;
-  this is the way out of the frame — a second screen, or a way in when the frame
-  did not render. It renders only on this plugin's own pages (matched on
-  `subject.pkg.name`) and returns `null` everywhere else, so it never leaves an
-  empty control on another plugin's page.
+  before anything has to be expanded. It prefers the docked tab; when the sidebar
+  cannot take it — `openTab` throws when no session surface is mounted, which is
+  the case while the global Plugins panel covers the conversation — it falls back
+  to opening the dashboard in a new tab. It renders only on this plugin's own
+  pages (matched on `subject.pkg.name`) and returns `null` everywhere else, so it
+  never leaves an empty control on another plugin's page.
 
 ### Fixed
 

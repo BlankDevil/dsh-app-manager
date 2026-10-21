@@ -141,7 +141,7 @@ const patchText = readFileSync(path.join(PLUGIN_DIR, "patch.yml"), "utf8");
 const rowId = patchText.match(/^\s*-\s*id:\s*([A-Za-z0-9._@/-]+)\s*$/m)?.[1];
 ok("patch.yml 里有行 id", typeof rowId === "string" && rowId.length > 0, `读到 ${JSON.stringify(rowId)}`);
 
-const calls = { injected: [], registered: [], locale: null };
+const calls = { injected: [], registered: [], locale: null, injectedServices: [] };
 const ctx = {
   locale: {
     bind: () => (key) => key,
@@ -166,14 +166,43 @@ const ctx = {
   },
 };
 
+// The right-sidebar services. `ctx.inject([...], cb)` is cordis's optional
+// lookup: the callback runs only when every named service is present.
+const sidebar = { types: [], panes: [] };
+const scope = {
+  locale: ctx.locale,
+  sidebarRightTabs: {
+    register(definition) {
+      sidebar.types.push(definition);
+      return () => {};
+    },
+  },
+  slots: {
+    inject(name, callback) {
+      calls.injected.push(name);
+      return callback();
+    },
+    register(options, component) {
+      sidebar.panes.push({ options, component });
+      return () => {};
+    },
+  },
+  effect: ctx.effect,
+};
+ctx.inject = (deps, callback) => {
+  calls.injectedServices.push(deps);
+  callback(scope);
+};
+
 client.apply(ctx);
 
 eq(
-  "注册到两个 slot（行页面 + 页面头部动作）",
+  "注册到三个 slot（行页面 + 页面头部动作 + 右侧栏正文）",
   JSON.stringify(calls.injected),
-  JSON.stringify(["plugins.row.config", "plugins.detail.actions"])
+  JSON.stringify(["plugins.row.config", "plugins.detail.actions", "sidebar.right.pane.tab"])
 );
-eq("注册条目数", calls.registered.length, 2);
+eq("按需注入右侧栏服务", JSON.stringify(calls.injectedServices), JSON.stringify([["sidebarRightTabs", "sidebarRight"]]));
+eq("外层 slot 注册条目数", calls.registered.length, 2);
 
 const reg = calls.registered.find((r) => r?.options?.name === "plugins.row.config");
 const action = calls.registered.find((r) => r?.options?.name === "plugins.detail.actions");
@@ -280,6 +309,64 @@ const ownRow = action.component({
   },
 });
 ok("自己的行页面上同样渲染按钮", ownRow !== null && textOf(ownRow).length > 0, `实际 ${JSON.stringify(ownRow)}`);
+
+// ---------------------------------------------------------------- 6. 右侧栏 tab
+
+console.log("\n=== 6. 右侧栏 tab（与对话并排） ===");
+
+eq("tab 类型只注册一次", sidebar.types.length, 1);
+
+const tabType = sidebar.types[0];
+eq("类型 id 用包名", tabType?.id, PKG.name);
+eq("type id 与导出常量一致", tabType?.id, client.TAB_ID);
+eq("kind", tabType?.kind, client.TAB_KIND);
+ok(
+  "keepMounted —— 切到终端再切回来不重载面板",
+  tabType?.keepMounted === true,
+  `实际 ${JSON.stringify(tabType?.keepMounted)}`
+);
+ok("title 是非空函数", typeof tabType?.title === "function" && String(tabType.title()).length > 0, "");
+ok(
+  "guide 有且只有一个入口（右侧栏起始页可见）",
+  Array.isArray(tabType?.guide) && tabType.guide.length === 1,
+  `实际 ${JSON.stringify(tabType?.guide)}`
+);
+eq("guide 入口 id", tabType?.guide?.[0]?.id, "open");
+ok("guide 入口 order 是数字", typeof tabType?.guide?.[0]?.order === "number", "");
+ok("guide 入口 title 非空", String(tabType?.guide?.[0]?.title?.() ?? "").length > 0, "");
+ok("guide 入口 description 非空", String(tabType?.guide?.[0]?.description?.() ?? "").length > 0, "");
+
+eq("正文注册到 sidebar.right.pane.tab", sidebar.panes.length, 1);
+eq("正文 key = 类型 id", sidebar.panes[0]?.options?.key, client.TAB_ID);
+
+window.location = { protocol: "http:", origin: "http://127.0.0.1:19387" };
+const tabBody = sidebar.panes[0]?.component({ t });
+eq("正文是同源 iframe", tabBody?.props?.src, "http://127.0.0.1:19387" + client.PAGE_PATH);
+ok("正文撑满面板高度（不是固定像素）", String(tabBody?.props?.style?.height) === "100%", `实际 ${JSON.stringify(tabBody?.props?.style?.height)}`);
+
+// ---------------------------------------------------------------- 7. 按钮的优先级
+
+console.log("\n=== 7. 按钮：优先侧栏，失败才开新标签页 ===");
+
+const ourSubject = { kind: "bundle", pkg: { name: PKG.name, installed: true, enabled: true, rows: [] } };
+
+let preventedWhenAvailable = false;
+const withSidebar = action.component({ t, subject: ourSubject, openSidebar: () => true });
+withSidebar.props.onClick({ preventDefault: () => { preventedWhenAvailable = true; } });
+ok(
+  "侧栏可用时阻止默认行为（不会同时开两个）",
+  preventedWhenAvailable,
+  "没阻止的话会既开侧栏又开新标签页"
+);
+
+let preventedWhenUnavailable = false;
+const withoutSidebar = action.component({ t, subject: ourSubject, openSidebar: () => false });
+withoutSidebar.props.onClick({ preventDefault: () => { preventedWhenUnavailable = true; } });
+ok(
+  "侧栏不可用时保留新标签页兜底",
+  preventedWhenUnavailable === false,
+  "不该阻止默认行为，否则点了没反应"
+);
 
 console.log(`\n=== 结果：${checks - failures}/${checks} 通过${failures ? `，${failures} 项失败 ✗` : " ✓"} ===`);
 if (failures > 0) {

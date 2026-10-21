@@ -1,9 +1,14 @@
 {
   "name": "dsh-app-manager",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "description": "A CLI application manager for discovering, monitoring, and managing installed command-line tools across package managers. DSH plugin: 7 AI-callable tools plus a web dashboard at http://127.0.0.1:3080/app-manager.",
   "main": "lib/src/index.js",
   "types": "lib/src/index.d.ts",
+  "exports": {
+    ".": "./lib/src/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
   "bin": {
     "app-manager": "./lib/bin/cli-app-manager.js",
     "am": "./lib/bin/cli-app-manager.js"
@@ -16,7 +21,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && node scripts/build-client.mjs",
     "start": "node lib/bin/cli-app-manager.js",
     "test": "node tests/run-tests.mjs",
     "test:quick": "node tests/run-tests.mjs --quick",
@@ -27,6 +32,7 @@
     "test:approval": "node tests/approval-gate.test.mjs",
     "test:actions": "node tests/actions.test.mjs",
     "test:compat": "node tests/dsh-compat.test.mjs",
+    "test:client": "node tests/client-entry.test.mjs",
     "smoke": "node tests/smoke-features.mjs",
     "prepublishOnly": "npm run build"
   },
@@ -63,6 +69,9 @@
   "dsh": {
     "bundle": {
       "patch": "./patch.yml"
+    },
+    "client": {
+      "platform": "web"
     }
   },
   "publishConfig": {

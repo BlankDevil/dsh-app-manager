@@ -5,6 +5,48 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),  
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0] - 2026-10-21
+
+The dashboard could always be reached by typing `/app-manager` into a browser.
+**DSH Desktop has no address bar**, so on the desktop the plugin was installed,
+running, serving its page — and impossible to open. It now registers a page in
+the Plugins panel, which is the one place the desktop shell can reach a plugin.
+
+### Added
+
+- **A browser half (`dsh.client`) that puts the dashboard inside the Plugins
+  panel.** The shell's only per-plugin entry point is the row config page
+  (`plugins.row.config`), keyed by `<bundle>#<row id>`. The new client bundle
+  registers that row page — `dsh-app-manager#app-manager` — and renders the
+  existing dashboard in an iframe. There is no second implementation of the UI:
+  the frame points at the same `webServer` route the browser uses.
+
+  The URL is derived from the shell's origin at render time, never hard-coded.
+  The desktop shell picks a **random localhost port on every launch** (it is not
+  3080 — that is `dsh web`), so a baked-in port would be wrong half the time.
+  Same-origin resolution means `web` and `desktop` both work with no
+  configuration.
+
+- **`npm run test:client`** — a guard for the entry point, because every way this
+  can break is silent. A wrong slot key does not error: the row simply never
+  grows its chevron and the page disappears. A bundle written as an ES module
+  instead of the shell's `__ModuleLoader__.load({ id, factory })` envelope
+  parses fine and registers nothing. The test asserts the manifest, the bundle
+  format, the registration key (read back out of `patch.yml`), and the rendered
+  URLs for both a web origin and a desktop origin.
+
+### Changed
+
+- `package.json` gained an `exports` map so the host can resolve
+  `exports["./client"]`. `"."` is declared explicitly — adding `exports` also
+  hides `main`, which would otherwise break the plugin's own entry point.
+- `npm run build` now copies `src/client.js` to `lib/client.js`. The browser half
+  is hand-written in the loader format, so there is nothing to compile, but it
+  has to sit next to the compiled Node half for `exports["./client"]` to resolve.
+- Version **0.9.0**: the client half is a new capability, and 0.8.0 is already
+  published — republishing a different 0.8.0 would make the tag and the registry
+  disagree.
+
 ## [0.8.0] - 2026-10-15
 
 Two questions the table used to answer wrongly: **"is this app still

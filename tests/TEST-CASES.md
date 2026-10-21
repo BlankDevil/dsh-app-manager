@@ -1,7 +1,26 @@
 # dsh-app-manager 测试用例规格
 
-版本：v7（对应插件 0.8.0 · dsh 0.1.5-rc.1 / 0.2.0-rc.2）
+版本：v9（对应插件 0.9.0 · dsh 0.1.5-rc.1 / 0.2.0-rc.2）
 状态基线：用例先于脚本编写；执行结果见 `reports/`。
+
+> **v9 相对 v8 的变化**：新增 **M 组（客户端入口，30 条）**。
+> 0.9.0 之前插件只有服务端半侧（`webServer` 路由），在 `dsh web` 里靠地址栏能用，
+> 在 **DSH Desktop** 里因为没有 UI 入口而"打不开"。M 组守的就是那个入口：
+> `dsh.client` 声明、bundle 的 `__ModuleLoader__.load` 格式、以及
+> `plugins.row.config` 的 key 是否等于 `<包名>#<patch 行 id>`。
+> 这三处写错**全都不报错**，只是页面静默消失。
+
+> **v8 相对 v7 的变化**：
+> ① **主套件不再只抽 1 个应用**。v7 里 `info`/`search` 每次只随机抽 **1 个**，
+> 60 个应用里 59 个常年不被触碰 —— 报告里那行「随机 1 / 池 57」就是证据。
+> 现在抽 **4~6 个**，且**按来源分层**（本机 path ≈35 / npm ≈10，均匀抽 5 个大概率
+> 全是 path，npm / choco / npx 分支永远测不到）。
+> ② **新增 F 组**：对抽中的这 4~6 个应用做**逐项**交叉验证（API / DSH 工具 / CLI /
+> 页面四条路径读同一个应用再比对），补上 E 组「一条断言套所有应用」证明不了的
+> 那部分 —— 字段存在 ≠ 这条记录是对的。
+> ③ 修正 `TC-E06` 的描述（0.8.0 起「无命令的包也列出」，不变量已改）。
+> ④ `run-tests.mjs` 的插件加载移出分组过滤：此前 `--group C,E,F`（不含 B）会在
+> 抽样处读 `undefined.routes` 直接崩，CONTRIBUTING 建议的「只跑相关模块」用不了。
 
 > **v7 相对 v6 的变化**：**报告必须写明本轮测的是哪些 app**。
 > 抽样随机化之后，「这份报告全绿」离开了样本就没有意义 —— 换一批样本可能就红，
@@ -127,13 +146,42 @@
 | TC-E03 | managed 语义自洽 | `managed===true ⟺ installKind==="managed"` |
 | TC-E04 | unmanaged 口径一致 | unmanaged API `total` === apps 中 `managed===false` 的数量 |
 | TC-E05 | 无重复键 | `(name, source)` 二元组无重复 |
-| TC-E06 | commands 非空 | 每项 `commands` 为非空数组 |
+| TC-E06 | commands 为数组；无命令项受限 | `commands` 必须是数组；**空数组只允许出现在包管理器来源**（npm / pnpm），且这类应用 `inPath` 必须为 false |
 | TC-E07 | 跨端点总数一致 | method API `totalApps` === apps API `total`（容差 ±2，超出记 FAIL 排查环境波动） |
 
 ---
 
-**合计**：A 组 18 · B 组 16 · C 组 5 · D 组 5 · E 组 7 = **51 条**
+## F 组 — 抽样应用逐项一致性（逐应用交叉验证，基于 C 组 JSON + 页面 HTML）
+
+E 组与 F 组是**两个方向**，缺一不可：
+
+- **E 组**：一条断言套在**所有**应用上 —— 证明「字段存在、口径自洽」。
+- **F 组**：把**同一个**应用从四条路径（`apps` API / DSH 工具 / CLI 子进程 /
+  页面 HTML）分别读出来再比对 —— 证明「这条记录本身是对的」。
+
+E 组证明不了后者。名字带空格、命令名与包名不同、来源是 npx 缓存、路径末尾带
+反斜杠 …… 这些差异只有落到**具体应用**上才会暴露，而一条通用断言只会看到
+「字段存在」。
+
+样本：**随机 4~6 个**，**按来源分层**（见文末「随机抽样」）。
+
+| ID | 用例 | 断言 |
+|----|------|------|
+| TC-F01 | 记录字段自洽 | 抽样应用都能在 `apps` API 里找到；`name` 非空且首尾无空白；`source` 非空；`commands` 为非空数组；`inPath` / `managed` 为布尔；`installKind` 非空 |
+| TC-F02 | 首命令是裸命令名 | 每个抽样应用的 `commands[0]` 匹配 `^[A-Za-z0-9][A-Za-z0-9._@+-]*$` —— 这是页面「点击名称启动」的前置条件（`/api/open` 只收裸命令名）；带空格/元字符的命令在页面上点不开，而列表里看不出来 |
+| TC-F03 | 工具 info 逐项命中 | 对每个抽样应用调用 `app_manager_info`：输出含应用名、`**Source:**` 后确为该项来源、含首命令 —— 三次比对都指向**同一个**应用，抓「张冠李戴」 |
+| TC-F04 | list 完整列出 | `app_manager_list` 输出包含每个抽样应用的完整名字（表格只 pad 不截断），且计数行 ≥ 抽样数 |
+| TC-F05 | managed 划分跨端点一致 | `managed===true` 的不得出现在 unmanaged 端点；`===false` 的必须出现 |
+| TC-F06 | 分类在页面上真有区块 | 每个抽样应用的 `category` 都能在页面 HTML 里找到对应 `data-category` —— 分类算错的应用会落进一个页面上不存在的分类里，表现为「列表少一行却没有任何报错」 |
+| TC-F07 | CLI search 逐个命中 | 对每个抽样应用跑一次 `app-manager search <name>` 子进程：退出码 0、输出含 `Found`、且结果里出现该名字（4~6 次子进程，约 5s） |
+
+---
+
+**合计**：A 组 18 · B 组 16 · C 组 5 · D 组 5 · E 组 7 · F 组 7 = **58 条**
 （其中 ◆ 网络扩展 2 条，`--quick` 模式跳过）
+
+> F 组的断言**每条都覆盖整个样本**，所以「58 条」是**用例数**，
+> 实际断言次数随抽样规模（4~6）浮动。
 
 **独立行为/性能组**（不在 `run-tests.mjs` 计数内，各自单独运行）：
 - G 组 13 条 · 拖拽交互行为（`node tests/drag-behavior.test.mjs`）
@@ -326,14 +374,18 @@ TC-H03 的职责。真实 dsh 服务在插件 `apply()` 时有后台预热（`se
 
 ### 随机抽样：被测应用不再是固定的那几个
 
-`tests/sample-apps.mjs` 提供 `sampleApps(pool, {min:4, max:6})` 与 `pickOne(pool)`。
+`tests/sample-apps.mjs` 提供 `sampleApps(pool, {min, max, label, stratify})` 与 `pickOne(pool)`。
 
+- **主套件（F 组 + `TC-B08`/`TC-A04`/`TC-A12`）**：从「带命令的应用」里随机抽
+  **4~6 个**，且 **`stratify: true`（按来源分层）**。单点用例沿用样本里的第一个。
 - **K 组**：从「带命令的应用」里随机抽 4~6 个跑终端 / shell 白名单 / 残留修复断言；
   从「npm 来源应用」里随机抽 4~6 个跑升级并发保护。
-- **主套件**：`info` / `search` 的目标应用（`TC-B08`、`TC-A04`、`TC-A12`）每次随机抽 1 个。
-- 抽到的名字会打印出来（`· 随机抽样 …`），便于复现失败的那一次。
+- 抽到的名字会打印出来（`· 随机抽样 …`），并写进 `reports/run-*.md` 的抽样表。
 - **为什么**：`apps.find()` 永远返回同一个应用，而那个应用往往恰好是名字干净、命令规范、
   路径正常的那个 —— 名字带空格、命令名与包名不同、路径特殊的应用可能一次都没被测过。
+- **为什么分层**：本机 path 来源约 35 个、npm 约 10 个 —— **均匀抽 5 个大概率全是 path**，
+  npm / choco / npx-cache 三条分支常年零覆盖。分层后每次运行都能碰到几种来源
+  （实测一轮抽到 path + npm + npx-cache + choco）。
 - **副作用**：断言总数随抽样规模（4~6）浮动，不再是固定值。
 - **黑名单**：Fiddler 全家永不被抽中（`tests/sample-apps.mjs` 的 `EXCLUDED`，按
   名称 / 安装路径 / 命令匹配）。实测排除项：`ExecAction`、`Fiddler`、`EnableLoopback`、
@@ -438,3 +490,48 @@ satisfies("0.1.7-rc.2",  "^0.1.5-rc.1")                  = true    ← 注意：
 最后一行正是「不能手写评估器」的证据：同为预发布版本，`0.1.7-rc.2` 落在
 `^0.1.5-rc.1` 的范围内，而 `0.2.0-rc.2` 不落 —— 规则比"同 tuple 才允许预发布"更微妙。
 
+
+---
+
+## M 组 — 客户端入口（`client-entry.test.mjs`，30 条，v9 新增）
+
+**为什么单独成组**：这一组守的是「插件在 **DSH Desktop** 里能不能点开」。
+
+插件主体 UI 是 `webServer` 上的 `/app-manager` 页面。`dsh web` 里能用，因为浏览器
+**有地址栏**；Electron 外壳没有地址栏，插件页只能从壳内 UI 进，而壳里唯一的入口是
+**「插件 → bundle → 某一行 → 该行的配置页」**，即 `plugins.row.config` 这个 keyed slot。
+
+这个入口的每一种坏法都是**静默的**：
+
+| 坏法 | 现象 |
+|------|------|
+| slot key 与 `<包名>#<行 id>` 不一致 | 行上不出现展开箭头，页面直接消失，无日志无异常 |
+| bundle 写成 ES module（`export function apply`） | 解析成模块，**永远不注册 factory**，同样静默 |
+| `exports["./client"]` 缺失或指向不存在的文件 | `dsh-client-modules` 激活时**直接失败**（比没入口更糟） |
+| 加了 `exports` 但漏了 `"."` | 包根入口被打掉，宿主连插件主体都 import 不到 |
+
+| ID | 用例 | 断言 |
+|----|------|------|
+| TC-M01–M04 | 清单声明 | `dsh.client.platform === 'web'`；`exports["./client"]` 是字符串；`exports["."]` 仍存在；入口文件真实存在且落在 `files` 白名单内 |
+| TC-M05–M06 | 产物同步 | `src/client.js` 存在；`lib/client.js` 与源码逐字节一致（构建产物过期即失败） |
+| TC-M07–M08 | 加载格式 | 执行源码会调用 `window.__ModuleLoader__.load`；`id` 等于包名 |
+| TC-M09–M13 | factory 契约 | 返回 `apply` / `inject` / `ROW_KEY` / `PAGE_PATH`；`inject` 含 `slots`；只请求 `react`（未声明 external 时只能要基座模块） |
+| TC-M14–M22 | 注册行为 | 只向 `plugins.row.config` 注册一次；**key 等于 `<package.json name>#<patch.yml 的行 id>`**（行 id 从 patch 现场读出，不是写死的）；与导出常量一致；locale 命名空间正确；词典含 zh/en |
+| TC-M23–M30 | 渲染与地址 | `view=summary` 输出非空文本且不是 iframe；`view=page` 含 iframe 且 `src === origin + '/app-manager'`（分别校验 web 的 3080 与 desktop 的 19387 两种 origin）；非 http(s) 外壳退化为根相对路径；iframe 有 title |
+
+**设计取舍**：这一组用 `new Function(src)()` + 假 `window.__ModuleLoader__` 直接跑真实
+产物，而不是断言源码字符串。差别在于——断言字符串的话，`key` 写错、envelope 写错都
+照样"通过"；跑真实产物才能验证**注册出去的那个对象**长什么样。
+
+**已做的宿主级验证（0.9.0，一次性 scratch profile，验完即删）**：
+
+```
+启动图里出现：{"id":"dsh-app-manager","url":"plugins/??dsh-app-manager/client.js&rev=c14da48375f1"}
+GET /plugins/??dsh-app-manager/client.js&rev=c14da48375f1 → 200 · 7461 bytes
+  · 含 __ModuleLoader__.load
+  · 含 key dsh-app-manager#app-manager
+同图内也在：dsh-client-ui-plugin-manager（slot 声明方）、dsh-client-ui-renderer（slots 服务）、dsh-client-locale
+```
+
+⚠️ **仍未验证的**：真实浏览器里点击「插件 → dsh-app-manager → app-manager → 展开」
+之后 iframe 是否渲染。这需要重启 DSH Desktop 并肉眼确认——静态与宿主层能验的已验完。

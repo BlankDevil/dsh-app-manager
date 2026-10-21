@@ -18,7 +18,7 @@ import path from "node:path";
 // ---------- 环境常量 ----------
 const NODE = process.execPath;
 const TESTS_DIR = path.dirname(fileURLToPath(import.meta.url));
-import { pickOne, describeApp, excludedPatterns } from "./sample-apps.mjs";
+import { sampleApps, describeApp, excludedPatterns } from "./sample-apps.mjs";
 // The plugin root is the parent of this tests/ directory.
 const PLUGIN_DIR = path.resolve(TESTS_DIR, "..");
 const CLI = path.join(PLUGIN_DIR, "lib/bin/cli-app-manager.js");
@@ -237,11 +237,17 @@ async function main() {
   let methodJson = null;
   let pathAppName = null; // 供 update 守卫用例选取的非 npm 来源应用
 
+  // 插件**在分组过滤之外**加载。
+  //
+  // 之前 `pluginCtx = await loadPlugin()` 写在 TC-B01 里，于是 `--group C,E,F`
+  // 这类不含 B 的调用会在抽样处直接 TypeError（读 undefined.routes）崩掉 ——
+  // 「只跑相关模块」这个用法（CONTRIBUTING 里建议的）实际上用不了。
+  pluginCtx = await loadPlugin();
+
   // ============ B 组（先行：产物供 A/D/E 组使用） ============
   group("B 组 · 插件加载与 DSH 工具契约");
 
   await test("TC-B01", "模块导出契约", async () => {
-    pluginCtx = await loadPlugin();
     const { plugin } = pluginCtx;
     assert(typeof plugin.apply === "function", `apply 应为函数，实际 ${typeof plugin.apply}`);
     assert(plugin.name === "dsh-app-manager", `name 应为 dsh-app-manager，实际 ${plugin.name}`);
@@ -249,17 +255,25 @@ async function main() {
     return `name=${plugin.name} inject=${JSON.stringify(plugin.inject)}`;
   });
 
-  // info / search 的目标应用：随机抽，不再写死 "dsh"。
-  // 写死一个应用等于只测那一个 —— 名字、命令、路径都恰好"干净"的那一个。
+  // 抽样应用：随机抽 4~6 个，且**按来源分层**。
+  //
+  // 之前只抽 1 个（pickOne）。一个样本撑不起「这版对 60 个应用都成立」这句话：
+  // 名字、命令、路径恰好干净的那一个总能通过。分层是因为本机 path 来源约 35 个、
+  // npm 约 10 个 —— 均匀抽 5 个大概率全是 path，npm / choco / npx 分支常年不被触碰。
   const appsRoute = pluginCtx.routes.find((r) => r.path === "/app-manager/api/apps");
   const appsProbe = await callRoute(appsRoute, "/app-manager/api/apps");
   const discovered = (JSON.parse(appsProbe.body).apps || []).filter((a) => a.commands && a.commands.length > 0);
-  const infoTarget = recordSample(
-    "info / search 目标应用",
-    pickOne(discovered, "info/search 目标应用"),
-    `随机 1 / 池 ${discovered.length}`
-  );
-  assert(infoTarget, "本机没有带命令的应用，无法随机选目标");
+  const samplePool = sampleApps(discovered, {
+    min: 4,
+    max: 6,
+    stratify: true,
+    label: "抽样应用",
+  });
+  assert(samplePool.length > 0, "本机没有带命令的应用，无法随机选目标");
+  const sampleHow = `随机 ${samplePool.length} / 池 ${discovered.length}（按来源分层）`;
+  for (const app of samplePool) recordSample("抽样应用（F 组逐项 + info/search）", app, sampleHow);
+  // 单点用例（TC-A04 / A12 / B08）沿用样本里的第一个，保持既有断言不变。
+  const infoTarget = samplePool[0];
   console.log(`  本次抽样目标: ${describeApp(infoTarget)}`);
 
   await test("TC-B02", "apply 注册工具数 = 7", async () => {
@@ -593,6 +607,117 @@ async function main() {
     return `method=${methodJson.totalApps} apps=${appsJson.total} diff=${diff}`;
   });
 
+  // ============ F 组（抽样应用逐项一致性） ============
+  //
+  // E 组守的是「整份数据自洽」：一条断言套在所有应用上，证明的是「字段存在」。
+  // 它证明不了「这个应用这条记录是对的」—— 名字里有空格、命令与包名不同、
+  // 来源是 npx 缓存、路径末尾带反斜杠 …… 这些差异只有落到**具体应用**上才暴露。
+  //
+  // F 组换一个方向：挑 4~6 个具体应用（按来源分层），把**同一个应用**从
+  // API / DSH 工具 / CLI / 页面四条路径分别读出来，再交叉比对。
+  group("F 组 · 抽样应用逐项一致性（API / 工具 / CLI / 页面交叉验证）");
+
+  const sampledRecords = samplePool
+    .map((s) => appsJson.apps.find((a) => a.name === s.name))
+    .filter(Boolean);
+  const escapeRe = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+  await test("TC-F01", `抽样 ${samplePool.length} 个应用的记录字段自洽`, async () => {
+    const missing = samplePool.filter((s) => !appsJson.apps.some((a) => a.name === s.name));
+    assert(missing.length === 0, `抽样应用在 apps API 中找不到: ${missing.map((a) => a.name).join(", ")}`);
+    for (const a of sampledRecords) {
+      assert(a.name.length > 0 && a.name.trim() === a.name, `"${a.name}": 名字为空或首尾含空白`);
+      assert(typeof a.source === "string" && a.source.length > 0, `${a.name}: source 为空`);
+      assert(Array.isArray(a.commands) && a.commands.length > 0, `${a.name}: commands 应为非空数组`);
+      assert(typeof a.inPath === "boolean", `${a.name}: inPath 应为布尔，实际 ${typeof a.inPath}`);
+      assert(typeof a.managed === "boolean", `${a.name}: managed 应为布尔`);
+      assert(typeof a.installKind === "string" && a.installKind.length > 0, `${a.name}: installKind 为空`);
+    }
+    const sources = [...new Set(sampledRecords.map((a) => a.source))];
+    return `${sampledRecords.length} 项齐全 · 来源 ${sources.join("+")}`;
+  });
+
+  await test("TC-F02", "抽样应用的首命令都是可直接执行的裸命令名", async () => {
+    // 这守的是页面「点击名称启动」的前置条件：/api/open 只接受裸命令名
+    // （无空格、无重定向、无 shell 元字符）。若 discovery 把带空格的字符串
+    // 当命令报出来，该应用在页面上就是点不开的 —— 而列表里看不出来。
+    const BARE = /^[A-Za-z0-9][A-Za-z0-9._@+-]*$/;
+    const bad = sampledRecords
+      .map((a) => ({ name: a.name, cmd: a.commands[0] }))
+      .filter((x) => !BARE.test(x.cmd));
+    assert(
+      bad.length === 0,
+      `首命令不是裸命令名（页面将拒绝启动）: ${bad.map((x) => `${x.name}→"${x.cmd}"`).join(", ")}`
+    );
+    return `${sampledRecords.length} 个首命令均为裸命令名`;
+  });
+
+  await test("TC-F03", "工具 info 对每个抽样应用都命中，且字段与该记录一致", async () => {
+    const infoTool = getTool("app_manager_info");
+    const problems = [];
+    const sizes = [];
+    for (const a of sampledRecords) {
+      const out = String(await infoTool.execute({ name: a.name }, execSignal));
+      sizes.push(out.length);
+      if (!out.includes(a.name)) problems.push(`${a.name}: 输出未含应用名`);
+      if (!new RegExp(`\\*\\*Source:\\*\\*\\s*${escapeRe(a.source)}(\\s|$)`).test(out)) {
+        problems.push(`${a.name}: Source 非 ${a.source}`);
+      }
+      if (!out.includes(a.commands[0])) problems.push(`${a.name}: 输出未含首命令 ${a.commands[0]}`);
+    }
+    assert(problems.length === 0, problems.join(" | "));
+    return `${sampledRecords.length} 个均命中（输出 ${Math.min(...sizes)}~${Math.max(...sizes)} 字符）`;
+  });
+
+  await test("TC-F04", "list 工具输出完整列出每个抽样应用", async () => {
+    const out = String(await getTool("app_manager_list").execute({}, execSignal));
+    const missing = sampledRecords.filter((a) => !out.includes(a.name));
+    assert(missing.length === 0, `list 输出缺少: ${missing.map((a) => a.name).join(", ")}`);
+    const n = parseInt(out.match(/^(\d+) apps \(/m)?.[1] ?? "0", 10);
+    assert(n >= sampledRecords.length, `计数 ${n} 小于抽样数 ${sampledRecords.length}`);
+    return `${sampledRecords.length}/${sampledRecords.length} 出现在 ${n} 行的 list 输出里`;
+  });
+
+  await test("TC-F05", "抽样应用的 managed 划分与 unmanaged 端点一致", async () => {
+    const unmanagedNames = new Set(unmanagedJson.apps.map((a) => a.name));
+    const problems = [];
+    for (const a of sampledRecords) {
+      const inUnmanaged = unmanagedNames.has(a.name);
+      if (a.managed && inUnmanaged) problems.push(`${a.name}: managed=true 却出现在 unmanaged`);
+      if (!a.managed && !inUnmanaged) problems.push(`${a.name}: managed=false 却不在 unmanaged`);
+    }
+    assert(problems.length === 0, problems.join(" | "));
+    const m = sampledRecords.filter((a) => a.managed).length;
+    return `${sampledRecords.length} 项一致（managed ${m} / unmanaged ${sampledRecords.length - m}）`;
+  });
+
+  await test("TC-F06", "抽样应用的分类在页面上都有对应区块", async () => {
+    // 发现 → 渲染 的一致性：分类算错的应用不会凭空消失，而是被塞进一个
+    // 页面上根本不存在的分类里 —— 列表少了一行，却没有任何报错。
+    const problems = [];
+    for (const a of sampledRecords) {
+      if (!pageHtml.includes(`data-category="${a.category}"`)) {
+        problems.push(`${a.name}: 分类 ${a.category} 在页面无对应区块`);
+      }
+    }
+    assert(problems.length === 0, problems.join(" | "));
+    const cats = [...new Set(sampledRecords.map((a) => a.category))];
+    return `分类 ${cats.join(", ")} 均有区块`;
+  });
+
+  await test("TC-F07", `CLI search 能搜到每个抽样应用（${samplePool.length} 次子进程）`, async () => {
+    const failures = [];
+    for (const a of sampledRecords) {
+      const r = await runCli(["search", a.name], 30000);
+      const plain = String(r.stdout).replace(/\x1b\[[0-9;]*m/g, "");
+      if (r.code !== 0) failures.push(`${a.name}: 退出码 ${r.code}`);
+      else if (!plain.includes("Found")) failures.push(`${a.name}: 未找到（输出 ${clip(plain, 60)}）`);
+      else if (!plain.includes(a.name)) failures.push(`${a.name}: 结果里没有该名字`);
+    }
+    assert(failures.length === 0, failures.join(" | "));
+    return `${sampledRecords.length} 个应用均可被 search 命中`;
+  });
+
   // ============ B 组收尾（依赖 C 组数据的 update 守卫 + 网络用例） ============
   group("B 组 · 续（守卫与网络用例）");
 
@@ -828,7 +953,8 @@ async function main() {
 
   // ---------- 本轮打的是哪些应用 ----------
   md += `## 本次测试用到的应用\n\n`;
-  md += `应用是**每次运行随机抽取**的（本套件：info/search 随机 1 个；动作组另抽 4~6 个）。\n`;
+  md += `应用是**每次运行随机抽取**的：本套件抽 **4~6 个**（按来源分层，避免全是 path），`
+  md += `F 组对这 4~6 个逐项交叉验证；动作组另抽 4~6 个 + 4 个 npm 应用。\n`;
   md += `脱离样本谈「全绿」没有意义 —— 换个样本可能就红，所以样本必须写进报告，失败才可复现。\n\n`;
   md += `| 用途 | 应用 | 来源 | 首命令 | 抽样方式 |\n|---|---|---|---|---|\n`;
   if (sampledApps.length === 0) {

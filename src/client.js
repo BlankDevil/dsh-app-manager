@@ -42,24 +42,40 @@ window.__ModuleLoader__.load({
     /** Dictionary namespace owned by this plugin. */
     const NS = "plugin.appManager";
 
+    /** This package's name — the bundle half of every slot key the shell builds. */
+    const BUNDLE_NAME = "dsh-app-manager";
+
+    /** Row id this plugin's patch declares (`id: app-manager`). */
+    const ROW_ID = "app-manager";
+
     /**
      * The slot key the Plugins panel looks for.
      *
      * `dsh-client-ui-plugin-manager` builds this as
      * `${bundle package name}#${row id}`; the row id is the one our patch
-     * declares (`app-manager`). A mismatch is silent — the row simply never
-     * grows a chevron and the page stays unreachable — so `tests/client-entry.test.mjs`
-     * asserts this string against `patch.yml` and `package.json`.
+     * declares. A mismatch is silent — the row simply never grows a chevron and
+     * the page stays unreachable — so `tests/client-entry.test.mjs` asserts this
+     * string against `patch.yml` and `package.json`.
      */
-    const ROW_KEY = "dsh-app-manager#app-manager";
+    const ROW_KEY = `${BUNDLE_NAME}#${ROW_ID}`;
 
     /** The route the server half registers. */
     const PAGE_PATH = "/app-manager";
+
+    /** Registry id for the right-sidebar tab type (package name is the natural choice). */
+    const TAB_ID = "dsh-app-manager";
+
+    /** Page kind, as the sidebar's navigation controller names it. */
+    const TAB_KIND = "app-manager";
 
     const en = {
       title: "App Manager",
       summary: "Installed CLI tools: versions, update state, and leftovers.",
       openInTab: "Open in a new tab",
+      openPanel: "Open dashboard",
+      openSidebar: "Open in sidebar",
+      tabTitle: "App Manager",
+      tabGuide: "Installed CLI tools, versions and updates — beside your conversation.",
       frameTitle: "App Manager dashboard",
       unsupported: "This shell cannot embed the dashboard; open it in a browser instead.",
       urlLabel: "Dashboard URL",
@@ -69,6 +85,10 @@ window.__ModuleLoader__.load({
       title: "应用管理器",
       summary: "本机已安装的命令行工具：版本、可更新状态、卸载残留。",
       openInTab: "在新标签页打开",
+      openPanel: "打开面板",
+      openSidebar: "在侧栏打开",
+      tabTitle: "应用管理器",
+      tabGuide: "已安装的命令行工具、版本与更新 —— 和对话并排看。",
       frameTitle: "应用管理器面板",
       unsupported: "当前外壳无法内嵌该面板，请在浏览器中打开。",
       urlLabel: "面板地址",
@@ -178,6 +198,128 @@ window.__ModuleLoader__.load({
       return react.createElement("div", { "data-dsh-app-manager": true }, toolbar, frame);
     }
 
+    /**
+     * The right-sidebar tab body.
+     *
+     * The sidebar docks this pane **beside** the conversation — next to the
+     * terminal, the browser and file previews — which is the whole point: the
+     * dashboard stops being a page you navigate away to and becomes something
+     * that stays open while you keep working. `keepMounted` (set on the type)
+     * means switching tabs does not reload it.
+     *
+     * @param {object} props slot props.
+     * @returns {object} React element.
+     */
+    function AppManagerTab(props) {
+      return react.createElement("iframe", {
+        src: pageUrl(),
+        title: label(props, "frameTitle"),
+        "data-dsh-app-manager": "tab",
+        style: {
+          width: "100%",
+          height: "100%",
+          minHeight: "320px",
+          border: "0",
+          background: "transparent",
+          display: "block",
+        },
+      });
+    }
+
+    /**
+     * Open the dashboard as a right-sidebar tab.
+     *
+     * `ctx.sidebarRight.openTab()` throws when no session surface is mounted —
+     * which is exactly the case while the global Plugins panel covers the
+     * conversation. That is a placement limit, not a user error, so this reports
+     * failure and the caller falls back to a plain new tab.
+     *
+     * @param {object} ctx plugin context.
+     * @returns {() => boolean} opener: true when the sidebar took the tab.
+     */
+    function makeSidebarOpener(ctx) {
+      return () => {
+        try {
+          if (!ctx.sidebarRight) return false;
+          ctx.sidebarRight.openTab(TAB_KIND);
+          return true;
+        } catch {
+          return false;
+        }
+      };
+    }
+
+    /**
+     * Whether a page subject belongs to this plugin.
+     *
+     * `plugins.detail.actions` is a **list** slot: every contribution is asked to
+     * render for *every* page (bundle, row, or official item). Ours must render
+     * only where it makes sense, and return `null` elsewhere rather than an empty
+     * control that would show up on unrelated plugins' pages.
+     *
+     * The subject carries `{ kind, pkg, row? }` where `pkg` is
+     * `{ name, version, installed, enabled, rows }` — see
+     * `dsh-client-ui-plugin-manager`'s `packageRef`.
+     *
+     * @param {object} subject page subject.
+     * @returns {boolean} true for our bundle's page and its row pages.
+     */
+    function isOwnSubject(subject) {
+      const pkg = subject && subject.pkg;
+      return Boolean(pkg && pkg.name === BUNDLE_NAME);
+    }
+
+    /** Shared look of the header control, so it reads as a button in any theme. */
+    const actionStyle = {
+      display: "inline-flex",
+      alignItems: "center",
+      gap: "0.35rem",
+      padding: "0.32rem 0.7rem",
+      borderRadius: "6px",
+      border: "1px solid rgba(127,127,127,0.4)",
+      font: "inherit",
+      fontSize: "0.9em",
+      color: "inherit",
+      textDecoration: "none",
+      whiteSpace: "nowrap",
+      cursor: "pointer",
+    };
+
+    /**
+     * Header control that opens the dashboard in a new tab.
+     *
+     * Registered on `plugins.detail.actions`, which puts it in the page header of
+     * the bundle page *and* of the row page — before you have to expand anything.
+     * That is the "one obvious button" people look for when the embedded frame is
+     * not what they want (e.g. they want a second screen, or the frame did not
+     * render).
+     *
+     * @param {object} props slot props (`subject`, `t`).
+     * @returns {object|null} link element, or null on someone else's page.
+     */
+    function DetailOpenAction(props) {
+      if (!isOwnSubject(props && props.subject)) return null;
+      return react.createElement(
+        "a",
+        {
+          href: pageUrl(),
+          target: "_blank",
+          rel: "noreferrer",
+          "data-dsh-app-manager-action": "open",
+          style: actionStyle,
+          // Preferred placement first: a docked tab that coexists with whatever
+          // else is open. When the sidebar cannot take it (no session surface
+          // mounted), the anchor's default action opens a plain new tab instead.
+          onClick: (event) => {
+            if (typeof props.openSidebar === "function" && props.openSidebar()) {
+              event.preventDefault();
+            }
+          },
+        },
+        label(props, "openPanel")
+      );
+    }
+
     /** Required cordis services. */
     const inject = ["slots", "locale"];
 
@@ -188,6 +330,7 @@ window.__ModuleLoader__.load({
      */
     function apply(ctx) {
       const t = ctx.locale.bind(NS);
+      const openSidebar = makeSidebarOpener(ctx);
 
       ctx.effect(() => ctx.locale.register(NS, { zh, en }), "dsh-app-manager: dictionaries");
 
@@ -206,15 +349,79 @@ window.__ModuleLoader__.load({
         "dsh-app-manager: plugins row page"
       );
 
+      // A header control on the plugin's own page, so the dashboard is reachable
+      // without expanding the row (and works even if the embedded frame does not).
+      ctx.effect(
+        () =>
+          ctx.slots.inject("plugins.detail.actions", () =>
+            ctx.slots.register(
+              {
+                name: "plugins.detail.actions",
+                order: 10,
+                locale: NS,
+                inject: () => ({ openSidebar }),
+              },
+              DetailOpenAction
+            )
+          ),
+        "dsh-app-manager: plugin page header action"
+      );
+
+      // Right-sidebar tab — the placement that lets the dashboard sit *beside*
+      // the conversation instead of replacing it.
+      //
+      // Registered through `ctx.inject` rather than the plugin's required
+      // `inject` list on purpose: both services belong to the web shell, and a
+      // hard requirement would take the row page down with them on any host that
+      // lacks them. Missing services simply mean this block never runs.
+      ctx.inject(["sidebarRightTabs", "sidebarRight"], (scope) => {
+        scope.effect(
+          () =>
+            scope.sidebarRightTabs.register({
+              id: TAB_ID,
+              kind: TAB_KIND,
+              priority: "extension",
+              keepMounted: true,
+              title: () => t("tabTitle"),
+              guide: [
+                {
+                  id: "open",
+                  order: 20,
+                  title: () => t("tabTitle"),
+                  description: () => t("tabGuide"),
+                },
+              ],
+            }),
+          "dsh-app-manager: sidebar tab type"
+        );
+
+        scope.effect(
+          () =>
+            scope.slots.inject("sidebar.right.pane.tab", () =>
+              scope.slots.register(
+                { name: "sidebar.right.pane.tab", key: TAB_ID, locale: NS },
+                AppManagerTab
+              )
+            ),
+          "dsh-app-manager: sidebar tab body"
+        );
+      });
+
       // The dictionary is bound eagerly so a missing namespace fails at mount
       // time (matching every other client plugin) rather than on first render.
       void t;
     }
 
     exports.NS = NS;
+    exports.BUNDLE_NAME = BUNDLE_NAME;
+    exports.ROW_ID = ROW_ID;
     exports.ROW_KEY = ROW_KEY;
     exports.PAGE_PATH = PAGE_PATH;
+    exports.TAB_ID = TAB_ID;
+    exports.TAB_KIND = TAB_KIND;
+    exports.AppManagerTab = AppManagerTab;
     exports.AppManagerPage = AppManagerPage;
+    exports.DetailOpenAction = DetailOpenAction;
     exports.apply = apply;
     exports.inject = inject;
     return module.exports;

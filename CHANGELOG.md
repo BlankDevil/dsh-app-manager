@@ -7,6 +7,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.9.0] - 2026-10-21
 
+The dashboard stops being a page you leave the conversation for. It can now be
+**docked in the right sidebar**, next to the terminal, the browser and file
+previews — the placement the desktop shell is actually built around. Two smaller
+gaps from 0.8.1 are fixed alongside it.
+
+### Added
+
+- **The dashboard as a right-sidebar tab** (`sidebarRightTabs` + the
+  `sidebar.right.pane.tab` slot). This is the placement that makes it coexist
+  with everything else: it docks beside the conversation instead of replacing it,
+  and `keepMounted` keeps the frame alive across tab switches, so switching to
+  the terminal and back does not reload the list.
+
+  It is also discoverable from the sidebar's own start page through a `guide`
+  entry, so it can be opened there without going through the plugin page at all.
+
+  The tab type is registered through `ctx.inject(["sidebarRightTabs",
+  "sidebarRight"])` rather than the plugin's required `inject` list: a hard
+  requirement would take the row page down with it on any host that lacks those
+  services. If they are missing, the tab simply never appears.
+
+- **An "Open dashboard" control in the plugin page header**
+  (`plugins.detail.actions`). It sits on the bundle page *and* on the row page,
+  before anything has to be expanded. It prefers the docked tab; when the sidebar
+  cannot take it — `openTab` throws when no session surface is mounted, which is
+  the case while the global Plugins panel covers the conversation — it falls back
+  to opening the dashboard in a new tab. It renders only on this plugin's own
+  pages (matched on `subject.pkg.name`) and returns `null` everywhere else, so it
+  never leaves an empty control on another plugin's page.
+
+### Fixed
+
+- **The package description still advertised `http://127.0.0.1:3080/app-manager`.**
+  That is `dsh web`'s default port. The desktop shell picks a **random localhost
+  port on every launch**, so the number is simply wrong there. The description now
+  names the route and both carriers instead of a port that fits only one of them.
+
+### Note — 0.8.1 installed as 0.8.0
+
+Reported after 0.8.1: the plugin list offered 0.8.1, but the installed copy
+stayed 0.8.0. The cause is not in this package, and it is worth writing down:
+
+```
+dependencies:
++ dsh-app-manager ^0.8.0
+Progress: resolved 1, reused 1, downloaded 0, added 1
+```
+
+The plugin manager re-ran pnpm with the probe's **existing spec** (`^0.8.0`) and
+pnpm reused the locked 0.8.0 — `^0.8.0` is already satisfied by 0.8.0, so nothing
+was downloaded. Installing an **exact** version works:
+
+```bash
+dsh plugin --profile <name> add -w dsh-app-manager@0.8.2
+```
+
+## [0.8.1] - 2026-10-21
+
 The dashboard could always be reached by typing `/app-manager` into a browser.
 **DSH Desktop has no address bar**, so on the desktop the plugin was installed,
 running, serving its page — and impossible to open. It now registers a page in
@@ -43,9 +101,10 @@ the Plugins panel, which is the one place the desktop shell can reach a plugin.
 - `npm run build` now copies `src/client.js` to `lib/client.js`. The browser half
   is hand-written in the loader format, so there is nothing to compile, but it
   has to sit next to the compiled Node half for `exports["./client"]` to resolve.
-- Version **0.9.0**: the client half is a new capability, and 0.8.0 is already
-  published — republishing a different 0.8.0 would make the tag and the registry
-  disagree.
+- Version **0.8.1**: shipped as a patch. The dashboard was always meant to be
+  reachable on the desktop — the missing client half is a gap in what 0.8.0
+  promised, not a new capability worth its own minor. 0.8.0 stays published and
+  untouched; `latest` moves to 0.8.1.
 
 ## [0.8.0] - 2026-10-15
 

@@ -493,7 +493,7 @@ satisfies("0.1.7-rc.2",  "^0.1.5-rc.1")                  = true    ← 注意：
 
 ---
 
-## M 组 — 客户端入口（`client-entry.test.mjs`，30 条，v9 新增）
+## M 组 — 客户端入口（`client-entry.test.mjs`，58 条，v9 新增）
 
 **为什么单独成组**：这一组守的是「插件在 **DSH Desktop** 里能不能点开」。
 
@@ -518,6 +518,9 @@ satisfies("0.1.7-rc.2",  "^0.1.5-rc.1")                  = true    ← 注意：
 | TC-M09–M13 | factory 契约 | 返回 `apply` / `inject` / `ROW_KEY` / `PAGE_PATH`；`inject` 含 `slots`；只请求 `react`（未声明 external 时只能要基座模块） |
 | TC-M14–M22 | 注册行为 | 只向 `plugins.row.config` 注册一次；**key 等于 `<package.json name>#<patch.yml 的行 id>`**（行 id 从 patch 现场读出，不是写死的）；与导出常量一致；locale 命名空间正确；词典含 zh/en |
 | TC-M23–M30 | 渲染与地址 | `view=summary` 输出非空文本且不是 iframe；`view=page` 含 iframe 且 `src === origin + '/app-manager'`（分别校验 web 的 3080 与 desktop 的 19387 两种 origin）；非 http(s) 外壳退化为根相对路径；iframe 有 title |
+| TC-M31–M40 | 页面头部按钮 | 别人的 bundle 页 / 官方插件页不渲染；自己的 bundle 页与行页都渲染；`href` 同源；`target=_blank`；文案非空 |
+| TC-M41–M54 | 右侧栏 tab | 类型只注册一次、`id` 用包名、`kind` 正确、`keepMounted`（切 tab 不重载）、`title()` 非空、`guide` 恰好一个入口且 title/description/order 齐全；正文注册到 `sidebar.right.pane.tab` 且 `key === 类型 id`；正文是同源 iframe 且 `height:100%` |
+| TC-M55–M58 | 按钮优先级 | 侧栏可用时 `preventDefault`（否则会同时开侧栏 + 新标签页）；侧栏不可用时**不**阻止默认行为（保留新标签页兜底） |
 
 **设计取舍**：这一组用 `new Function(src)()` + 假 `window.__ModuleLoader__` 直接跑真实
 产物，而不是断言源码字符串。差别在于——断言字符串的话，`key` 写错、envelope 写错都

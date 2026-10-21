@@ -1,7 +1,7 @@
 {
   "name": "dsh-app-manager",
-  "version": "0.8.1",
-  "description": "A CLI application manager for discovering, monitoring, and managing installed command-line tools across package managers. DSH plugin: 7 AI-callable tools plus a web dashboard at http://127.0.0.1:3080/app-manager.",
+  "version": "0.8.2",
+  "description": "A CLI application manager for discovering, monitoring, and managing installed command-line tools across package managers. DSH plugin: 7 AI-callable tools plus a dashboard at /app-manager (dsh web) and in the DSH Desktop plugin panel.",
   "main": "lib/src/index.js",
   "types": "lib/src/index.d.ts",
   "exports": {

@@ -168,10 +168,19 @@ const ctx = {
 
 client.apply(ctx);
 
-eq("只向 plugins.row.config 注册", JSON.stringify(calls.injected), JSON.stringify(["plugins.row.config"]));
-eq("注册条目数", calls.registered.length, 1);
+eq(
+  "注册到两个 slot（行页面 + 页面头部动作）",
+  JSON.stringify(calls.injected),
+  JSON.stringify(["plugins.row.config", "plugins.detail.actions"])
+);
+eq("注册条目数", calls.registered.length, 2);
 
-const reg = calls.registered[0];
+const reg = calls.registered.find((r) => r?.options?.name === "plugins.row.config");
+const action = calls.registered.find((r) => r?.options?.name === "plugins.detail.actions");
+
+ok("行页面已注册", reg !== undefined, "缺 plugins.row.config 就没有可展开的页面");
+ok("页面头部动作已注册", action !== undefined, "缺 plugins.detail.actions 就没有「打开面板」按钮");
+
 eq("slot 名", reg?.options?.name, "plugins.row.config");
 eq(
   "slot key = 包名#行 id",
@@ -186,6 +195,7 @@ ok(
 eq("locale 命名空间", reg?.options?.locale, client.NS);
 eq("词典同时提供 zh / en", Object.keys(reg ? calls.locale.dictionaries : {}).sort().join(","), "en,zh");
 ok("注册的组件是函数组件", typeof reg?.component === "function", `实际 ${typeof reg?.component}`);
+ok("头部动作是函数组件", typeof action?.component === "function", `实际 ${typeof action?.component}`);
 
 // ---------------------------------------------------------------- 4. 渲染与地址
 
@@ -236,6 +246,40 @@ for (const origin of ["http://127.0.0.1:3080", "http://127.0.0.1:19387"]) {
 window.location = { protocol: "file:", origin: "null" };
 const fileFrame = renderPage();
 eq("非 http(s) 外壳下退化为根相对路径", fileFrame?.props?.src, client.PAGE_PATH);
+
+// ---------------------------------------------------------------- 5. 页面头部按钮
+
+console.log("\n=== 5. 页面头部「打开面板」按钮 ===");
+
+window.location = { protocol: "http:", origin: "http://127.0.0.1:19387" };
+
+const foreign = action.component({
+  t,
+  subject: { kind: "bundle", pkg: { name: "some-other-plugin", installed: true, enabled: true, rows: [] } },
+});
+eq("别人的插件页上不渲染", foreign, null);
+
+const itemSubject = action.component({ t, subject: { kind: "item", id: "x" } });
+eq("官方插件页（无 pkg）上不渲染", itemSubject, null);
+
+const ownBundle = action.component({
+  t,
+  subject: { kind: "bundle", pkg: { name: PKG.name, installed: true, enabled: true, rows: [] } },
+});
+ok("自己的 bundle 页上渲染按钮", ownBundle !== null && typeof ownBundle === "object", `实际 ${JSON.stringify(ownBundle)}`);
+eq("按钮指向同源的 dashboard", ownBundle?.props?.href, "http://127.0.0.1:19387" + client.PAGE_PATH);
+ok("按钮在新标签页打开", ownBundle?.props?.target === "_blank", `实际 ${JSON.stringify(ownBundle?.props?.target)}`);
+ok("按钮有可见文案", textOf(ownBundle).length > 0, "空按钮等于没有按钮");
+
+const ownRow = action.component({
+  t,
+  subject: {
+    kind: "row",
+    pkg: { name: PKG.name, installed: true, enabled: true, rows: [{ rowId: rowId }] },
+    row: { rowId },
+  },
+});
+ok("自己的行页面上同样渲染按钮", ownRow !== null && textOf(ownRow).length > 0, `实际 ${JSON.stringify(ownRow)}`);
 
 console.log(`\n=== 结果：${checks - failures}/${checks} 通过${failures ? `，${failures} 项失败 ✗` : " ✓"} ===`);
 if (failures > 0) {

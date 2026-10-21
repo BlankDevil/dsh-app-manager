@@ -5,6 +5,46 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),  
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.2] - 2026-10-21
+
+Two gaps left over from 0.8.1.
+
+### Added
+
+- **An "Open dashboard" control in the plugin page header**
+  (`plugins.detail.actions`). It sits on the bundle page *and* on the row page,
+  before anything has to be expanded. The row page still embeds the dashboard;
+  this is the way out of the frame — a second screen, or a way in when the frame
+  did not render. It renders only on this plugin's own pages (matched on
+  `subject.pkg.name`) and returns `null` everywhere else, so it never leaves an
+  empty control on another plugin's page.
+
+### Fixed
+
+- **The package description still advertised `http://127.0.0.1:3080/app-manager`.**
+  That is `dsh web`'s default port. The desktop shell picks a **random localhost
+  port on every launch**, so the number is simply wrong there. The description now
+  names the route and both carriers instead of a port that fits only one of them.
+
+### Note — 0.8.1 installed as 0.8.0
+
+Reported after 0.8.1: the plugin list offered 0.8.1, but the installed copy
+stayed 0.8.0. The cause is not in this package, and it is worth writing down:
+
+```
+dependencies:
++ dsh-app-manager ^0.8.0
+Progress: resolved 1, reused 1, downloaded 0, added 1
+```
+
+The plugin manager re-ran pnpm with the probe's **existing spec** (`^0.8.0`) and
+pnpm reused the locked 0.8.0 — `^0.8.0` is already satisfied by 0.8.0, so nothing
+was downloaded. Installing an **exact** version works:
+
+```bash
+dsh plugin --profile <name> add -w dsh-app-manager@0.8.2
+```
+
 ## [0.8.1] - 2026-10-21
 
 The dashboard could always be reached by typing `/app-manager` into a browser.

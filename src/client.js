@@ -42,16 +42,22 @@ window.__ModuleLoader__.load({
     /** Dictionary namespace owned by this plugin. */
     const NS = "plugin.appManager";
 
+    /** This package's name — the bundle half of every slot key the shell builds. */
+    const BUNDLE_NAME = "dsh-app-manager";
+
+    /** Row id this plugin's patch declares (`id: app-manager`). */
+    const ROW_ID = "app-manager";
+
     /**
      * The slot key the Plugins panel looks for.
      *
      * `dsh-client-ui-plugin-manager` builds this as
      * `${bundle package name}#${row id}`; the row id is the one our patch
-     * declares (`app-manager`). A mismatch is silent — the row simply never
-     * grows a chevron and the page stays unreachable — so `tests/client-entry.test.mjs`
-     * asserts this string against `patch.yml` and `package.json`.
+     * declares. A mismatch is silent — the row simply never grows a chevron and
+     * the page stays unreachable — so `tests/client-entry.test.mjs` asserts this
+     * string against `patch.yml` and `package.json`.
      */
-    const ROW_KEY = "dsh-app-manager#app-manager";
+    const ROW_KEY = `${BUNDLE_NAME}#${ROW_ID}`;
 
     /** The route the server half registers. */
     const PAGE_PATH = "/app-manager";
@@ -60,6 +66,7 @@ window.__ModuleLoader__.load({
       title: "App Manager",
       summary: "Installed CLI tools: versions, update state, and leftovers.",
       openInTab: "Open in a new tab",
+      openPanel: "Open dashboard",
       frameTitle: "App Manager dashboard",
       unsupported: "This shell cannot embed the dashboard; open it in a browser instead.",
       urlLabel: "Dashboard URL",
@@ -69,6 +76,7 @@ window.__ModuleLoader__.load({
       title: "应用管理器",
       summary: "本机已安装的命令行工具：版本、可更新状态、卸载残留。",
       openInTab: "在新标签页打开",
+      openPanel: "打开面板",
       frameTitle: "应用管理器面板",
       unsupported: "当前外壳无法内嵌该面板，请在浏览器中打开。",
       urlLabel: "面板地址",
@@ -178,6 +186,69 @@ window.__ModuleLoader__.load({
       return react.createElement("div", { "data-dsh-app-manager": true }, toolbar, frame);
     }
 
+    /**
+     * Whether a page subject belongs to this plugin.
+     *
+     * `plugins.detail.actions` is a **list** slot: every contribution is asked to
+     * render for *every* page (bundle, row, or official item). Ours must render
+     * only where it makes sense, and return `null` elsewhere rather than an empty
+     * control that would show up on unrelated plugins' pages.
+     *
+     * The subject carries `{ kind, pkg, row? }` where `pkg` is
+     * `{ name, version, installed, enabled, rows }` — see
+     * `dsh-client-ui-plugin-manager`'s `packageRef`.
+     *
+     * @param {object} subject page subject.
+     * @returns {boolean} true for our bundle's page and its row pages.
+     */
+    function isOwnSubject(subject) {
+      const pkg = subject && subject.pkg;
+      return Boolean(pkg && pkg.name === BUNDLE_NAME);
+    }
+
+    /** Shared look of the header control, so it reads as a button in any theme. */
+    const actionStyle = {
+      display: "inline-flex",
+      alignItems: "center",
+      gap: "0.35rem",
+      padding: "0.32rem 0.7rem",
+      borderRadius: "6px",
+      border: "1px solid rgba(127,127,127,0.4)",
+      font: "inherit",
+      fontSize: "0.9em",
+      color: "inherit",
+      textDecoration: "none",
+      whiteSpace: "nowrap",
+      cursor: "pointer",
+    };
+
+    /**
+     * Header control that opens the dashboard in a new tab.
+     *
+     * Registered on `plugins.detail.actions`, which puts it in the page header of
+     * the bundle page *and* of the row page — before you have to expand anything.
+     * That is the "one obvious button" people look for when the embedded frame is
+     * not what they want (e.g. they want a second screen, or the frame did not
+     * render).
+     *
+     * @param {object} props slot props (`subject`, `t`).
+     * @returns {object|null} link element, or null on someone else's page.
+     */
+    function DetailOpenAction(props) {
+      if (!isOwnSubject(props && props.subject)) return null;
+      return react.createElement(
+        "a",
+        {
+          href: pageUrl(),
+          target: "_blank",
+          rel: "noreferrer",
+          "data-dsh-app-manager-action": "open",
+          style: actionStyle,
+        },
+        label(props, "openPanel")
+      );
+    }
+
     /** Required cordis services. */
     const inject = ["slots", "locale"];
 
@@ -206,15 +277,35 @@ window.__ModuleLoader__.load({
         "dsh-app-manager: plugins row page"
       );
 
+      // A header control on the plugin's own page, so the dashboard is reachable
+      // without expanding the row (and works even if the embedded frame does not).
+      ctx.effect(
+        () =>
+          ctx.slots.inject("plugins.detail.actions", () =>
+            ctx.slots.register(
+              {
+                name: "plugins.detail.actions",
+                order: 10,
+                locale: NS,
+              },
+              DetailOpenAction
+            )
+          ),
+        "dsh-app-manager: plugin page header action"
+      );
+
       // The dictionary is bound eagerly so a missing namespace fails at mount
       // time (matching every other client plugin) rather than on first render.
       void t;
     }
 
     exports.NS = NS;
+    exports.BUNDLE_NAME = BUNDLE_NAME;
+    exports.ROW_ID = ROW_ID;
     exports.ROW_KEY = ROW_KEY;
     exports.PAGE_PATH = PAGE_PATH;
     exports.AppManagerPage = AppManagerPage;
+    exports.DetailOpenAction = DetailOpenAction;
     exports.apply = apply;
     exports.inject = inject;
     return module.exports;

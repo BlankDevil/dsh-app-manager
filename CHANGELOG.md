@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),  
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.9.0] - 2026-10-21
+## [0.8.1] - 2026-10-21
 
 The dashboard could always be reached by typing `/app-manager` into a browser.
 **DSH Desktop has no address bar**, so on the desktop the plugin was installed,
@@ -43,9 +43,10 @@ the Plugins panel, which is the one place the desktop shell can reach a plugin.
 - `npm run build` now copies `src/client.js` to `lib/client.js`. The browser half
   is hand-written in the loader format, so there is nothing to compile, but it
   has to sit next to the compiled Node half for `exports["./client"]` to resolve.
-- Version **0.9.0**: the client half is a new capability, and 0.8.0 is already
-  published — republishing a different 0.8.0 would make the tag and the registry
-  disagree.
+- Version **0.8.1**: shipped as a patch. The dashboard was always meant to be
+  reachable on the desktop — the missing client half is a gap in what 0.8.0
+  promised, not a new capability worth its own minor. 0.8.0 stays published and
+  untouched; `latest` moves to 0.8.1.
 
 ## [0.8.0] - 2026-10-15
 

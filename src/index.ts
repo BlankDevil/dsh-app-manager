@@ -1124,7 +1124,7 @@ function generateAppManagerPage(): string {
         return `
           <tr data-app="${escapeHtml(app.name)}" data-source="${escapeHtml(app.source)}" data-cmd="${escapeHtml(app.commands.join(" "))}">
             <td class="name" title="${escapeHtml(app.name)}"><span class="row-grip" aria-hidden="true">⠿</span>${nameMarkup}${subtitle}</td>
-            <td class="version" title="${escapeHtml(app.version)}">${escapeHtml(app.version)}</td>
+            <td class="version" title="${escapeHtml(app.version)}"><div class="vwrap"><span class="ver-text">${escapeHtml(app.version)}</span></div></td>
             <td class="commands" title="${escapeHtml(app.commands.join(", "))}">${escapeHtml(app.commands.join(", "))}</td>
             <td class="source" title="${escapeHtml(app.source)}">${escapeHtml(app.source)}</td>
             <td class="install">${installBadge}</td>
@@ -1586,7 +1586,7 @@ function generateAppManagerPage(): string {
 
     /* Column widths — kept identical across every category table */
     col.c-name    { width: 22%; }
-    col.c-version { width: 11%; }
+    col.c-version { width: 13%; }
     col.c-command { width: 20%; }
     col.c-source  { width: 9%; }
     col.c-install { width: 11%; }
@@ -1600,6 +1600,24 @@ function generateAppManagerPage(): string {
 
     .name { font-weight: 600; color: var(--accent); }    .version, .commands, .mono { font-family: var(--font-mono); }
     .version { font-size: var(--fs-small); }
+    /* Version text and its upgrade badge share the cell.
+     *
+     * Cells are overflow:hidden + table-layout:fixed, and this column is
+     * 13% wide — so a badge appended straight into the cell got **clipped
+     * away**: the DOM had it (tests passed), the screen did not. The wrapper
+     * makes the version text the only thing that may ellipsise; the badge is
+     * flex:0 0 auto and therefore always fully painted. */
+    .vwrap {
+      display: flex;
+      align-items: center;
+      gap: 0.35rem;
+      min-width: 0;
+    }
+    .ver-text {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
     .commands { font-size: var(--fs-small); color: var(--text); }
     .source { text-transform: capitalize; }
     .path { font-size: var(--fs-small); color: var(--muted); }
@@ -1642,7 +1660,8 @@ function generateAppManagerPage(): string {
     /* "update available" badge inside the Version cell */
     .upd {
       display: inline-block;
-      margin-left: 0.35rem;
+      flex: 0 0 auto;
+      margin-left: 0;
       font: inherit;
       font-size: var(--fs-small);
       font-weight: 700;
@@ -2392,32 +2411,75 @@ function generateAppManagerPage(): string {
         });
 
         // Decorate the Version column with an upgrade badge per app.
+        //
+        // Idempotent on purpose: this runs at load **and** after every refresh.
+        // The original version only ever *added* badges (it skipped rows that
+        // already had one), so once a badge was painted it stayed forever —
+        // pointing at a stale "latest", and surviving even after the app was
+        // upgraded. Now: present → created/updated, absent → removed.
         function decorate(updates) {
           var rows = document.querySelectorAll('tr[data-app]');
           var marked = 0;
           for (var i = 0; i < rows.length; i++) {
             var tr = rows[i];
-            var info = updates[tr.getAttribute('data-app')];
             var cell = tr.querySelector('td.version');
-            if (!info || !cell || cell.querySelector('.upd')) continue;
-            var b = document.createElement('button');
-            b.type = 'button';
-            b.className = 'upd';
+            if (!cell) continue;
+            var host = cell.querySelector('.vwrap') || cell;
+            var info = updates[tr.getAttribute('data-app')];
+            var b = cell.querySelector('.upd');
+            if (!info) {
+              if (b && !b.disabled && b.parentNode) b.parentNode.removeChild(b);
+              continue;
+            }
+            if (!b) {
+              b = document.createElement('button');
+              b.type = 'button';
+              b.className = 'upd';
+              b.setAttribute('data-name', tr.getAttribute('data-app'));
+              host.appendChild(b);
+            }
+            // An in-flight upgrade owns the button's label ("Upgrading…").
+            if (b.disabled) continue;
             b.textContent = '⬆ ' + info.latest;
             b.title = 'Upgrade to ' + info.latest + ' (runs: ' + info.command + ')';
-            b.setAttribute('data-name', tr.getAttribute('data-app'));
             b.setAttribute('data-command', info.command);
-            cell.appendChild(b);
             marked++;
           }
           return marked;
         }
 
+        /**
+         * Apply an updates payload, whichever shape it arrives in:
+         * /api/updates returns {checkedAt, updates:{...}}, while /api/refresh
+         * embeds the same object under its own "updates" key.
+         */
+        function applyUpdates(payload) {
+          if (!payload) return 0;
+          var map = payload.updates || payload;
+          var n = decorate(map);
+          updState.checking = false;
+          updState.error = null;
+          updState.count = n;
+          updState.at = new Date();
+          updateStatus();
+          return n;
+        }
+
         function refreshUpdates() {
+          updState.checking = true;
+          updateStatus();
           return fetch(API + '/updates', { headers: { accept: 'application/json' } })
             .then(function (r) { return r.json(); })
-            .then(function (data) { return decorate((data && data.updates) || {}); })
-            .catch(function () { return 0; });
+            .then(function (data) { return applyUpdates(data); })
+            .catch(function (e) {
+              // Silent before: a blocked/failed registry sweep looked exactly
+              // like "everything is up to date". Say so instead.
+              updState.checking = false;
+              updState.error = (e && e.message) || 'unknown error';
+              updateStatus();
+              if (window.console && console.warn) console.warn('[app-manager] update check failed', e);
+              return 0;
+            });
         }
 
         // Upgrade badge → confirm with the exact command → POST.
@@ -2534,13 +2596,21 @@ function generateAppManagerPage(): string {
         function setVersion(tr, version, note) {
           var cell = tr.querySelector('td.version');
           if (!cell) return;
-          var node = null;
-          for (var i = 0; i < cell.childNodes.length; i++) {
-            var n = cell.childNodes[i];
-            if (n.nodeType === 3 && n.textContent.trim()) { node = n; break; }
+          // The version lives in .ver-text so the upgrade badge can sit next
+          // to it without inheriting the ellipsis. Fall back to the old
+          // text-node path for any row rendered before this markup existed.
+          var span = cell.querySelector('.ver-text');
+          if (span) {
+            span.textContent = version;
+          } else {
+            var node = null;
+            for (var i = 0; i < cell.childNodes.length; i++) {
+              var n = cell.childNodes[i];
+              if (n.nodeType === 3 && n.textContent.trim()) { node = n; break; }
+            }
+            if (node) node.textContent = version + ' ';
+            else cell.insertBefore(document.createTextNode(version + ' '), cell.firstChild);
           }
-          if (node) node.textContent = version + ' ';
-          else cell.insertBefore(document.createTextNode(version + ' '), cell.firstChild);
           cell.title = note ? version + ' —— ' + note : version;
         }
 
@@ -2605,10 +2675,17 @@ function generateAppManagerPage(): string {
           setStat('managed', data.managedCount);
           setStat('unmanaged', data.unmanagedCount);
           setStat('inpath', inPath);
+          // The refresh route already computed the registry sweep when asked —
+          // it used to arrive here and be dropped on the floor, so the badges
+          // never moved. Apply it.
+          if (data && data.updates) applyUpdates(data.updates);
           return true;
         }
 
         var lastRefresh = null;
+
+        /** Last update-check outcome, surfaced in the status strip. */
+        var updState = { checking: false, count: null, at: null, error: null };
 
         function updateStatus() {
           if (!statusEl) return;
@@ -2618,6 +2695,13 @@ function generateAppManagerPage(): string {
             parts.push('上次刷新 ' + (secs < 60 ? secs + ' 秒前' : Math.round(secs / 60) + ' 分钟前'));
           } else {
             parts.push('尚未刷新');
+          }
+          if (updState.checking) {
+            parts.push('正在检查更新…');
+          } else if (updState.error) {
+            parts.push('更新检查失败');
+          } else if (updState.count !== null) {
+            parts.push(updState.count > 0 ? '可升级 ' + updState.count + ' 个' : '均已是最新');
           }
           var every = autoSelect ? Number(autoSelect.value) : 0;
           parts.push(every > 0
@@ -2630,19 +2714,34 @@ function generateAppManagerPage(): string {
           opts = opts || {};
           if (refreshBtn) { refreshBtn.disabled = true; refreshBtn.textContent = '⟳ 刷新中…'; }
           var qs = '?versions=' + (opts.versions === false ? '0' : '1');
-          if (opts.updates) qs += '&updates=1';
+          // "force" for the explicit button (the user clicked, so pay the sweep),
+          // "1" for the timer (reuse the server-side 5-minute cache). Passing
+          // nothing at all — what the timer used to do — left badges frozen at
+          // whatever the page had loaded with.
+          if (opts.updates === 'force') qs += '&updates=force';
+          else if (opts.updates) qs += '&updates=1';
+          if (opts.updates) { updState.checking = true; updateStatus(); }
           return post(API + '/refresh' + qs)
             .then(function (res) {
               var body = res.body || {};
-              if (!body.apps) { toast('刷新失败：' + (body.message || res.status), 'err'); return; }
+              if (!body.apps) {
+                if (opts.updates) { updState.checking = false; updState.error = 'refresh failed'; }
+                toast('刷新失败：' + (body.message || res.status), 'err');
+                return;
+              }
               lastRefresh = new Date();
               var applied = applyPayload(body);
               if (applied && opts.quiet !== true) {
                 var n = body.versions && body.versions.resolved ? Object.keys(body.versions.resolved).length : 0;
-                toast('已刷新：' + body.apps.length + ' 个应用' + (n ? '，探测到 ' + n + ' 个版本' : ''), 'ok');
+                var u = body.updates && body.updates.updates ? Object.keys(body.updates.updates).length : 0;
+                toast('已刷新：' + body.apps.length + ' 个应用' + (n ? '，探测到 ' + n + ' 个版本' : '') +
+                  (opts.updates ? '，' + u + ' 个可升级' : ''), 'ok');
               }
             })
-            .catch(function (e) { toast('刷新失败：' + e.message, 'err'); })
+            .catch(function (e) {
+              if (opts.updates) { updState.checking = false; updState.error = e.message; }
+              toast('刷新失败：' + e.message, 'err');
+            })
             .then(function () {
               if (refreshBtn) { refreshBtn.disabled = false; refreshBtn.textContent = '⟳ 刷新'; }
               updateStatus();
@@ -2651,7 +2750,7 @@ function generateAppManagerPage(): string {
 
         if (refreshBtn) {
           // 手动刷新把注册表检查也做上（明确点了按钮，值得多花几秒）。
-          refreshBtn.addEventListener('click', function () { doRefresh({ updates: true }); });
+          refreshBtn.addEventListener('click', function () { doRefresh({ updates: 'force' }); });
         }
 
         var autoTimer = null;
@@ -2663,7 +2762,7 @@ function generateAppManagerPage(): string {
           if (!every) return;
           autoTimer = setInterval(function () {
             if (document.hidden) return; // 页面不可见时不打扰机器
-            doRefresh({ versions: true, quiet: true });
+            doRefresh({ versions: true, quiet: true, updates: true });
           }, every * 1000);
         }
         if (autoSelect) {
@@ -2794,6 +2893,7 @@ function generateAppManagerPage(): string {
         window.__appActions = {
           toast: toast,
           decorate: decorate,
+          applyUpdates: applyUpdates,
           refreshUpdates: refreshUpdates,
           refresh: doRefresh,
           applyPayload: applyPayload,
@@ -3076,11 +3176,13 @@ function registerWebRoutes(
         // and asking the registry is a network round trip, so an auto-refresh
         // tick stays cheap while an explicit refresh can be thorough.
         const withVersions = params.get("versions") === "1";
-        const withUpdates = params.get("updates") === "1";
-
+        // `updates=force` → always sweep the registry (explicit button click).
+        // `updates=1`     → reuse the 5-minute cache (auto-refresh tick).
+        const updatesMode = params.get("updates");
+        const withUpdates = updatesMode !== null;
         scanResetter();
         const versions = withVersions ? await getVersions(true) : null;
-        const updates = withUpdates ? await getUpdates(true) : null;
+        const updates = withUpdates ? await getUpdates(updatesMode === "force") : null;
         return sendJson(res, 200, {
           ...appsPayload(versions?.resolved),
           refreshedAt: new Date().toISOString(),

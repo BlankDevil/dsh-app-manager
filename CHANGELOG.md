@@ -5,6 +5,44 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),  
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.1] - 2026-10-21
+
+The upgrade badges were being computed and then not shown, and refreshes never
+moved them. Detection was fine all along — `/api/updates` has been returning
+`9router 0.5.99 → 0.5.104` every time.
+
+### Fixed
+
+- **The badge was clipped by the Version column.** Cells are `overflow: hidden`
+  inside a `table-layout: fixed` table, and that column is 11% wide — so the
+  button appended after the version text was cut off at the cell edge. It was
+  in the DOM (every DOM-level assertion passed) and invisible on screen. The
+  cell now wraps its contents in `.vwrap`: the version text ellipsises, the
+  badge is `flex: 0 0 auto` and is always painted. Column widened to 13%.
+- **A refresh computed the registry sweep and then threw it away.**
+  `/api/refresh?updates=1` really did run the sweep (about 12 s), but the page's
+  `applyPayload()` only consumed `apps` and ignored the `updates` field, so the
+  badges stayed exactly as they were at page load. They are applied now.
+- **Badges were add-only.** `decorate()` skipped any cell that already had a
+  badge, so a stale `latest` survived forever and a badge stayed on an app that
+  had already been upgraded. It is idempotent now: present → created/updated,
+  absent → removed (an in-flight upgrade's "Upgrading…" label is left alone).
+- **Auto-refresh never asked for updates at all.** The timer called
+  `/refresh?versions=1` with no `updates` parameter, so nothing was ever
+  re-checked while the page stayed open. It now uses `updates=1` (reuses the
+  server's 5-minute cache) while the explicit button uses `updates=force`.
+
+### Added
+
+- **The status strip reports the update check**: "正在检查更新…" / "可升级 N 个" /
+  "均已是最新" / "更新检查失败". Previously a failed check was swallowed by an
+  empty `catch`, which looked identical to "everything is up to date".
+- `tests/updates-sync.test.mjs` (10 checks) drives the real page in jsdom:
+  badge on first paint, badge inside `.vwrap`, `updates=force` on click,
+  badge text following a changed registry answer, removal once up to date,
+  no duplicated version text, `updates=1` for the timer, no request when
+  updates are not asked for, and a visible failure state.
+
 ## [0.9.0] - 2026-10-21
 
 The dashboard stops being a page you leave the conversation for. It can now be
